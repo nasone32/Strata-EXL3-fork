@@ -22,7 +22,14 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
 
 namespace strata::core {
 namespace {
@@ -186,6 +193,23 @@ struct Exl3Pack::Impl {
         shards.emplace(name, std::move(f));
         return *raw;
     }
+    // GGUF parity for host RAM: only the EXPERT tensors belong in the page cache (the expert stream
+    // stages them from its own mappings).  Everything this pack reads - the EXL3 linears and the staged
+    // roles - is uploaded to VRAM inside build() and never read again, so its host pages are dead weight.
+    // Record each touched tensor's byte range in the file; release_host_pages() gives exactly those back.
+    std::vector<std::tuple<std::string, uint64_t, uint64_t>> touched_;   // (shard path, file begin, file end)
+    void touch(const std::string& name) {
+        std::string path; size_t off = 0, bytes = 0;
+        if (model.locate(name, path, off, bytes) && bytes > 0)
+            touched_.emplace_back(path, off, off + bytes);
+    }
+    Exl3Linear linear_tracked(const std::string& base) {
+        Exl3Linear L = model.linear(base);
+        touch(base + ".trellis");
+        touch(base + ".suh");
+        touch(base + ".svh");
+        return L;
+    }
     const StTensor* raw(const std::string& name) {
         auto it = weight_map.find(name);
         if (it == weight_map.end()) return nullptr;
@@ -198,6 +222,7 @@ struct Exl3Pack::Impl {
         const StTensor* t = sf.find(name);
         if (!t) return nullptr;
         if (shape_out) *shape_out = t;
+        touched_.emplace_back(sf.path(), sf.data_offset() + t->begin, sf.data_offset() + t->end);
         return sf.data(*t);
     }
 
@@ -236,7 +261,7 @@ bool stage_role(Exl3Pack::Impl& im, const RoleSpec& r, const ModelGeometry& g, c
     if (r.deq) {
         // the engine reads the indexer projections directly as BF16; reconstruct the EXL3 index_qk_proj
         // (out = q(512) | k(128)) and split it into the two engine [in, out] matrices.
-        Exl3Linear L = im.model.linear(hf_name);
+        Exl3Linear L = im.linear_tracked(hf_name);
         std::vector<uint16_t> w((size_t) L.in() * L.out());
         strata::kernels::cpu::exl3_reconstruct_weight(L.trellis, L.ki, L.nj, L.bits,
                                                       (strata::kernels::cpu::Exl3Codebook) L.cb, L.suh, L.svh, w.data());
@@ -345,7 +370,7 @@ bool stage_exl3(Exl3Pack::Impl& im, const RoleSpec& r, const ModelGeometry& g, c
                 const std::string& engine_name, WeightTable& wt, std::string& err, uint64_t& bytes_out) {
     if (!im.model.has(hf_base)) { err = "exl3: no EXL3 linear " + hf_base; return false; }
     Exl3Linear L;
-    try { L = im.model.linear(hf_base); } catch (const std::exception& e) { err = e.what(); return false; }
+    try { L = im.linear_tracked(hf_base); } catch (const std::exception& e) { err = e.what(); return false; }
     const int words = 256 * L.bits / 16;
     int nj = L.nj;
     const uint16_t* svh = L.svh;
@@ -445,7 +470,7 @@ bool stage_exl3_requantized(Exl3Pack::Impl& im, const RoleSpec& r, const ModelGe
                             const std::string& engine_name, WeightTable& wt, std::string& err, uint64_t& bytes_out,
                             void* q8_scratch) {
     Exl3Linear L;
-    try { L = im.model.linear(hf_base); } catch (const std::exception& e) { err = e.what(); return false; }
+    try { L = im.linear_tracked(hf_base); } catch (const std::exception& e) { err = e.what(); return false; }
     const int n_in = L.in(), n_out = L.out();
     const int words = 256 * L.bits / 16;
     auto fail = [&](const char* what, cudaError_t e) {
@@ -604,7 +629,7 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream, int layer_
         uint64_t need = 0;
         for (const Staged& s : staged) {
             if (s.r->deq) {   // reconstructed to BF16 [in, out]
-                Exl3Linear L = im.model.linear(s.hf);
+                Exl3Linear L = im.linear_tracked(s.hf);
                 const uint64_t oc = s.r->xf == Xf::SplitQ ? L.out() * 4 / 5 : L.out() / 5;
                 const uint64_t bytes = (uint64_t) L.in() * oc * 2;
                 need += (bytes + 255) & ~(uint64_t) 255;
@@ -652,14 +677,14 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream, int layer_
         {
             int64_t max_in = 0;
             for (const RoleSpec& r : kGlobal)
-                if (r.exl3) { try { max_in = std::max(max_in, (int64_t) im.model.linear(r.hf).in()); } catch (...) {} }
+                if (r.exl3) { try { max_in = std::max(max_in, (int64_t) im.linear_tracked(r.hf).in()); } catch (...) {} }
             for (int layer = layer_lo; layer < layer_hi; ++layer) {
                 const bool qsa = (layer % 4) == 3;
                 auto scan = [&](const RoleSpec* arr, size_t n) {
                     for (size_t i = 0; i < n; ++i) {
                         const RoleSpec& r = arr[i];
                         if (!r.exl3 || (r.qsa_only && !qsa) || (r.gdn_only && qsa)) continue;
-                        try { max_in = std::max(max_in, (int64_t) im.model.linear(kLayerPrefix + std::to_string(layer) + "." + r.hf).in()); } catch (...) {}
+                        try { max_in = std::max(max_in, (int64_t) im.linear_tracked(kLayerPrefix + std::to_string(layer) + "." + r.hf).in()); } catch (...) {}
                     }
                 };
                 scan(kCommon, sizeof kCommon / sizeof kCommon[0]);
@@ -709,6 +734,54 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream, int layer_
         err = std::string("exl3: ") + e.what();
         return false;
     }
+}
+
+uint64_t Exl3Pack::release_host_pages(std::string& note) {
+#if defined(_WIN32)
+    note = "POSIX only";
+    return 0;
+#else
+    // Unmap first: a clean page that is still mapped survives POSIX_FADV_DONTNEED (the same reason
+    // GGUF's #1250 cache drop madvises before it fadvises).  Both mapping sets the pack used go; the
+    // expert stream holds its own, separate mappings of the expert tensors and is untouched.
+    impl_->shards.clear();
+    impl_->model.close_shards();
+    if (impl_->touched_.empty()) { note = "nothing was read"; return 0; }
+    std::sort(impl_->touched_.begin(), impl_->touched_.end());
+    const long ps = ::sysconf(_SC_PAGESIZE);
+    const uint64_t page = ps > 0 ? (uint64_t) ps : 4096;
+    // Inward page alignment per range: the head page of the first dense tensor and the tail page of
+    // the last can be shared with a NEIGHBOUR's bytes in the file, and a neighbour can be an expert
+    // tensor - a shared page is left alone (ArenaExpertSource::release takes the same care).  Ranges
+    // that end up touching are merged so one shard is fadvise'd in few calls.
+    struct Range { std::string path; uint64_t begin, end; };
+    std::vector<Range> ranges;
+    for (const auto& [path, b, e] : impl_->touched_) {
+        const uint64_t ab = (b + page - 1) & ~(page - 1), ae = e & ~(page - 1);
+        if (ae <= ab) continue;
+        if (!ranges.empty() && ranges.back().path == path && ranges.back().end == ab)
+            ranges.back().end = ae;   // dense tensors packed back to back in the shard
+        else ranges.push_back({path, ab, ae});
+    }
+    uint64_t dropped = 0;
+    int64_t shard_count = 0;
+    std::string cur_path;
+    int fd = -1;
+    for (const Range& r : ranges) {
+        if (r.path != cur_path) {
+            if (fd >= 0) ::close(fd);
+            cur_path = r.path;
+            fd = ::open(cur_path.c_str(), O_RDONLY);
+            ++shard_count;
+        }
+        if (fd < 0) continue;
+        if (::posix_fadvise(fd, (off_t) r.begin, (off_t) (r.end - r.begin), POSIX_FADV_DONTNEED) == 0)
+            dropped += r.end - r.begin;
+    }
+    if (fd >= 0) ::close(fd);
+    note = std::to_string(ranges.size()) + " ranges over " + std::to_string(shard_count) + " shards";
+    return dropped;
+#endif
 }
 
 }  // namespace strata::core

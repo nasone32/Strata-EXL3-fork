@@ -349,6 +349,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_gemv.cu
                           src/kernels/cuda/exl3.cu
                           src/kernels/cuda/exl3_experts.cu
+                          src/kernels/exl3_peer.cpp
+                          src/kernels/exl3_peer_output.cpp
+                          src/kernels/exl3_peer_adapt.cpp
                           src/kernels/cuda/s_gemv.cu
                           src/kernels/cuda/s2_gemv_quads.cu
                           src/kernels/cuda/s2_gemv_fast.cu
@@ -1168,6 +1171,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(arch_defaults_test src/core/arch_defaults_test.cpp src/core/arch_defaults.cpp)
   target_include_directories(arch_defaults_test PRIVATE include)
   add_test(NAME arch_defaults_test COMMAND arch_defaults_test)
+  add_executable(exl3_flags_test src/core/exl3_flags_test.cpp)
+  target_include_directories(exl3_flags_test PRIVATE include)
+  add_test(NAME exl3_flags_test COMMAND exl3_flags_test)
   add_executable(suffix_drafter_test src/spec/suffix_drafter_test.cpp)
   target_link_libraries(suffix_drafter_test PRIVATE strata_spec)
   add_test(NAME suffix_drafter_test COMMAND suffix_drafter_test)
@@ -1206,6 +1212,9 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(bf16_bits_test src/kernels/bf16_bits_test.cpp)
   target_include_directories(bf16_bits_test PRIVATE include)
   add_test(NAME bf16_bits_test COMMAND bf16_bits_test)
+  add_executable(f16_convert_test tests/platform/f16_convert_test.cpp)
+  target_include_directories(f16_convert_test PRIVATE include)
+  add_test(NAME f16_convert_test COMMAND f16_convert_test)
   # the batch window's row layout (a slot's group of proposed rows, the layer split's hand-off capacity; header-only, CPU)
   add_executable(batch_rows_test tests/core/batch_rows_test.cpp)
   target_include_directories(batch_rows_test PRIVATE include)
@@ -1217,13 +1226,19 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3.cpp)
+            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3.cpp
+            src/kernels/cpu/exl3_moe.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
 if(MSVC)
   set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+  # exl3_moe.cpp: the ported CPU expert tier carries its per-tier functions behind runtime
+  # dispatch; MSVC has no per-function targets, so the whole TU takes AVX-512 and supported()
+  # requires at least AVX2 at run time.  GCC/Clang compile it WITHOUT flags: every tier is a
+  # function target attribute.
+  set_source_files_properties(src/kernels/cpu/exl3_moe.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
 else()
   # GCC/Clang spell it differently, and `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
   set_source_files_properties(src/kernels/cpu/expert.cpp
@@ -1272,6 +1287,13 @@ add_executable(strata-exl3-model src/artifact/exl3_model_check.cpp)
 target_include_directories(strata-exl3-model PRIVATE include)
 target_link_libraries(strata-exl3-model PRIVATE strata_kernels_cpu)
 
+# The ported CPU expert tier (src/kernels/cpu/exl3_moe.cpp) against the CPU oracle on the real
+# model: tolerance vs exl3_folded_gemv, multi-row bit-exactness, swizzled-vs-native layout,
+# --sum for cross-tier comparisons, --bench for warm throughput (docs/EXL3.md).
+add_executable(strata-exl3-cpu-parity src/kernels/exl3_cpu_parity.cpp)
+target_include_directories(strata-exl3-cpu-parity PRIVATE include)
+target_link_libraries(strata-exl3-cpu-parity PRIVATE strata_kernels_cpu)
+
 # GPU EXL3 GEMV on real expert weights vs the CPU reference (needs the downloaded model).
 if(STRATA_ENABLE_HIP OR STRATA_ENABLE_CUDA)
   add_executable(strata-exl3-gpu src/kernels/exl3_gpu_model_check.cpp)
@@ -1280,6 +1302,30 @@ if(STRATA_ENABLE_HIP OR STRATA_ENABLE_CUDA)
   add_executable(strata-exl3-moe src/kernels/exl3_moe_layer_check.cpp)
   target_include_directories(strata-exl3-moe PRIVATE ${_strata_gpu_include_directories} include)
   target_link_libraries(strata-exl3-moe PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  # The real expert-stream prefill path (run_device) with STRATA_EXL3_WAVESYNC=1 against the per-tile
+  # barrier, on the synthetic model directory tools/test_exl3_loader.py writes (multi-wave, both
+  # dispatch arms, slot eviction, bit-for-bit output comparison).
+  add_executable(strata-exl3-wave src/kernels/exl3_wave_check.cpp)
+  target_include_directories(strata-exl3-wave PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(strata-exl3-wave PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  # OPT-IN grouped small-M engine-seam check (STRATA_EXL3_SMALL_M in the host-IO expert service):
+  # four flag arms over one window battery, byte-identity plus dispatch-coverage assertions.
+  add_executable(strata-exl3-smallm-seam src/kernels/exl3_small_m_seam.cpp)
+  target_include_directories(strata-exl3-smallm-seam PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(strata-exl3-smallm-seam PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  # NON-PRODUCTION diagnostic (decode-isolation): the staging span decomposed into pread /
+  # pinned memcpy / 9-plane H2D enqueues / worker scheduling, plus the hit/miss split's pure
+  # two-pass issue cost and the prebuilt-descriptor (slot-table) probe on device-resident weights.
+  add_executable(strata-exl3-transport src/kernels/exl3_transport_bench.cpp
+                                   src/kernels/cuda/exl3_transport_spin.cu)
+  target_include_directories(strata-exl3-transport PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(strata-exl3-transport PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  # NON-PRODUCTION diagnostic (small-M verification windows): the resident grouped trellis-reuse
+  # prototype (exl3_moe_rows_grouped) against the current indexed GEMV per-call, on real 3bpw
+  # expert weights - parity oracles plus per-call GPU spans, host issue, e2e and 48-call chains.
+  add_executable(strata-exl3-smallm src/kernels/exl3_small_m_bench.cpp)
+  target_include_directories(strata-exl3-smallm PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(strata-exl3-smallm PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   # what a dense EXL3 linear would cost requantized to a ggml K-quant (the native MMVQ path)
   add_executable(strata-exl3-native src/kernels/exl3_native_check.cpp)
   target_include_directories(strata-exl3-native PRIVATE ${_strata_gpu_include_directories} include
@@ -1297,6 +1343,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(exl3_route_plan_test src/kernels/exl3_route_plan_test.cpp)
   target_include_directories(exl3_route_plan_test PRIVATE include)
   add_test(NAME exl3_route_plan_test COMMAND exl3_route_plan_test)
+  add_executable(peer_adapt_plan_test src/kernels/peer_adapt_plan_test.cpp)
+  target_include_directories(peer_adapt_plan_test PRIVATE include)
+  add_test(NAME peer_adapt_plan_test COMMAND peer_adapt_plan_test)
   add_executable(exl3_parity src/kernels/exl3_parity.cpp)
   target_include_directories(exl3_parity PRIVATE include)
   target_link_libraries(exl3_parity PRIVATE strata_kernels_cpu)
@@ -1314,6 +1363,12 @@ if(STRATA_BUILD_TESTS)
     set(_exl3_validation_env STRATA_EXL3_MODEL_CHECK=$<TARGET_FILE:strata-exl3-model>)
     if(TARGET strata)
       list(APPEND _exl3_validation_env STRATA_EXL3_ENGINE=$<TARGET_FILE:strata>)
+    endif()
+    if(TARGET strata-exl3-wave)
+      list(APPEND _exl3_validation_env STRATA_EXL3_WAVE_CHECK=$<TARGET_FILE:strata-exl3-wave>)
+    endif()
+    if(TARGET strata-exl3-smallm-seam)
+      list(APPEND _exl3_validation_env STRATA_EXL3_SMALL_M_SEAM=$<TARGET_FILE:strata-exl3-smallm-seam>)
     endif()
     add_test(NAME exl3_loader_validation
              COMMAND ${CMAKE_COMMAND} -E env ${_exl3_validation_env}
@@ -1350,14 +1405,31 @@ if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_HIP OR STRATA_ENABLE_CUDA))
   target_include_directories(exl3_gemv_parity PRIVATE ${_strata_gpu_include_directories} include)
   target_link_libraries(exl3_gemv_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   add_test(NAME exl3_gemv_parity COMMAND exl3_gemv_parity)
+  # the dense multirow trellis GEMV (A9): m-row call vs CPU reference and vs m==1 calls (gfx11 only)
+  add_executable(exl3_dense_mr_parity src/kernels/exl3_dense_mr_parity.cpp)
+  target_include_directories(exl3_dense_mr_parity PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(exl3_dense_mr_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  add_test(NAME exl3_dense_mr_parity COMMAND exl3_dense_mr_parity)
   add_executable(exl3_moe_multi_parity src/kernels/exl3_moe_multi_parity.cpp)
   target_include_directories(exl3_moe_multi_parity PRIVATE ${_strata_gpu_include_directories} include)
   target_link_libraries(exl3_moe_multi_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   add_test(NAME exl3_moe_multi_parity COMMAND exl3_moe_multi_parity)
   set_tests_properties(exl3_moe_multi_parity PROPERTIES SKIP_RETURN_CODE 77)
+  # the async EXL3 peer tier primitive (static subset, PeerExperts shape; tests only at this stage)
+  add_executable(exl3_peer_test src/kernels/exl3_peer_test.cpp)
+  target_include_directories(exl3_peer_test PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(exl3_peer_test PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  add_test(NAME exl3_peer_test COMMAND exl3_peer_test)
+  set_tests_properties(exl3_peer_test PROPERTIES SKIP_RETURN_CODE 77)
+
+  add_executable(exl3_verify_graph_test src/kernels/exl3_verify_graph_test.cpp)
+  target_include_directories(exl3_verify_graph_test PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(exl3_verify_graph_test PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  add_test(NAME exl3_verify_graph_test COMMAND exl3_verify_graph_test)
+  set_tests_properties(exl3_verify_graph_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   add_executable(exl3_moe_window_bench src/kernels/exl3_moe_window_bench.cpp)
   target_include_directories(exl3_moe_window_bench PRIVATE ${_strata_gpu_include_directories} include)
-  target_link_libraries(exl3_moe_window_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  target_link_libraries(exl3_moe_window_bench PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   # PleTable::open_exl3 (the EXL3 n-gram table) against the numpy codec.
   add_executable(ple_exl3_parity src/kernels/ple_exl3_parity.cpp)
   target_include_directories(ple_exl3_parity PRIVATE ${_strata_gpu_include_directories} include)

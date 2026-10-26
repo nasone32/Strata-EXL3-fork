@@ -24,7 +24,7 @@
 
 namespace strata::core { class PeerExperts; }
 namespace strata::kernels::cpu { class ExpertPool; }
-namespace strata::kernels { class Exl3ExpertStream; }
+namespace strata::kernels { class Exl3ExpertStream; class Exl3Peer; }
 
 namespace strata::prefill {
 
@@ -76,6 +76,10 @@ public:
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
+    /// Wait for every stream `init` made (compute, copies, KV) - relayout's own wait, without re-carving - so a
+    /// lender may reclaim the borrowed range (the EXL3 arena loan's restore; a cancelled read can leave copy/KV
+    /// work in flight that run()'s own end-of-call syncs never reached).
+    bool sync_streams(std::string& err);
     int64_t chunk() const;
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
@@ -129,6 +133,17 @@ public:
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     void set_exl3_experts(kernels::Exl3ExpertStream* experts) { exl3_experts_ = experts; }
+
+    /// STRATA_EXL3_PEER_PREFILL=1: the EXL3 peer tier computes the prompt chunks' peer-owned
+    /// experts on the peer card (the GGUF `--peer-device` prompt share, on the EXL3 stack).
+    /// `owned` is the engine's byte-per-(layer*expert) residency table (!= 0 = the peer holds it -
+    /// the same exclusions the primary's admission applies); `chunk` is the prompt-chunk cap the
+    /// mapped transport buffers are sized for.  The peer's per-token weighted sums replace its raw
+    /// rows on the way back, so a prompt with this enabled is NOT bit-identical to a single-GPU
+    /// prompt (the GGUF peer-prefill exactness class); decode windows are untouched.  Returns
+    /// false with `err` when the transport cannot allocate - the prompt path then stays local.
+    bool set_exl3_peer(kernels::Exl3Peer* peer, const uint8_t* owned, int64_t n_layers, int64_t n_expert,
+                       int64_t chunk, std::string& err);
 
     const PrefillStats& stats() const { return stats_; }
 

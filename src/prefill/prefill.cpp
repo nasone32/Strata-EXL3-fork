@@ -7,6 +7,7 @@
 #include "mmq_resident_sort.hpp"
 #include "wmma_gemm.h"
 #include "strata/core/mtp.hpp"
+#include "strata/core/exl3_flags.hpp"
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
@@ -37,6 +38,7 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/kernels/exl3_experts.hpp"
+#include "strata/kernels/exl3_peer.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -715,6 +717,36 @@ struct PeerPrefill {
     }
 };
 
+// STRATA_EXL3_PEER_PREFILL: the prompt chunks' peer share on the EXL3 stack (the PeerPrefill
+// shape above, EXL3 kernels).  Per MoE layer: the FP16 `mixed` image and the router weights go
+// down into mapped/pinned host memory on a side stream of the primary (the peer reads them over
+// its own link); the routes split by the ownership table - the local share compacted in order
+// into run_device, the peer share handed to Exl3Peer::launch_prefill, whose per-token weighted
+// sums (mapped host memory) the combine adds to the local rows (moe_combine_peer).  Not
+// bit-identical to a single-GPU prompt; see Prefill::set_exl3_peer.
+struct Exl3PeerPf {
+    kernels::Exl3Peer* peer = nullptr;
+    std::vector<uint8_t> owned_copy;      // the ownership table, copied at setup (owned points into it)
+    const uint8_t* owned = nullptr;       // [layer * n_expert + expert]: != 0 = peer-resident
+    int64_t n_layers = 0, n_expert = 0;
+    int64_t rows_cap = 0;
+    int64_t T_cap = 0;
+    cudaStream_t xs = nullptr;           // the primary's D2H side stream (activations + weights)
+    cudaEvent_t ev = nullptr;            // m.cs reached this layer's activations/weights
+    uint16_t* host_x16 = nullptr;        // mapped+portable: the FP16 mixed image (T_cap x N)
+    float* host_w = nullptr;             // pinned: the router weights (T_cap x 10)
+    std::vector<uint8_t> mask;           // per route: 1 = the peer computes it (run_device's skip)
+    std::vector<int32_t> slot;           // per route: identity, or T*K (the combine's skip sentinel)
+    int64_t rows_local = 0, rows_peer = 0;
+    int64_t layers = 0, rows_total = 0;  // counters (STRATA_PREFILL_TIMING reports at release)
+    ~Exl3PeerPf() {
+        if (xs) { cudaStreamSynchronize(xs); cudaStreamDestroy(xs); }
+        if (ev) cudaEventDestroy(ev);
+        if (host_x16) cudaFreeHost(host_x16);
+        if (host_w) cudaFreeHost(host_w);
+    }
+};
+
 // #1712: a chunk's small int32 tables (the QSA step records, the token ids) go up from a pinned buffer.  A cudaMemcpyAsync
 // from pageable memory is staged by the runtime; on gfx1100 the first text prompt after a picture one was seen to read stale
 // step records that way.  The event holds the next upload back until the last one has left the buffer.  No pinned RAM:
@@ -882,6 +914,7 @@ struct Prefill::Impl {
     PinnedUpload tok_up;
     core::PinnedRing up_ring;                // #1996: every other upload of the prompt path whose host side is pageable
     std::unique_ptr<PeerPrefill> pp;         // multi-GPU: the peer GPU's expert share (set_peer)
+    std::unique_ptr<Exl3PeerPf> epf;         // STRATA_EXL3_PEER_PREFILL: the EXL3 peer's share
     // layer split: the next stage's GPU as a stream-only peer (set_stage_helper); its buffers are that stage's own
     // prompt buffers, bound per prompt, and it takes the place of `pp` for a run it helps
     std::unique_ptr<PeerPrefill> help_pp;
@@ -939,6 +972,10 @@ void Prefill::reset() {
 
 void Prefill::release() {
     if (!impl_) return;
+    if (impl_->epf && impl_->epf->layers > 0)
+        std::fprintf(stderr, "strata prefill: the EXL3 peer computed %lld routed rows across %lld prompt layers\n",
+                     (long long) impl_->epf->rows_total, (long long) impl_->epf->layers);
+    impl_->epf.reset();
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
@@ -1225,6 +1262,10 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.gemm.set_f16_io(m.f16_io);
         set_act_f16(m.f16_io);
     }
+    size_t free_before_carve = 0, memory_total = 0;
+    const bool size_audit = exl3_experts_ &&
+                            strata::core::exl3_flag("STRATA_EXL3_PREFILL_BORROW", nullptr, true);
+    if (size_audit) (void) cudaMemGetInfo(&free_before_carve, &memory_total);
     if (!carve(T, &o)) {
         size_t fb = 0, tb = 0;
         cudaMemGetInfo(&fb, &tb);
@@ -1234,6 +1275,18 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
               std::to_string(o.used >> 20) + " MiB taken, the failing buffer wanted " +
               std::to_string(o.failed_bytes >> 20) + " MiB)";
         return false;
+    }
+    if (size_audit) {
+        size_t free_after = 0;
+        (void) cudaMemGetInfo(&free_after, &memory_total);
+        std::fprintf(stderr, "exl3 prefill sizing: device=%d chunk=%lld borrowed_count=%llu owned_count=%llu "
+                             "actual_requested=%llu carve_device_delta=%llu ring=%d ring_bytes=%llu; no lending\n",
+                     m.device, (long long) chunk,
+                     (unsigned long long) bytes_needed(g, ss, chunk, false),
+                     (unsigned long long) bytes_needed_owned(g, ss, chunk, false),
+                     (unsigned long long) o.used,
+                     (unsigned long long) (free_before_carve > free_after ? free_before_carve - free_after : 0),
+                     m.ring, (unsigned long long) ((uint64_t) m.ring * MAXBLOB()));
     }
     return true;
 }
@@ -1378,6 +1431,16 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
+
+bool Prefill::sync_streams(std::string& err) {
+    Impl& m = *impl_;
+    if (cudaStreamSynchronize(m.cs) != cudaSuccess || cudaStreamSynchronize(m.copy) != cudaSuccess ||
+        (m.kv_copy && cudaStreamSynchronize(m.kv_copy) != cudaSuccess)) {
+        err = "prefill: the prompt path's streams failed to drain";
+        return false;
+    }
+    return true;
+}
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err, const char** why) {
@@ -1859,6 +1922,41 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
                                                     "% of the primary's streamed experts through a " + std::to_string(pp->RP) + "-slot ring").c_str()
                                                  : ", compact group buffers") : "", fb >> 20);
     m.pp = std::move(pp);
+    return true;
+}
+
+bool Prefill::set_exl3_peer(kernels::Exl3Peer* peer, const uint8_t* owned, int64_t n_layers, int64_t n_expert,
+                            int64_t chunk, std::string& err) {
+    Impl& m = *impl_;
+    m.epf.reset();
+    if (peer == nullptr || owned == nullptr || n_layers <= 0 || n_expert <= 0 || chunk <= 0) {
+        err = "prefill: EXL3 peer share needs a peer, the ownership table and a chunk cap";
+        return false;
+    }
+    auto epf = std::make_unique<Exl3PeerPf>();
+    epf->peer = peer;
+    epf->owned_copy.assign(owned, owned + (size_t) n_layers * n_expert);
+    epf->owned = epf->owned_copy.data();
+    epf->n_layers = n_layers;
+    epf->n_expert = n_expert;
+    epf->rows_cap = peer->prefill_rows_cap();
+    epf->T_cap = chunk;
+    int prev = 0;
+    (void) cudaGetDevice(&prev);
+    bool ok = cudaStreamCreateWithFlags(&epf->xs, cudaStreamNonBlocking) == cudaSuccess &&
+              cudaEventCreateWithFlags(&epf->ev, cudaEventDisableTiming) == cudaSuccess &&
+              cudaHostAlloc((void**) &epf->host_x16, (size_t) chunk * N * sizeof(uint16_t),
+                            cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess &&
+              cudaHostAlloc((void**) &epf->host_w, (size_t) chunk * 10 * sizeof(float), cudaHostAllocDefault) == cudaSuccess;
+    (void) cudaSetDevice(prev);
+    if (!ok) {
+        err = "prefill: the EXL3 peer share's mapped transport buffers did not allocate";
+        return false;
+    }
+    std::fprintf(stderr, "strata prefill: the EXL3 peer computes its experts' rows of each prompt chunk "
+                         "(up to %lld of %lld routed rows per layer); activations and weights go through mapped host "
+                         "memory, one weighted sum per token back\n", (long long) epf->rows_cap, (long long) chunk * 10);
+    m.epf = std::move(epf);
     return true;
 }
 
@@ -3033,22 +3131,91 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!defer_shared && !shared_expert()) return false;
                     if (exl3_experts_) {
                         if (defer_shared && !shared_expert()) return false;
+                        // STRATA_EXL3_PEER_PREFILL: the peer's activations/weights readback goes on
+                        // the side stream now, so both copies land while the host waits out the
+                        // routing readback below (the layer's gr_mix_r/mixed_h and route(m.w) are
+                        // already queued on m.cs at this point).
+                        Exl3PeerPf* epf = m.epf.get();
+                        if (epf && (cudaEventRecord(epf->ev, m.cs) != cudaSuccess ||
+                                    cudaStreamWaitEvent(epf->xs, epf->ev, 0) != cudaSuccess ||
+                                    cudaMemcpyAsync(epf->host_x16, m.mixed_h, (size_t) T * N * sizeof(uint16_t),
+                                                    cudaMemcpyDeviceToHost, epf->xs) != cudaSuccess ||
+                                    cudaMemcpyAsync(epf->host_w, m.w, (size_t) T * K * sizeof(float),
+                                                    cudaMemcpyDeviceToHost, epf->xs) != cudaSuccess)) {
+                            err = "prefill: EXL3 peer transport readback failed"; return false;
+                        }
                         m.ids_host.resize((size_t) T * K);
                         if (cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * sizeof(int32_t),
                                             cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
                             cudaStreamSynchronize(m.cs) != cudaSuccess) {
                             err = "prefill: EXL3 routing readback failed"; return false;
                         }
-                        if (!exl3_experts_->run_device((int) l, m.mixed, m.ids_host.data(), (int) T, K, m.Dm, m.cs)) {
-                            err = "prefill: EXL3 grouped FFN failed at layer " + std::to_string(l); return false;
+                        // The route split: the peer's experts (whole groups - ownership is per
+                        // (layer, expert), so the skip mask never splits a group) are dropped from
+                        // the primary's plan, which keeps the LOCAL rows at their ORIGINAL Dm
+                        // positions (run_device's skip mask retains destinations).  The combine
+                        // reads them through identity slots; peer routes get the skip sentinel.
+                        // The peer share is capped first-come; routes past the cap stay local.
+                        bool use_peer = false;
+                        if (epf) {
+                            if (cudaStreamSynchronize(epf->xs) != cudaSuccess) {
+                                err = "prefill: EXL3 peer transport readback failed"; return false;
+                            }
+                            epf->mask.assign((size_t) T * K, 0);
+                            epf->slot.resize((size_t) T * K);
+                            const uint8_t* lay_owned = epf->owned + (size_t) l * epf->n_expert;
+                            int64_t rows_peer = 0;
+                            const int32_t skip_sentinel = (int32_t) (T * K);
+                            for (int64_t i = 0; i < (int64_t) T * K; ++i) {
+                                epf->slot[(size_t) i] = (int32_t) i;
+                                const int32_t e = m.ids_host[(size_t) i];
+                                if (e >= 0 && e < epf->n_expert && lay_owned[e] && rows_peer < epf->rows_cap) {
+                                    epf->mask[(size_t) i] = 1;
+                                    epf->slot[(size_t) i] = skip_sentinel;
+                                    ++rows_peer;
+                                }
+                            }
+                            epf->rows_peer = rows_peer;
+                            epf->rows_local = (int64_t) T * K - rows_peer;
+                            use_peer = rows_peer > 0;
                         }
-                        m.slot_host.resize((size_t) T * K);
-                        for (size_t i = 0; i < m.slot_host.size(); ++i) m.slot_host[i] = (int32_t) i;
-                        if (cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * K * sizeof(int32_t),
-                                            cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
-                            err = "prefill: EXL3 row map upload failed"; return false;
+                        if (use_peer) {
+                            if (cudaMemcpyAsync(m.slot_dev, epf->slot.data(), (size_t) T * K * sizeof(int32_t),
+                                                cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
+                                err = "prefill: EXL3 row map upload failed"; return false;
+                            }
+                            // The peer enqueues first: its compute overlaps the local share's
+                            // staging/FFN below (the host blocks inside run_device regardless).
+                            if (!epf->peer->launch_prefill((int64_t) l, epf->host_x16, T, m.ids_host.data(),
+                                                           epf->mask.data(), epf->host_w, err)) {
+                                err = "prefill: EXL3 peer FFN failed at layer " + std::to_string(l) +
+                                      " (" + err + ")"; return false;
+                            }
+                            if (!exl3_experts_->run_device((int) l, m.mixed, m.ids_host.data(), (int) T, K,
+                                                           m.Dm, m.cs, epf->mask.data())) {
+                                err = "prefill: EXL3 grouped FFN failed at layer " + std::to_string(l); return false;
+                            }
+                            if (!epf->peer->finish_prefill(err)) {
+                                err = "prefill: EXL3 peer FFN failed at layer " + std::to_string(l) +
+                                      " (" + err + ")"; return false;
+                            }
+                            // rows_local = T*K: every local slot passes, the peer sentinel does not
+                            moe_combine_peer(m.Dm, m.slot_dev, m.w, m.shared, m.sg, epf->peer->prefill_sums_host(),
+                                             (int64_t) T * K, m.bo, T, m.cs);
+                            ++epf->layers;
+                            epf->rows_total += epf->rows_peer;
+                        } else {
+                            if (!exl3_experts_->run_device((int) l, m.mixed, m.ids_host.data(), (int) T, K, m.Dm, m.cs)) {
+                                err = "prefill: EXL3 grouped FFN failed at layer " + std::to_string(l); return false;
+                            }
+                            m.slot_host.resize((size_t) T * K);
+                            for (size_t i = 0; i < m.slot_host.size(); ++i) m.slot_host[i] = (int32_t) i;
+                            if (cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * K * sizeof(int32_t),
+                                                cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
+                                err = "prefill: EXL3 row map upload failed"; return false;
+                            }
+                            moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                         }
-                        moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                     } else {
                     // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
                     // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
@@ -4377,6 +4544,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         return ok;
     }
 #endif
+    // STRATA_EXL3_PEER_PREFILL: re-read the peer's residency before each chunk.  The adapter
+    // replaces peer experts only between serial windows (never during a prompt), so per-chunk is
+    // the freshest safe snapshot; without it the split could mask an expert the tier just dropped
+    // and the peer would refuse the layer.
+    if (impl_ && impl_->epf) {
+        std::vector<int32_t> res;
+        impl_->epf->peer->residency((int) impl_->epf->n_layers, (int) impl_->epf->n_expert, res);
+        if (res.size() == impl_->epf->owned_copy.size())
+            for (size_t i = 0; i < res.size(); ++i) impl_->epf->owned_copy[i] = res[i] >= 0 ? 1 : 0;
+    }
     const bool body_ok = run_impl(tokens, n, pos0, err);
 
     std::string drain_err;

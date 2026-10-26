@@ -2,17 +2,17 @@
 
 ## Reporting a vulnerability
 
-Please report anything that should not be public until it is fixed **privately**, through GitHub's private
-vulnerability reporting: the repository's **Security** tab, **Report a vulnerability**
-([direct link](https://github.com/Niko1221/Strata/security/advisories/new)). Say what you found, how to reproduce it
-(the request, the config keys involved, the Strata version), and what an attacker gains. We answer there, fix it in
-a release, and credit you in the advisory unless you ask us not to.
+Report non-public vulnerabilities **privately** using this fork's **Security** tab and
+**Report a vulnerability** ([direct link](https://github.com/nasone32/Strata-EXL3-fork/security/advisories/new)).
+Include the affected commit, configuration, reproduction steps and impact. Do not put credentials,
+private conversations or exploit details in a public issue.
 
-Ordinary hardening ideas and findings that are safe to discuss in public are welcome as an
-[issue](https://github.com/Niko1221/Strata/issues) (#544 collects audit findings) or as a pull request, which we
-review like our own code.
+This is an experimental AMD community-test fork without a guaranteed response time or stable-release
+support policy. If a finding also affects upstream Strata, report it privately to
+[upstream](https://github.com/Niko1221/Strata/security/advisories/new) as appropriate.
 
-Supported: the latest release. Fixes go into the next release, not into older ones.
+Public hardening suggestions can be filed as an
+[issue](https://github.com/nasone32/Strata-EXL3-fork/issues) or pull request in this fork.
 
 ## What the server exposes
 

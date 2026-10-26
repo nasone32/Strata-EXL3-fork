@@ -146,14 +146,18 @@ const float (*had128())[128] {
 void had_rows(std::vector<float>& m, int rows, int cols) {
     const float(*h)[128] = had128();
     std::vector<float> tmp(128);
+    // a tail block shorter than 128 transforms its live rows correctly on zero padding: the padded
+    // lanes are read as zero and never written (without the guard this wrote past the buffer for any
+    // row count not a multiple of 128)
     for (int b = 0; b < rows; b += 128) {
+        const int live = std::min(128, rows - b);
         for (int c = 0; c < cols; ++c) {
-            for (int i = 0; i < 128; ++i) {
+            for (int i = 0; i < live; ++i) {
                 float acc = 0;
-                for (int j = 0; j < 128; ++j) acc += h[i][j] * m[(b + j) * cols + c];
+                for (int j = 0; j < live; ++j) acc += h[i][j] * m[(b + j) * cols + c];
                 tmp[i] = acc;
             }
-            for (int i = 0; i < 128; ++i) m[(b + i) * cols + c] = tmp[i];
+            for (int i = 0; i < live; ++i) m[(b + i) * cols + c] = tmp[i];
         }
     }
 }
@@ -163,12 +167,13 @@ void had_cols(std::vector<float>& m, int rows, int cols) {
     std::vector<float> tmp(128);
     for (int r = 0; r < rows; ++r) {
         for (int b = 0; b < cols; b += 128) {
-            for (int j = 0; j < 128; ++j) {
+            const int live = std::min(128, cols - b);
+            for (int j = 0; j < live; ++j) {
                 float acc = 0;
-                for (int k = 0; k < 128; ++k) acc += m[r * cols + b + k] * h[k][j];
+                for (int k = 0; k < live; ++k) acc += m[r * cols + b + k] * h[k][j];
                 tmp[j] = acc;
             }
-            for (int j = 0; j < 128; ++j) m[r * cols + b + j] = tmp[j];
+            for (int j = 0; j < live; ++j) m[r * cols + b + j] = tmp[j];
         }
     }
 }

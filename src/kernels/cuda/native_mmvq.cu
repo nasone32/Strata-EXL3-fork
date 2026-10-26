@@ -1163,17 +1163,29 @@ static bool s26_tsum_on() {
 
 // S26 STRATA_LFUSE (PAIR): blocks n_out.. compute the same rows of w2 into y2 (two matrices of one shape on one
 // input in one launch; each output's code is the single matrix's)
-template<typename F, int NCOLS, int NW, int ROWS, bool TS = false, bool PAIR = false>
+//
+// A11 STRATA_MMVQ_BUNCH (MULTI): two or three matrices of DIFFERENT widths on one input in one launch - the
+// window's q|k|v and qkv|z bundles.  The remap is PAIR's with explicit per-matrix block counts (b1, b2), and
+// n_out is reassigned with the matrix so each y keeps its own stride; every output's code is again the single
+// matrix's, so the bundle is bitwise the sequential calls (as with ROWS, one-vs-two rows per block agree bitwise).
+template<typename F, int NCOLS, int NW, int ROWS, bool TS = false, bool PAIR = false, bool MULTI = false>
 __launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
 __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w, const Q81Block* x_, float* y_,
                                          int n_in, int n_out,
-                                         const typename F::Block* __restrict__ w2 = nullptr, float* __restrict__ y2 = nullptr) {
+                                         const typename F::Block* __restrict__ w2 = nullptr, float* __restrict__ y2 = nullptr,
+                                         const typename F::Block* __restrict__ w3 = nullptr, float* __restrict__ y3 = nullptr,
+                                         int n2 = 0, int n3 = 0, int b1 = 0, int b2 = 0) {
     const Q81Block* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
     float* STRATA_PDL_RESTRICT y = y_;
     constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     int bxi = int(blockIdx.x);
-    if constexpr (PAIR) {
+    if constexpr (MULTI) {
+        if (bxi >= b1) {
+            bxi -= b1; w = w2; y = y2; n_out = n2;
+            if (w3 != nullptr && bxi >= b2) { bxi -= b2; w = w3; y = y3; n_out = n3; }
+        }
+    } else if constexpr (PAIR) {
         if (bxi >= n_out / ROWS) { bxi -= n_out / ROWS; w = w2; y = y2; }
     }
     const int row0 = ROWS * bxi;
@@ -1311,13 +1323,16 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
         launch_pdl(native_mmvq_multi_kernel<F, NCOLS, NW, 2, false, false>, dim3(blocks), dim3(WARP, NW), 0, s, w, x, y, n_in, n_out,
-                   (const typename F::Block*) nullptr, (float*) nullptr);
+                   (const typename F::Block*) nullptr, (float*) nullptr, (const typename F::Block*) nullptr,
+                   (float*) nullptr, 0, 0, 0, 0);
         return;
     }
     const dim3 threads(WARP, WARPS);
-    // the PAIR arguments, unused here (launch_pdl passes every parameter)
+    // the PAIR/MULTI arguments, unused here (launch_pdl passes every parameter)
     const typename F::Block* const no_w2 = nullptr;
     float* const no_y2 = nullptr;
+    const typename F::Block* const no_w3 = nullptr;
+    float* const no_y3 = nullptr;
     // #783 PR-h (stuchapin909): two rows per block for every K, not only small K - each row keeps its own partial sums and
     // reduction, so a row's result does not depend on its neighbour; STRATA_NO_MMVQ_ROWS2=1 keeps one row for large K
     static const bool rows1 = [] {
@@ -1325,14 +1340,18 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
     if ((rows1 || q8_0_rows1<F>(n_in, n_out)) && n_in / F::DIV >= F::BPI) {
-        if (s26_tsum_on()) launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
-        else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
+        if (s26_tsum_on()) launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2,
+                                       no_w3, no_y3, 0, 0, 0, 0);
+        else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2,
+                                        no_w3, no_y3, 0, 0, 0, 0);
         return;
     }
     constexpr int ROWS = 2;
     const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
-    if (s26_tsum_on()) launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, true, false>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
-    else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, false, false>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
+    if (s26_tsum_on()) launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, true, false>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2,
+                                   no_w3, no_y3, 0, 0, 0, 0);
+    else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, false, false>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2,
+                                    no_w3, no_y3, 0, 0, 0, 0);
 }
 
 template<typename F>
@@ -2457,6 +2476,67 @@ void q8_0_pair_launch(const Q80Block* w1, const Q80Block* w2, const Q81Block* x,
         native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, true><<<unsigned(2 * n_out), threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);
     else
         native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, true><<<unsigned(2 * n_out), threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);
+}
+
+// A11 STRATA_MMVQ_BUNCH: two or three Q8_0 matrices of different widths sharing one q8_1 input, one
+// launch (the window's q|k|v and qkv|z bundles).  Same eligibility as native_mmvq_pair; ROWS is one
+// only if every member would take it standalone (the two agree bitwise, but the grid should match).
+template<int NCOLS>
+void q8_0_bunch_launch(const Q80Block* w1, const Q80Block* w2, const Q80Block* w3, const Q81Block* x,
+                       float* y1, float* y2, float* y3, int n_in, int n1, int n2, int n3, cudaStream_t s) {
+    using F = SmallTraits<Q80Block, 8>;
+    const bool one_row = n_in / F::DIV >= F::BPI && q8_0_rows1<F>(n_in, n1) && q8_0_rows1<F>(n_in, n2) &&
+                         (n3 <= 0 || q8_0_rows1<F>(n_in, n3));
+    const int rows = one_row ? 1 : 2;
+    const int r1 = (n1 + rows - 1) / rows, r2 = (n2 + rows - 1) / rows;
+    const int r3 = n3 > 0 ? (n3 + rows - 1) / rows : 0;
+    const Q80Block* w3p = n3 > 0 ? w3 : nullptr;
+    float* y3p = n3 > 0 ? y3 : nullptr;
+    const dim3 threads(WARP, WARPS);
+    const dim3 grid(unsigned(r1 + r2 + r3));
+    if (one_row) {
+        if (s26_tsum_on())
+            launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, false, true>, grid, threads, 0, s,
+                       w1, x, y1, n_in, n1, w2, y2, w3p, y3p, n2, n3, r1, r2);
+        else
+            launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, false, true>, grid, threads, 0, s,
+                       w1, x, y1, n_in, n1, w2, y2, w3p, y3p, n2, n3, r1, r2);
+    } else {
+        if (s26_tsum_on())
+            launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 2, true, false, true>, grid, threads, 0, s,
+                       w1, x, y1, n_in, n1, w2, y2, w3p, y3p, n2, n3, r1, r2);
+        else
+            launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 2, false, false, true>, grid, threads, 0, s,
+                       w1, x, y1, n_in, n1, w2, y2, w3p, y3p, n2, n3, r1, r2);
+    }
+}
+
+bool native_mmvq_bunch(int ggml_type, const void* w1, const void* w2, const void* w3, const void* x_q8_1,
+                       float* y1, float* y2, float* y3, int n_in, int n_out1, int n_out2, int n_out3,
+                       int ncols, void* stream) {
+    using F = SmallTraits<Q80Block, 8>;
+    if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > 8 || n_out1 <= 0 || n_out2 <= 0 ||
+        n_in <= 0 || n_in % 32 != 0 || n_in / F::DIV < F::BPI || !w1 || !w2 || !x_q8_1 || !y1 || !y2 ||
+        !stream || (n_out3 > 0 && (!w3 || !y3)))
+        return false;
+    const auto& reg = q8_packed_registry();
+    if (reg.count(w1) || reg.count(w2) || (w3 != nullptr && reg.count(w3))) return false;
+    const auto* a = static_cast<const Q80Block*>(w1);
+    const auto* b = static_cast<const Q80Block*>(w2);
+    const auto* c = n_out3 > 0 ? static_cast<const Q80Block*>(w3) : nullptr;
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    switch (ncols) {
+        case 2: q8_0_bunch_launch<2>(a, b, c, x, y1, y2, y3, n_in, n_out1, n_out2, n_out3, s); break;
+        case 3: q8_0_bunch_launch<3>(a, b, c, x, y1, y2, y3, n_in, n_out1, n_out2, n_out3, s); break;
+        case 4: q8_0_bunch_launch<4>(a, b, c, x, y1, y2, y3, n_in, n_out1, n_out2, n_out3, s); break;
+        case 5: q8_0_bunch_launch<5>(a, b, c, x, y1, y2, y3, n_in, n_out1, n_out2, n_out3, s); break;
+        case 6: q8_0_bunch_launch<6>(a, b, c, x, y1, y2, y3, n_in, n_out1, n_out2, n_out3, s); break;
+        case 7: q8_0_bunch_launch<7>(a, b, c, x, y1, y2, y3, n_in, n_out1, n_out2, n_out3, s); break;
+        default: q8_0_bunch_launch<8>(a, b, c, x, y1, y2, y3, n_in, n_out1, n_out2, n_out3, s); break;
+    }
+    launch_check();
+    return true;
 }
 
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,

@@ -34,6 +34,9 @@ td.log
 /mtp/
 /run-*.bat
 /run-*.sh
+# ... except this fork's own launchers, which are source (setup.py's own run-* scripts stay ignored)
+!/run-peer.sh
+!/run-peer-4bpw.sh
 /strata-*.json
 /strata-*.log
 /build-strata.bat
@@ -61,3 +64,13 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# the local python environment is a symlink to a sibling checkout's venv (setup makes a real
+# directory; /.venv/ above only matches that form)
+/.venv
+# compiled investigation probes under notes/ (sources live beside them or in the notes' text)
+notes/funnel_probe
+notes/rdna_probe
+notes/rdna_probe2
+notes/shared_probe
+notes/rdna_ab

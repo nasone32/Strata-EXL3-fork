@@ -16,7 +16,9 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/platform/memory.hpp"
+#include "strata/platform/decode_trace.hpp"
 #include "strata/core/arch_defaults.hpp"
+#include "strata/core/exl3_flags.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/device.hpp"
@@ -88,7 +90,12 @@
 #endif
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/exl3_pack.hpp"
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/exl3_experts.hpp"
+#include "strata/kernels/cpu/exl3_moe.hpp"
+#include "strata/artifact/exl3_model.hpp"
+#include "strata/kernels/exl3_peer.hpp"
+#include "strata/kernels/exl3_peer_adapt.hpp"
 #include "strata/core/family_layout.hpp"
 #if defined(STRATA_HAVE_QWEN35)
 #include "strata/qwen35/engine.hpp"
@@ -498,6 +505,8 @@ struct Options {
     int peer_reserve_mib = 600;
     int64_t peer_slots = 0;
     int peer_adapt_swaps = -1;
+    int peer_adapt_mib = 0; // EXL3 opt-in: per-round upload limit (0: swap cap only)
+    float peer_adapt_min_gain = 1.5f;
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
     int64_t peer_prefill_rows = -1;
@@ -551,6 +560,9 @@ struct Options {
     int64_t prefill_auto_max = 8192;
     /// #1630: a bare `--prefill auto` stops here on a Windows HIP build (0: no cap). A chunk the user names is not capped.
     int64_t prefill_auto_cap = 0;
+    /// the operator NAMED the chunk (`--prefill N`, not auto) - the EXL3 arena loan's eligibility: an auto chunk is
+    /// not sized for this rig's cache, so only an explicit one borrows the arena's tail ranks
+    bool prefill_explicit = false;
     /// a bare `--prefill auto` (no ":N", no STRATA_PREFILL_AUTO_MAX): the gfx12 Linux rule below may raise its ceiling
     bool prefill_auto_bare = false;
     bool prefill_gfx12_16k = false;   ///< the gfx12 default raised the auto chunk ceiling to 16384 (a layer split takes 8192 back, 0.1.44)
@@ -912,6 +924,8 @@ void usage() {
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
                  "  --peer-slots N       expert slots on the peer (default: what fits)\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
+                 "  --peer-adapt-mib N   EXL3 adaptive peer: maximum upload MiB per round (0 = swap cap only)\n"
+                 "  --peer-adapt-min-gain F  EXL3 adaptive peer: usage gain over a victim (default 1.5)\n"
                  "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
                  "                       0 = the prompt path stays on the primary)\n"
                  "  --expert-cache-per-layer  R4.2g: give each layer its OWN slots instead of letting the first\n"
@@ -1044,16 +1058,163 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
     }
 }
 
+/// The peer split's complement chunk: a (tokens=c, k=1) run_multi call carries at most this many
+/// routes - the stream's setup reserves at least an 8-token window, so no chunk can grow a
+/// buffer inside a callback.  The verifier window itself is <= 8 tokens x top-k (<= 64 routes).
+constexpr int64_t kPeerChunkTokens = 8;
+
 /// The EXL3 expert pool: streams each layer's routed experts from the model's safetensors and runs them.
+/// The peer tier (opt-in, STRATA_EXL3_PEER=1): a startup (layer, expert) subset computed on a
+/// second device by `Exl3Peer`; this pool's complement rows keep the primary path, and the primary
+/// cache never admits peer-owned weights (the stream's ownership exclusion).
 struct Exl3Drive {
     strata::kernels::Exl3ExpertStream* stream = nullptr;
     int cur_layer = 0;
     bool* failed = nullptr;
     std::vector<strata::kernels::Exl3ExpertStream*> layers;
+    strata::kernels::Exl3Peer* peer = nullptr;
+    strata::kernels::Exl3PeerOutput* peer_output = nullptr;
+    strata::kernels::Exl3PeerAdapt* peer_adapt = nullptr;
+    int64_t n_embd = 2560;
+    // peer-tier accounting (printed at shutdown): the smoke must see REAL peer rows, not just
+    // a tier that started
+    int64_t peer_rows = 0, win_mixed = 0, win_all = 0, win_zero = 0, peer_fallbacks = 0;
+    int64_t routes_seen = 0;
+    // STRATA_EXL3_PROF=1 (verification-profile milestone): callback service spans, printed at
+    // shutdown.  HOST-ELAPSED, not CPU time and not additive GPU time: the peer's launch merely
+    // enqueues its work (which then runs concurrently with the primary service), the primary
+    // service is a blocking call whose GPU work overlaps the peer's, and `finish`'s span
+    // CONTAINS the wait for the peer's remaining GPU work.  `other` = callback residual
+    // (route classification, the padded/chunk staging copies, scatter).
+    bool prof = false;
+    int64_t prof_cb = 0, prof_primary_calls = 0;
+    double prof_cb_ms = 0, prof_peer_launch_ms = 0, prof_primary_ms = 0, prof_peer_finish_ms = 0;
+    struct ProfileSnapshot {
+        int64_t calls, primary_calls, routes, peer_rows;
+        double callback_ms, launch_ms, primary_ms, finish_ms;
+    };
+    ProfileSnapshot profile_snapshot() const {
+        return {prof_cb, prof_primary_calls, routes_seen, peer_rows, prof_cb_ms,
+                prof_peer_launch_ms, prof_primary_ms, prof_peer_finish_ms};
+    }
+    void profile_request(const ProfileSnapshot& b) const {
+        const auto a = profile_snapshot();
+        const int64_t calls = a.calls - b.calls;
+        if (!prof || calls <= 0) return;
+        const int64_t routes = a.routes - b.routes, peers = a.peer_rows - b.peer_rows;
+        std::fprintf(stderr, "strata EXL3 request profile: %lld callbacks, %lld primary calls, "
+                     "%lld routes, %lld peer routes (%.2f%%); callback %.3f ms = launch %.3f + "
+                     "primary %.3f + finish %.3f + other %.3f ms/call (inclusive host spans)\n",
+                     (long long) calls, (long long) (a.primary_calls-b.primary_calls),
+                     (long long) routes, (long long) peers, routes ? 100.0*peers/routes : 0.0,
+                     (a.callback_ms-b.callback_ms)/calls, (a.launch_ms-b.launch_ms)/calls,
+                     (a.primary_ms-b.primary_ms)/calls, (a.finish_ms-b.finish_ms)/calls,
+                     ((a.callback_ms-b.callback_ms)-(a.launch_ms-b.launch_ms)-
+                      (a.primary_ms-b.primary_ms)-(a.finish_ms-b.finish_ms))/calls);
+    }
+    ~Exl3Drive() {
+        if (cpu != nullptr && (cpu_rows > 0 || routes_seen > 0))
+            std::fprintf(stderr, "strata generate: EXL3 cpu tier summary: %lld of %lld routed rows computed on "
+                         "the CPU (%.1f%%)\n", (long long) cpu_rows, (long long) routes_seen,
+                         routes_seen > 0 ? 100.0 * (double) cpu_rows / (double) routes_seen : 0.0);
+        if (peer != nullptr || peer_rows > 0)
+            std::fprintf(stderr, "strata generate: EXL3 peer summary: %lld of %lld routed rows computed "
+                         "by the peer (%.1f%%), windows mixed/all/zero %lld/%lld/%lld, %lld fallbacks\n",
+                         (long long) peer_rows, (long long) routes_seen,
+                         routes_seen > 0 ? 100.0 * (double) peer_rows / (double) routes_seen : 0.0,
+                         (long long) win_mixed, (long long) win_all,
+                         (long long) win_zero, (long long) peer_fallbacks);
+        if (prof && prof_cb > 0)
+            std::fprintf(stderr, "strata generate: EXL3 callback profile (%lld layer-calls): host elapsed per "
+                         "call callback %.3f ms = peer launch %.3f + primary service %.3f (%lld calls) + peer "
+                         "finish %.3f + other %.3f (inclusive host spans; peer GPU work overlaps the primary "
+                         "service and its tail hides in finish's wait - NOT additive GPU time)\n",
+                         (long long) prof_cb, prof_cb_ms / (double) prof_cb,
+                         prof_peer_launch_ms / (double) prof_cb, prof_primary_ms / (double) prof_cb,
+                         (long long) prof_primary_calls, prof_peer_finish_ms / (double) prof_cb,
+                         (prof_cb_ms - prof_peer_launch_ms - prof_primary_ms - prof_peer_finish_ms) / (double) prof_cb);
+    }
+    // the split's preallocated callback buffers (NO allocation in a callback): worst window is
+    // 8 tokens x 64 routes; every complement row gets its own x row (k=1 call layout)
+    std::vector<float> p_x, p_out;
+    std::vector<int32_t> p_ids, p_kind;
+    std::vector<int64_t> p_row;
+    void peer_buf_init(int64_t max_routes, int64_t embd) {
+        n_embd = embd;
+        p_x.assign((size_t) max_routes * (size_t) embd, 0.0f);
+        p_out.assign((size_t) max_routes * (size_t) embd, 0.0f);
+        p_ids.assign((size_t) max_routes, 0);
+        p_kind.assign((size_t) max_routes, 0);
+        p_row.assign((size_t) max_routes, 0);
+    }
+    // ---- The EXL3 CPU tier (opt-in STRATA_EXL3_CPU_TIER): the stream's REFUSED rows (cache
+    // full, nothing evicted) are computed on the CPU by the ported exllamav3 kernels - the
+    // GGUF pool's overflow policy.  The service itself lives in the setup scope; the drive
+    // keeps the preallocated per-row tables the callbacks build (again: no allocation there).
+    strata::kernels::cpu::Exl3CpuMoe* cpu = nullptr;
+    std::vector<uint8_t> cpu_flag;   // tokens*k refusal flags from the stream
+    std::vector<int> cpu_ids, cpu_tok, cpu_row;
+    int64_t cpu_rows = 0;
+    int cpu_hybrid_groups = 0;  // opt-in singleton miss quota; native layout avoids cold repacks
+    int cpu_hybrid_min_misses = 4;
+    bool cpu_hybrid_peer = false;
+    int cpu_hybrid_start(strata::kernels::Exl3ExpertStream* experts, int layer,
+                         const float* x, const int32_t* ids, int tokens, int k, float* out,
+                         const int32_t* peer_kind = nullptr) {
+        const int routes = tokens * k;
+        if (!cpu || cpu_hybrid_groups <= 0 || routes > (int) cpu_flag.size()) return 0;
+        if (cpu_hybrid_peer) {
+            if (!peer_kind) return 0;
+            for (int i = 0; i < routes; ++i) cpu_flag[(size_t) i] = peer_kind[i] == 2;
+        } else experts->classify(layer, ids, tokens, k, cpu_flag.data());
+        int misses = 0;
+        for (int i = 0; i < routes; ++i) if (cpu_flag[(size_t) i]) {
+            bool first = true;
+            for (int j = 0; j < i; ++j) if (ids[j] == ids[i]) { first = false; break; }
+            misses += first;
+        }
+        if (!cpu_hybrid_peer && misses < cpu_hybrid_min_misses) return 0;
+        int n = 0;
+        for (int i = 0; i < routes; ++i) {
+            bool take = cpu_flag[(size_t) i] != 0 && n < cpu_hybrid_groups;
+            if (take) {
+                int reuse = 0;
+                for (int j = 0; j < routes; ++j) reuse += ids[j] == ids[i];
+                take = reuse == 1;  // keep multirow weight reuse on GPU
+            }
+            cpu_flag[(size_t) i] = take;
+            if (take) {
+                cpu_ids[(size_t) n] = ids[i]; cpu_tok[(size_t) n] = i / k;
+                cpu_row[(size_t) n++] = i;
+            }
+        }
+        if (n) {
+            try {
+                cpu->run_rows_bg(layer, x, n_embd, cpu_ids.data(), cpu_tok.data(),
+                                 cpu_row.data(), n, out, n_embd);
+            } catch (const std::exception& err) {
+                std::fprintf(stderr, "strata EXL3 CPU hybrid: %s; keeping rows on GPU\n", err.what());
+                std::fill(cpu_flag.begin(), cpu_flag.begin() + routes, 0);
+                return 0;
+            }
+        }
+        return n;
+    }
+    void cpu_hybrid_join(int n) {
+        if (n > 0) { cpu->run_rows_join(); cpu_rows += n; }
+    }
+    void cpu_buf_init(int64_t max_routes) {
+        cpu_flag.assign((size_t) max_routes, 0);
+        cpu_ids.assign((size_t) max_routes, 0);
+        cpu_tok.assign((size_t) max_routes, 0);
+        cpu_row.assign((size_t) max_routes, 0);
+    }
     strata::kernels::Exl3ExpertStream* for_layer(int layer) const {
         return layers.empty() ? stream : (layer >= 0 && (size_t) layer < layers.size() ? layers[(size_t) layer] : nullptr);
     }
 };
+void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t tokens,
+                           int64_t k, float* out, int64_t layer);
 void drive_exl3_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
                      int64_t k, float* out) {
     (void) weights;   // `moe_combine` applies the router weights on the device
@@ -1061,6 +1222,93 @@ void drive_exl3_pool(void* user, const float* x_f, const int32_t* ids, const flo
     { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) std::fprintf(stderr, "strata generate: prior cuda error before the EXL3 pool: %s\n", cudaGetErrorString(e)); }
     if (t->stream == nullptr) { std::memset(out, 0, (size_t) n_embd * (size_t) k * sizeof(float)); return; }
     const int layer = t->cur_layer++;
+    if (t->cpu_hybrid_groups > 0) {
+        drive_exl3_pool_multi(user, x_f, ids, 1, k, out, layer);
+        return;
+    }
+    if (t->peer_adapt) t->peer_adapt->observe(layer, ids, (int) k);
+    // ---- STATIC peer tier (see drive_exl3_pool_multi): peer rows launch first, finish into
+    // their destinations before publication; the complement keeps the primary path; any failure
+    // falls through to the FULL primary service - nothing partial is ever published.
+    strata::kernels::Exl3Peer* peer = t->peer;
+    if (peer != nullptr && peer->valid() && k <= (int64_t) t->p_kind.size()) {
+        int64_t n_peer = 0;
+        for (int64_t i = 0; i < k; ++i) {
+            t->p_kind[(size_t) i] = peer->has(layer, ids[i]) ? 2 : -1;
+            n_peer += t->p_kind[(size_t) i] == 2;
+        }
+        if (n_peer > 0) {
+            std::string perr;
+            bool ok = peer->launch(layer, x_f, ids, 1, (int) k, t->p_kind.data(), perr);
+            if (ok && n_peer == k) {
+                ok = peer->finish(out, perr);
+            } else if (ok) {
+                int64_t c = 0;
+                for (int64_t i = 0; i < k; ++i) {
+                    if (t->p_kind[(size_t) i] == 2) continue;
+                    t->p_ids[(size_t) c] = ids[i];
+                    t->p_row[(size_t) c] = i;
+                    ++c;
+                }
+                ok = t->stream->run(layer, x_f, t->p_ids.data(), (int) c, t->p_out.data(), nullptr) &&
+                     peer->finish(out, perr);
+                if (ok)
+                    for (int64_t j = 0; j < c; ++j)
+                        std::memcpy(out + (size_t) t->p_row[(size_t) j] * (size_t) n_embd,
+                                    t->p_out.data() + (size_t) j * (size_t) n_embd,
+                                    (size_t) n_embd * sizeof(float));
+            }
+            if (ok) {
+                t->peer_rows += n_peer;
+                return;
+            }
+            std::fprintf(stderr, "strata generate: the EXL3 peer tier failed at layer %d (%s) - "
+                         "full primary fallback\n", layer, perr.c_str());
+            ++t->peer_fallbacks;
+            peer->close();
+            t->stream->set_owned_elsewhere(nullptr, 0, 0);
+        }
+    }
+    // ---- The CPU tier's rows (opt-in STRATA_EXL3_CPU_TIER): the stream refuses cache-full
+    // misses (zeroing their rows) and this computes them here, on the host, before the
+    // caller's combine reads `out`.  A CPU failure falls back to the GPU for exactly those
+    // rows - the tier must never break generation.
+    if (t->cpu != nullptr && k <= 64) {
+        uint8_t cpu_rows[64];
+        if (t->stream->run(layer, x_f, ids, (int) k, out, nullptr, cpu_rows)) {
+            int cids[64], ct[64], cr[64];
+            int n = 0;
+            for (int64_t i = 0; i < k; ++i)
+                if (cpu_rows[i] != 0) { cids[n] = ids[i]; ct[n] = 0; cr[n] = (int) i; ++n; }
+            if (n > 0) {
+                bool ok = true;
+                try {
+                    t->cpu->run_rows(layer, x_f, t->n_embd, cids, ct, cr, n, out, t->n_embd);
+                } catch (const std::exception& err) {
+                    std::fprintf(stderr, "strata generate: EXL3 cpu tier failed at layer %d (%s) - gpu fallback\n",
+                                 layer, err.what());
+                    ok = false;
+                }
+                if (!ok && t->stream->run(layer, x_f, cids, n, t->p_out.data(), nullptr))
+                    for (int j = 0; j < n; ++j)
+                        std::memcpy(out + (size_t) cr[j] * (size_t) n_embd,
+                                    t->p_out.data() + (size_t) j * (size_t) n_embd,
+                                    (size_t) n_embd * sizeof(float));
+                else if (!ok) {
+                    if (t->failed) *t->failed = true;
+                    for (int j = 0; j < n; ++j)
+                        std::memset(out + (size_t) cr[j] * (size_t) n_embd, 0, (size_t) n_embd * sizeof(float));
+                }
+                t->cpu_rows += n;
+            }
+            return;
+        }
+        // the stream itself failed: fall through to the shared failure handling
+        std::memset(out, 0, (size_t) n_embd * (size_t) k * sizeof(float));
+        if (t->failed) *t->failed = true;
+        std::fprintf(stderr, "strata generate: EXL3 expert stream failed at layer %d\n", layer);
+        return;
+    }
     if (!t->stream->run(layer, x_f, ids, (int) k, out, nullptr)) {
         if (t->failed) *t->failed = true;
         std::memset(out, 0, (size_t) n_embd * (size_t) k * sizeof(float));
@@ -1068,18 +1316,283 @@ void drive_exl3_pool(void* user, const float* x_f, const int32_t* ids, const flo
     }
 }
 
+void configure_exl3_verify_graph(strata::core::VerifyHits& vh,
+                                 strata::kernels::Exl3ExpertStream* experts, int k,
+                                 strata::kernels::Exl3PeerOutput* peer_output = nullptr) {
+    const char* flag = std::getenv("STRATA_EXL3_VERIFY_HITS");
+    if (!experts || (!peer_output && (!flag || !flag[0] || flag[0] == '0'))) return;
+    experts->enable_verify_graph(strata::kernels::kVerifyMaxT, k);
+    auto& eg = vh.external_graph;
+    using Stream = strata::kernels::Exl3ExpertStream;
+    eg.user = experts;
+    eg.refresh = [](void* p, void* st) { ((Stream*) p)->refresh_verify_graph(st); };
+    eg.hits = [](void* p, int l, const float* x, const int32_t* ids, int t, int k, float* out,
+                 uint32_t ring, void* st) { ((Stream*) p)->verify_graph_hits(l, x, ids, t, k, out, ring, st); };
+    eg.publish = [](void* p, int l, const float* x, const int32_t* ids, int t, int k,
+                    float* mx, int32_t* mi, uint32_t* seq, uint32_t ring, void* st) {
+        ((Stream*) p)->verify_graph_publish(l, x, ids, t, k, mx, mi, seq, ring, st);
+    };
+    eg.skip = [](void* p) { return ((Stream*) p)->verify_graph_skip(); };
+    eg.copy_misses = [](void* p, const float* mapped, float* out, int routes, void* st) {
+        ((Stream*) p)->verify_graph_copy_misses(mapped, out, routes, st);
+    };
+    eg.begin_host = [](void* p, int l) { return ((Stream*) p)->verify_graph_begin_host(l); };
+    eg.end_host = [](void* p, int l) { ((Stream*) p)->verify_graph_end_host(l); };
+    if(peer_output) {
+        eg.peer_user=peer_output;
+        eg.copy_peer=[](void* p,float* parts,int routes,const uint32_t* skip,uint32_t ring,void* st) {
+            ((strata::kernels::Exl3PeerOutput*)p)->copy(parts,routes,skip,ring,st);
+        };
+        eg.release_peer=[](void* p) {((strata::kernels::Exl3PeerOutput*)p)->release();};
+    }
+}
+
 void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t tokens,
                            int64_t k, float* out, int64_t layer) {
     auto* drive = (Exl3Drive*) user;
     auto* experts = drive->for_layer((int) layer);
-    if (!experts || tokens <= 0 || tokens > INT32_MAX || k <= 0 || k > 64 ||
-        !experts->run_multi((int) layer, x_f, ids, (int) tokens, (int) k, out, nullptr)) {
+    if (!experts || tokens <= 0 || tokens > INT32_MAX || k <= 0 || k > 64) {
+        if (drive->failed) *drive->failed = true;
+        if (drive->stream && tokens > 0 && k > 0)
+            std::memset(out, 0, (size_t) tokens * (size_t) k * 2560 * sizeof(float));
+        std::fprintf(stderr, "strata generate: EXL3 window failed at layer %lld\n", (long long) layer);
+        return;
+    }
+    if (drive->peer_adapt && !experts->verify_graph_host_active())
+        drive->peer_adapt->observe((int) layer, ids, (int) (tokens * k));
+    struct OutputFrame {
+        strata::kernels::Exl3PeerOutput* output;
+        bool published=false;
+        ~OutputFrame(){if(output && !published) output->empty();}
+    } output_frame{drive->peer_output};
+    static const bool kProf = [] {
+        const char* v = std::getenv("STRATA_EXL3_PROF");
+        return v && v[0] && v[0] != '0';
+    }();
+    if (experts->verify_graph_host_active())
+        experts->verify_graph_check((int) layer, x_f, ids, (int) tokens, (int) k);
+    if (kProf) drive->prof = true;
+    const Clock::time_point cb0 = kProf ? Clock::now() : Clock::time_point{};
+    auto prof_ms = [](Clock::time_point t0) {
+        return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    };
+    // ---- STATIC peer tier: the kind-2 rows LAUNCH on the peer before the primary service and
+    // FINISH (into their own out destinations) before this callback returns - before the
+    // verifier publishes the rows.  The complement keeps the primary path in bounded chunks.
+    // Any peer failure falls through to the FULL primary service below: nothing partial is ever
+    // published, and the tier closes (drains) with its exclusions cleared.
+    strata::kernels::Exl3Peer* peer = drive->peer;
+    auto finish_peer=[&](std::string& error) {
+        const bool ok=drive->peer_output ? peer->finish_deferred(error) : peer->finish(out,error);
+        if(ok && drive->peer_output) output_frame.published=true;
+        return ok;
+    };
+    const int64_t routes = tokens * k;
+    drive->routes_seen += routes;   // the peer and CPU summaries share the denominator
+    if (peer != nullptr && peer->valid() && routes <= (int64_t) drive->p_kind.size()) {
+        int64_t n_peer = 0;
+        for (int64_t i = 0; i < routes; ++i) {
+            drive->p_kind[(size_t) i] = peer->has(layer, ids[i]) ? 2 : -1;
+            n_peer += drive->p_kind[(size_t) i] == 2;
+        }
+        if (n_peer == 0) ++drive->win_zero;
+        else if (n_peer == routes) ++drive->win_all;
+        else ++drive->win_mixed;
+        // STRATA_EXL3_PEER_TRACE=1: unbuffered stderr breadcrumbs around every peer-stage
+        // boundary, so a hung window's LAST line names the stage that never returned.
+        static const bool kPeerTrace = [] {
+            const char* v = std::getenv("STRATA_EXL3_PEER_TRACE");
+            return v && v[0] && v[0] != '0';
+        }();
+        if (kPeerTrace)
+            std::fprintf(stderr, "exl3 peer trace: L%lld tok=%lld k=%lld routes=%lld n_peer=%lld%s\n",
+                         (long long) layer, (long long) tokens, (long long) k, (long long) routes,
+                         (long long) n_peer, n_peer == 0 ? " (no launch)" : "");
+        if (n_peer > 0) {
+            std::string perr;
+            const Clock::time_point t_launch = kProf ? Clock::now() : Clock::time_point{};
+            static const bool peer_sparse = strata::core::exl3_flag("STRATA_EXL3_PEER_SPARSE", nullptr, true);
+            int n_cpu = 0;
+            if (drive->cpu_hybrid_peer && (peer_sparse || experts->verify_graph_host_active())) {
+                n_cpu = drive->cpu_hybrid_start(experts, (int) layer, x_f, ids, (int) tokens, (int) k, out,
+                                                drive->p_kind.data());
+                for (int64_t i = 0; i < routes; ++i) if (n_cpu && drive->cpu_flag[(size_t) i]) {
+                    drive->p_kind[(size_t) i] = -1;
+                    --n_peer;
+                }
+            }
+            if (kPeerTrace) std::fprintf(stderr, "exl3 peer trace: L%lld launch+\n", (long long) layer);
+            bool ok = peer->launch(layer, x_f, ids, (int) tokens, (int) k, drive->p_kind.data(), perr,drive->peer_output);
+            if (kPeerTrace) std::fprintf(stderr, "exl3 peer trace: L%lld launch- ok=%d\n", (long long) layer, (int) ok);
+            if (kProf) drive->prof_peer_launch_ms += prof_ms(t_launch);
+            if (ok && n_peer == routes) {
+                const Clock::time_point t_fin = kProf ? Clock::now() : Clock::time_point{};
+                ok = finish_peer(perr);   // graph transport may defer completion until consumption
+                if (kProf) drive->prof_peer_finish_ms += prof_ms(t_fin);
+            } else if (ok) {
+                if (peer_sparse || experts->verify_graph_host_active()) {
+                    // Preserve token indices and omit owned groups without dummy compute.
+                    const Clock::time_point t_prim = kProf ? Clock::now() : Clock::time_point{};
+                    if (!drive->cpu_hybrid_peer)
+                        n_cpu = drive->cpu_hybrid_start(experts, (int) layer, x_f, ids, (int) tokens, (int) k, out);
+                    ok = experts->run_multi_complement((int) layer, x_f, ids, (int) tokens, (int) k, out, nullptr,
+                                                       n_cpu ? drive->cpu_flag.data() : nullptr);
+                    if (kProf) { drive->prof_primary_ms += prof_ms(t_prim); ++drive->prof_primary_calls; }
+                } else {
+                // TRUE compact complement in bounded chunks (<= kPeerChunkTokens routes per
+                // (tokens=c, k=1) call - within the stream's setup token capacity, no callback
+                // allocation and no unchecked caps): each chunk's rows scatter to their own out
+                // destinations; the peer's rows land at theirs via finish().
+                int64_t c = 0;
+                for (int64_t i = 0; i < routes; ++i) {
+                    if (drive->p_kind[(size_t) i] == 2) continue;
+                    std::memcpy(drive->p_x.data() + (size_t) c * (size_t) drive->n_embd,
+                                x_f + (size_t) (i / k) * (size_t) drive->n_embd,
+                                (size_t) drive->n_embd * sizeof(float));   // copied before return
+                    drive->p_ids[(size_t) c] = ids[i];
+                    drive->p_row[(size_t) c] = i;
+                    ++c;
+                }
+                // ONE targeted competing strategy (opt-in STRATA_EXL3_PEER_PADDED=1): ONE
+                // (tokens,k) call per window - the complement rows padded with a non-peer id
+                // (their output is overwritten by finish).  The compact (c,k=1) whole-window
+                // form is UNSAFE: it hangs in the staging join above 8 tokens (demonstrated;
+                // <=8 works), so the default stays the bounded 8-route chunks.
+                static const bool peer_padded = strata::core::exl3_flag("STRATA_EXL3_PEER_PADDED", nullptr, true);
+                if (peer_padded) {
+                    int32_t pad_id = 0;
+                    for (int64_t i = 0; i < routes; ++i)
+                        if (drive->p_kind[(size_t) i] != 2) { pad_id = ids[i]; break; }
+                    for (int64_t i = 0; i < routes; ++i)
+                        drive->p_ids[(size_t) i] = drive->p_kind[(size_t) i] == 2 ? pad_id : ids[i];
+                    const Clock::time_point t_prim = kProf ? Clock::now() : Clock::time_point{};
+                    ok = experts->run_multi((int) layer, x_f, drive->p_ids.data(), (int) tokens, (int) k,
+                                            out, nullptr);
+                    if (kProf) { drive->prof_primary_ms += prof_ms(t_prim); ++drive->prof_primary_calls; }
+                }
+                for (int64_t j = 0; ok && !peer_padded && j < c; j += kPeerChunkTokens) {
+                    const int64_t n = std::min<int64_t>(kPeerChunkTokens, c - j);
+                    const Clock::time_point t_prim = kProf ? Clock::now() : Clock::time_point{};
+                    if (kPeerTrace)
+                        std::fprintf(stderr, "exl3 peer trace: L%lld prim chunk j=%lld n=%lld+\n",
+                                     (long long) layer, (long long) j, (long long) n);
+                    ok = experts->run_multi((int) layer, drive->p_x.data() + (size_t) j * drive->n_embd,
+                            drive->p_ids.data() + j, (int) n, 1,
+                            drive->p_out.data(), nullptr);
+                    if (kProf) { drive->prof_primary_ms += prof_ms(t_prim); ++drive->prof_primary_calls; }
+                    if (kPeerTrace)
+                        std::fprintf(stderr, "exl3 peer trace: L%lld prim chunk j=%lld ok=%d\n",
+                                     (long long) layer, (long long) j, (int) ok);
+                    if (ok)
+                        for (int64_t q = 0; q < n; ++q)   // scatter before the next chunk reuses p_out
+                            std::memcpy(out + (size_t) drive->p_row[(size_t) (j + q)] * (size_t) drive->n_embd,
+                                        drive->p_out.data() + (size_t) q * (size_t) drive->n_embd,
+                                        (size_t) drive->n_embd * sizeof(float));
+                }
+                }
+                const Clock::time_point t_fin = kProf ? Clock::now() : Clock::time_point{};
+                if (kPeerTrace) std::fprintf(stderr, "exl3 peer trace: L%lld finish+\n", (long long) layer);
+                ok = ok && finish_peer(perr);
+                if (kPeerTrace) std::fprintf(stderr, "exl3 peer trace: L%lld finish- ok=%d\n",
+                                             (long long) layer, (int) ok);
+                if (kProf) drive->prof_peer_finish_ms += prof_ms(t_fin);
+            }
+            // Join even after primary/peer failure, before fallback can reuse out.
+            drive->cpu_hybrid_join(n_cpu);
+            if (ok) {
+                drive->peer_rows += n_peer;
+                if (kProf) { drive->prof_cb_ms += prof_ms(cb0); ++drive->prof_cb; }
+                return;
+            }
+            std::fprintf(stderr, "strata generate: the EXL3 peer tier failed at layer %lld (%s) - "
+                         "full primary fallback\n", (long long) layer, perr.c_str());
+            ++drive->peer_fallbacks;
+            peer->close();
+            experts->set_owned_elsewhere(nullptr, 0, 0);   // safe mid-run: exclusions drop and the
+                                                           // primary may cache the orphaned pairs
+        }
+    }
+    const Clock::time_point t_full = kProf ? Clock::now() : Clock::time_point{};
+    // ---- The CPU tier's rows (opt-in STRATA_EXL3_CPU_TIER), OVERLAPPED: classify first (the
+    // refusal decision, no side effects), publish the CPU job on the pool's workers, then run
+    // the GPU part - staging, FFN, D2H of the admitted rows - while the CPU computes the
+    // refused ones, and join.  The two write disjoint rows of `out`; computing them in series
+    // measured slower than the evict-and-upload policy the tier replaces, so the overlap is
+    // the whole point of the shape.
+    bool ran = false;
+    if (drive->cpu_hybrid_groups > 0) {
+        const int n = drive->cpu_hybrid_start(experts, (int) layer, x_f, ids, (int) tokens, (int) k, out);
+        ran = experts->run_multi_complement((int) layer, x_f, ids, (int) tokens, (int) k, out, nullptr,
+                                            n ? drive->cpu_flag.data() : nullptr);
+        drive->cpu_hybrid_join(n);
+    } else if (drive->cpu != nullptr && routes <= (int64_t) drive->cpu_flag.size()) {
+        experts->classify((int) layer, ids, (int) tokens, (int) k, drive->cpu_flag.data());
+        int n = 0;
+        for (int64_t i = 0; i < routes; ++i)
+            if (drive->cpu_flag[(size_t) i] != 0) {
+                drive->cpu_ids[(size_t) n] = ids[i];
+                drive->cpu_tok[(size_t) n] = (int) (i / k);
+                drive->cpu_row[(size_t) n] = (int) i;
+                ++n;
+            }
+        if (n > 0) {
+            bool bg_ok = true;
+            try {
+                drive->cpu->run_rows_bg((int) layer, x_f, drive->n_embd, drive->cpu_ids.data(),
+                                        drive->cpu_tok.data(), drive->cpu_row.data(), n, out, drive->n_embd);
+            } catch (const std::exception& err) {
+                std::fprintf(stderr, "strata generate: EXL3 cpu tier failed to start at layer %lld (%s) - "
+                             "gpu fallback for its rows\n", (long long) layer, err.what());
+                bg_ok = false;
+            }
+            ran = experts->run_multi((int) layer, x_f, ids, (int) tokens, (int) k, out, nullptr,
+                                     drive->cpu_flag.data());
+            if (bg_ok) {
+                drive->cpu->run_rows_join();
+            } else {
+                // GPU fallback for exactly the refused rows: bounded (c, k=1) chunks into the
+                // preallocated complement buffers, then scatter (the peer complement's shape)
+                bool ok = true;
+                for (int64_t j = 0; j < n; ++j) {
+                    std::memcpy(drive->p_x.data() + (size_t) j * (size_t) drive->n_embd,
+                                x_f + (size_t) drive->cpu_tok[(size_t) j] * (size_t) drive->n_embd,
+                                (size_t) drive->n_embd * sizeof(float));
+                    drive->p_ids[(size_t) j] = drive->cpu_ids[(size_t) j];
+                }
+                for (int64_t j = 0; ok && j < n; j += kPeerChunkTokens) {
+                    const int64_t c = std::min<int64_t>(kPeerChunkTokens, n - j);
+                    if (!experts->run_multi((int) layer, drive->p_x.data() + (size_t) j * drive->n_embd,
+                                            drive->p_ids.data() + j, (int) c, 1, drive->p_out.data(), nullptr))
+                        ok = false;
+                    if (ok)
+                        for (int64_t q = 0; q < c; ++q)
+                            std::memcpy(out + (size_t) drive->cpu_row[(size_t) (j + q)] * (size_t) drive->n_embd,
+                                        drive->p_out.data() + (size_t) q * (size_t) drive->n_embd,
+                                        (size_t) drive->n_embd * sizeof(float));
+                }
+                if (!ok) {
+                    ran = false;
+                    for (int64_t j = 0; j < n; ++j)
+                        std::memset(out + (size_t) drive->cpu_row[(size_t) j] * (size_t) drive->n_embd, 0,
+                                    (size_t) drive->n_embd * sizeof(float));
+                }
+            }
+            drive->cpu_rows += n;
+        } else {
+            ran = experts->run_multi((int) layer, x_f, ids, (int) tokens, (int) k, out, nullptr);
+        }
+    } else {
+        ran = experts->run_multi((int) layer, x_f, ids, (int) tokens, (int) k, out, nullptr);
+    }
+    if (kProf) { drive->prof_primary_ms += prof_ms(t_full); ++drive->prof_primary_calls; }
+    if (!ran) {
         if (drive->failed) *drive->failed = true;
         // Let the verifier drain its wait kernels; the caller rejects this window via the failure latch.
         if (drive->stream && tokens > 0 && k > 0)
             std::memset(out, 0, (size_t) tokens * (size_t) k * 2560 * sizeof(float));
         std::fprintf(stderr, "strata generate: EXL3 window failed at layer %lld\n", (long long) layer);
     }
+    if (kProf) { drive->prof_cb_ms += prof_ms(cb0); ++drive->prof_cb; }
 }
 
 /// Plan v0.3 P6: the pool for a verify window.
@@ -2119,6 +2632,7 @@ int main(int argc, char** argv) {
         else if (a == "--prefill") {
             const std::string v = next("--prefill");
             o.prefill_auto = v == "auto" || v.rfind("auto:", 0) == 0;
+            o.prefill_explicit = !o.prefill_auto;
             // #282: auto:N (N = 16384 or 32768) or STRATA_PREFILL_AUTO_MAX lets auto take chunks above 8192
             const char* env_max = std::getenv("STRATA_PREFILL_AUTO_MAX");
             const long long want_max = v.rfind("auto:", 0) == 0 ? std::atoll(v.c_str() + 5)
@@ -2274,6 +2788,8 @@ int main(int argc, char** argv) {
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
         else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
+        else if (a == "--peer-adapt-mib") o.peer_adapt_mib = std::atoi(next("--peer-adapt-mib"));
+        else if (a == "--peer-adapt-min-gain") o.peer_adapt_min_gain = (float) std::atof(next("--peer-adapt-min-gain"));
         else if (a == "--peer-prefill-rows") o.peer_prefill_rows = std::atoll(next("--peer-prefill-rows"));
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
@@ -2323,6 +2839,7 @@ int main(int argc, char** argv) {
         }
         }
     }
+    if (!o.exl3_dir.empty()) strata::core::apply_exl3_defaults();
 #if defined(STRATA_USE_HIP)
     {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
         // any engine code reads its switches (they are read at first use), and the user's own settings are kept
@@ -2374,9 +2891,15 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (!o.exl3_dir.empty() && (o.spec > 0 || o.batch > 0 || o.prefill_chunk > 0 || o.prefill_auto || !o.layer_split.empty())) {
-        if (const char* dense = std::getenv("STRATA_EXL3_DENSE"); dense &&
+        // STRATA_EXL3_DENSE_MV=1 serves the window's trellis dense projections with the multirow GEMV
+        // (A9), so an EXL3 dense arm may run the window/prefill paths too; without it they need the
+        // default native (requantized) dense projections.
+        const char* dense_mv = std::getenv("STRATA_EXL3_DENSE_MV");
+        const bool dense_mv_on = dense_mv != nullptr && dense_mv[0] == '1' &&
+                                 strata::kernels::exl3_dense_mr_available();
+        if (const char* dense = std::getenv("STRATA_EXL3_DENSE"); !dense_mv_on && dense &&
             (std::strcmp(dense, "exl3") == 0 || std::strncmp(dense, "only:", 5) == 0)) {
-            std::fprintf(stderr, "strata generate: EXL3 windows and prefill need the default native dense projections; unset STRATA_EXL3_DENSE\n");
+            std::fprintf(stderr, "strata generate: EXL3 windows and prefill need the default native dense projections; unset STRATA_EXL3_DENSE or set STRATA_EXL3_DENSE_MV=1\n");
             return 2;
         }
         // The window uses the same native BF16/GDN/QSA arithmetic as its single-token reference.
@@ -2384,11 +2907,40 @@ int main(int argc, char** argv) {
         o.native_bf16 = o.native_bf16_extra = true;
         o.native_moe_combine = o.native_gdn = o.native_router = true;
         o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
-        if (o.aux_cpus.empty() && std::getenv("STRATA_AUX_CPUS") == nullptr) o.aux_cpus = "auto";
+        // STRATA_AUX_CPUS stays opt-in (a list, "auto" or "off" when the user sets it): the
+        // implicit EXL3 default is gone; unset means the threads are not pinned by it.
+    }
+    if (const char* v = std::getenv("STRATA_EXL3_VERIFY_HITS"); v && v[0] && v[0] != '0') {
+        if (o.exl3_dir.empty() || o.batch > 0 || !o.layer_split.empty() || o.pipeline_windows > 0) {
+            std::fprintf(stderr, "strata generate: STRATA_EXL3_VERIFY_HITS needs EXL3, one primary stage, "
+                                 "and one sequence (a peer expert tier is supported)\n");
+            return 2;
+        }
     }
     // --expert-cache has different units for EXL3 (per layer). Keep its request for the EXL3 stream,
     // but disable the GGUF cache and hit callback: that callback requires a Drive*, not Exl3Drive*.
     const int exl3_cache_slots = o.expert_cache_given ? o.expert_cache : -1;
+    const bool exl3_peer_adapt_on = [] {
+        const char* v = std::getenv("STRATA_EXL3_PEER_ADAPT"); return v && v[0] && v[0] != '0';
+    }();
+    strata::kernels::Exl3PeerAdapt::Options exl3_peer_adapt_options;
+    exl3_peer_adapt_options.every = o.adapt_every;
+    exl3_peer_adapt_options.max_swaps = o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps;
+    exl3_peer_adapt_options.decay = o.adapt_decay;
+    exl3_peer_adapt_options.min_gain = o.peer_adapt_min_gain;
+    if (exl3_peer_adapt_on) {
+        if (o.exl3_dir.empty() || o.peer_device < 1 ||
+            !strata::core::exl3_flag("STRATA_EXL3_PEER", nullptr, true) ||
+            o.batch > 0 || !o.layer_split.empty() || o.pipeline_windows > 0 ||
+            o.adapt_every <= 0 || exl3_peer_adapt_options.max_swaps <= 0 || o.peer_adapt_mib < 0 ||
+            !std::isfinite(o.adapt_decay) || o.adapt_decay < 0 || o.adapt_decay > 1 ||
+            !std::isfinite(o.peer_adapt_min_gain) || o.peer_adapt_min_gain < 0) {
+            std::fprintf(stderr, "strata generate: EXL3 peer adaptation needs the EXL3 peer tier, one sequence/stage, "
+                                 "positive adaptation interval/swap cap, decay in [0,1], and nonnegative byte cap/margin\n");
+            return 2;
+        }
+        exl3_peer_adapt_options.byte_cap = (size_t) o.peer_adapt_mib << 20;
+    }
     if (!o.exl3_dir.empty()) {
         o.expert_cache = 0;
         // EXL3's per-layer LRU owns replacement. The GGUF adaptive tier requires its blob/residency
@@ -3279,6 +3831,29 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: EXL3 %s: %zu roles, %.1f MiB EXL3 linears, %.1f MiB staged, in %.1f s\n",
                      o.exl3_dir.c_str(), wt.all().size(), (double) exl3_pack->exl3_bytes() / (1 << 20),
                      (double) exl3_pack->arena_bytes() / (1 << 20), load_s());
+        // GGUF parity for host RAM (#1250's principle): the dense tensors are on the GPU now, so their
+        // host pages go back - only the expert tensors belong in the page cache (the expert stream
+        // stages from its own mappings).  STRATA_EXL3_KEEP_DENSE_PAGES=1 is the A/B way back.
+        if (const char* keep = std::getenv("STRATA_EXL3_KEEP_DENSE_PAGES"); keep == nullptr || *keep == '\0' ||
+            std::strcmp(keep, "0") == 0) {
+            std::string drop_note;
+            const uint64_t dropped = exl3_pack->release_host_pages(drop_note);
+            std::fprintf(stderr, "strata generate: EXL3 released %.1f MiB of dense-tensor host pages (%s); the "
+                                 "expert tensors stay cached\n", (double) dropped / (1 << 20), drop_note.c_str());
+        }
+        // STRATA_EXL3_DENSE_MV: pre-grow the dense multirow GEMV's workspace for every trellis shape
+        // BEFORE any graph capture (the window and the decode graphs capture at session start; a lazy
+        // cudaMalloc inside a capture is fatal).  Both stream slots: the verifier forks the shared
+        // expert onto the second.
+        if (strata::core::dense_mv_enabled()) {
+            for (const auto& [name, ref] : wt.all())
+                if (ref.exl3 != nullptr) {
+                    const auto* m = (const strata::kernels::Exl3Mat*) ref.exl3;
+                    strata::kernels::exl3_gemv_reserve(m->ki * 16, m->nj * 16);
+                    strata::kernels::exl3_dense_mr_reserve_shape(0, m->ki, m->nj);
+                    strata::kernels::exl3_dense_mr_reserve_shape(1, m->ki, m->nj);
+                }
+        }
     } else if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
@@ -4800,7 +5375,11 @@ int main(int argc, char** argv) {
     if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
-    if (!o.exl3_dir.empty() && (o.spec >= 2 || o.batch > 0 || o.serve) && !multi_gpu && !native_head.bind(*wo, err)) {
+    // STRATA_EXL3_DENSE_MV with a trellis output head: the window's fallback computes the head logits
+    // with the dense multirow GEMV (verify.cpp), so the native head binding is not required
+    const bool head_trellis_mv = !o.exl3_dir.empty() && wo->exl3 != nullptr && strata::core::dense_mv_enabled();
+    if (!o.exl3_dir.empty() && (o.spec >= 2 || o.batch > 0 || o.serve) && !multi_gpu && !head_trellis_mv &&
+        !native_head.bind(*wo, err)) {
         std::fprintf(stderr, "strata generate: EXL3 output head: %s\n", err.c_str());
         return 1;
     }
@@ -5906,7 +6485,7 @@ int main(int argc, char** argv) {
 
     // ---- Multi-GPU: the second GPU's expert tier, filled with the ranked pairs the primary does not hold
     strata::core::PeerExperts peer;
-    if (o.peer_device >= 1) {
+    if (o.peer_device >= 1 && o.exl3_dir.empty()) {   // EXL3 has its own static peer tier below
         if (profile.empty() || srcp == nullptr || o.expert_cache <= 0) {
             std::fprintf(stderr, "strata generate: --peer-device needs --expert-profile and the expert cache\n");
             return 1;
@@ -5928,6 +6507,10 @@ int main(int argc, char** argv) {
     Exl3Drive exl3_drive;
     exl3_drive.failed = &drive.d.failed;
     std::unique_ptr<strata::kernels::Exl3ExpertStream> exl3_stream;
+    std::unique_ptr<strata::kernels::cpu::Exl3CpuMoe> exl3_cpu;
+    // the CPU tier's registered pointers live in this model's mmaps: it must OUTLIVE the
+    // service (a scope-local model unmaps them all at the block's end)
+    std::unique_ptr<strata::Exl3Model> exl3_cpu_model;
     if (!o.exl3_dir.empty()) {
         // The EXL3 stream keeps its own per-layer cache: `--expert-cache N` counts slots per layer there (the
         // GGUF count is global because its blobs are one pool), `auto`/unset sizes it from the free VRAM after
@@ -5982,6 +6565,229 @@ int main(int argc, char** argv) {
                              "%d host slots/layer, %.2f GiB RAM)\n",
                      exl3_stream->slots_per_layer(), (double) exl3_stream->bytes() / (double) (1ull << 30),
                      exl3_stream->ram_slots_per_layer(), (double) exl3_stream->ram_bytes() / (double) (1ull << 30));
+        // ---- --expert-profile on the EXL3 cache (the GGUF R4.2e fill, same profile.bin and the same
+        // read_expert_profile file): each layer's hottest pairs land in its free slots now, instead of
+        // admitting on first use.  Initial state only - the LRU keeps adapting afterwards (A/B #6
+        // measured a frozen EXL3 cache badly hurt).  Runs BEFORE the peer subset is built, so the
+        // peer's `holds()` exclusions see what the primary took and it gets the complement.
+        if (!o.expert_profile.empty()) {
+            int64_t prefilled = 0, fill_bytes = 0;
+            const auto fill_t0 = std::chrono::steady_clock::now();
+            std::string ferr;
+            bool fill_ok = exl3_stream->warmup_fill(profile, &prefilled, &fill_bytes, ferr);
+            for (auto& stage : stages)
+                fill_ok = fill_ok && stage->exl3_stream->warmup_fill(profile, &prefilled, &fill_bytes, ferr);
+            const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
+            if (!fill_ok) {
+                std::fprintf(stderr, "strata generate: the EXL3 profile fill failed: %s\n", ferr.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: EXL3 cache pre-filled %lld pairs (%.2f GiB) from %s in %.1f s "
+                                 "(%.0f MB/s); slot verified\n",
+                         (long long) prefilled, (double) fill_bytes / (double) (1ull << 30),
+                         o.expert_profile.c_str(), fill_s,
+                         fill_s > 0 ? (double) fill_bytes / 1e6 / fill_s : 0.0);
+        }
+        // ---- The CPU expert tier (B1, opt-in STRATA_EXL3_CPU_TIER=1): with the VRAM cache
+        // FULL, a miss is COMPUTED on the CPU by the ported exllamav3 VNNI kernels instead of
+        // evicting a hot expert - the GGUF engine's overflow policy (src/core/expert_source.cpp
+        // "THE DECISION"), restored for EXL3.  Registration walks every layer's experts once
+        // (raw pointers into the mmap; nothing is read yet - the repack cache fills lazily).
+        if (const char* ct = std::getenv("STRATA_EXL3_CPU_TIER"); ct && ct[0] && ct[0] != '0') {
+            if (strata::kernels::cpu::Exl3CpuMoe::supported()) {
+                const auto cpu_t0 = std::chrono::steady_clock::now();
+                exl3_cpu = std::make_unique<strata::kernels::cpu::Exl3CpuMoe>();
+                exl3_cpu_model = std::make_unique<strata::Exl3Model>(o.exl3_dir);
+                strata::Exl3Model& cpu_model = *exl3_cpu_model;
+                std::vector<strata::kernels::cpu::Exl3CpuMatrix> gs, us, ds;
+                for (int64_t l = 0; l < g.n_layers; ++l) {
+                    gs.resize((size_t) g.n_expert);
+                    us.resize((size_t) g.n_expert);
+                    ds.resize((size_t) g.n_expert);
+                    for (int64_t e = 0; e < g.n_expert; ++e) {
+                        const std::string base = "model.language_model.layers." + std::to_string(l) +
+                                                 ".mlp.experts." + std::to_string(e);
+                        auto fill = [](const strata::Exl3Linear& L, strata::kernels::cpu::Exl3CpuMatrix& M) {
+                            M.trellis = L.trellis; M.suh = L.suh; M.svh = L.svh;
+                            M.k = L.in(); M.n = L.out(); M.bits = L.bits; M.hb = 0;
+                        };
+                        fill(cpu_model.linear(base + ".gate_proj"), gs[(size_t) e]);
+                        fill(cpu_model.linear(base + ".up_proj"), us[(size_t) e]);
+                        fill(cpu_model.linear(base + ".down_proj"), ds[(size_t) e]);
+                    }
+                    exl3_cpu->add_layer((int) l, gs.data(), us.data(), ds.data(), (int) g.n_expert);
+                }
+                exl3_drive.cpu = exl3_cpu.get();
+                exl3_drive.cpu_buf_init(8 * 64);   // worst verify window; no callback allocations
+                if (const char* hybrid = std::getenv("STRATA_EXL3_CPU_HYBRID"))
+                    exl3_drive.cpu_hybrid_groups = std::max(0, std::min(8, std::atoi(hybrid)));
+                if (const char* min_misses = std::getenv("STRATA_EXL3_CPU_HYBRID_MIN_MISSES"))
+                    exl3_drive.cpu_hybrid_min_misses = std::max(1, std::min(64, std::atoi(min_misses)));
+                if (const char* assist = std::getenv("STRATA_EXL3_CPU_HYBRID_PEER"))
+                    exl3_drive.cpu_hybrid_peer = assist[0] && assist[0] != '0';
+                if (exl3_drive.p_x.empty())        // the GPU-fallback path shares the peer complement buffers
+                    exl3_drive.peer_buf_init(8 * 64, g.n_embd);
+                const auto st = exl3_cpu->stats();
+                const char* budget_env = std::getenv("STRATA_EXL3_CPU_CACHE_MIB");
+                std::fprintf(stderr, "strata generate: EXL3 cpu tier ready: %lld layers x %lld experts registered "
+                                     "in %.1f s (isa tier %d; repack cache budget %s MiB; STRATA_EXL3_CPU_* envs tune it)\n",
+                             (long long) g.n_layers, (long long) g.n_expert,
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - cpu_t0).count(),
+                             st.isa, budget_env != nullptr ? budget_env : "16384");
+            } else {
+                std::fprintf(stderr, "strata generate: STRATA_EXL3_CPU_TIER=1 but this CPU cannot run the "
+                                     "tier - keeping the evict-and-admit policy\n");
+            }
+        }
+    }
+    // ---- The EXL3 peer tier (explicit opt-in STRATA_EXL3_PEER=1): a startup ranked subset
+    // of (layer, expert) pairs computed on the peer device by Exl3Peer.  The primary stream never
+    // admits those weights (set_owned_elsewhere; prefill computes them into the bounded scratch
+    // without admitting), and the pool callbacks route their rows to the peer - launch before the
+    // primary service, finish before publication.  Without the env the EXL3 path keeps today's
+    // reject unchanged. STRATA_EXL3_PEER_ADAPT opts into the GGUF peer selection policy below.
+    std::unique_ptr<strata::kernels::Exl3Peer> peer_exl3;
+    std::unique_ptr<strata::kernels::Exl3PeerOutput> peer_exl3_output;
+    std::vector<uint8_t> peer_owned;
+    std::unique_ptr<strata::kernels::Exl3PeerAdapt> peer_exl3_adapt;
+    if (!o.exl3_dir.empty() && o.peer_device >= 1) {
+        if (!strata::core::exl3_flag("STRATA_EXL3_PEER", nullptr, true)) {
+            std::fprintf(stderr, "strata generate: --peer-device conflicts with STRATA_EXL3_PEER=0\n");
+            return 1;
+        }
+        if (o.batch > 0 || multi_gpu || !stages.empty()) {
+            std::fprintf(stderr, "strata generate: the EXL3 peer tier is refused with --batch or a layer "
+                         "split (untested modes are refused, not broadened)\n");
+            return 2;
+        }
+        strata::Exl3Model pmodel(o.exl3_dir);
+        // the primary's own device (whatever --gpu selected) must differ from the peer's
+        int primary_dev = 0;
+        (void) cudaGetDevice(&primary_dev);
+        if (o.peer_device == primary_dev) {
+            std::fprintf(stderr, "strata generate: --peer-device %d is the primary GPU - the peer tier "
+                         "needs a second device\n", o.peer_device);
+            return 2;
+        }
+        // static subset: the profile's ranked pairs (deduplicated) that the primary does not
+        // hold, else a deterministic round-robin; bounded by --peer-slots AND by a coarse byte
+        // budget on the peer device (free VRAM minus max(--peer-reserve-mib, 2 GiB display-peer
+        // headroom)); nothing is allocated here beyond the eventual open()
+        const int64_t bound = o.peer_slots > 0 ? o.peer_slots : 256;
+        if (bound > 65535) {
+            std::fprintf(stderr, "strata generate: --peer-slots %lld exceeds 65535\n", (long long) bound);
+            return 2;
+        }
+        size_t budget = 0;
+        {
+            int prev = -1;
+            (void) cudaGetDevice(&prev);
+            size_t peer_free = 0, peer_total = 0;
+            if (cudaSetDevice(o.peer_device) != cudaSuccess ||
+                cudaMemGetInfo(&peer_free, &peer_total) != cudaSuccess) {
+                (void) cudaSetDevice(prev);
+                std::fprintf(stderr, "strata generate: the EXL3 peer device %d cannot be queried\n",
+                             o.peer_device);
+                return 1;
+            }
+            (void) cudaSetDevice(prev);
+            // reserve = the configured floor (>= 2 GiB for the display-carrying peer) PLUS a
+            // coarse 256 MiB allowance for workspace/context overhead - budget-filling the tier
+            // must not eat the headroom target.  Coarse by design: no exact margin tuning.
+            const size_t keep = ((size_t) std::max<int64_t>(o.peer_reserve_mib, 2048) << 20) + ((size_t) 256 << 20);
+            budget = peer_free > keep ? peer_free - keep : 0;
+            std::fprintf(stderr, "strata generate: EXL3 peer budget: %zu MiB free on device %d, "
+                         "keeping %lld MiB (reserve + 256 MiB coarse overhead) -> %zu MiB for experts\n",
+                         peer_free >> 20, o.peer_device, (long long) (keep >> 20), budget >> 20);
+        }
+        std::vector<std::pair<int32_t, int32_t>> ranked;
+        std::set<std::pair<int32_t, int32_t>> seen;
+        size_t used = 0;
+            auto consider = [&](int32_t l, int32_t e) {
+                if ((int64_t) ranked.size() >= bound) return;
+                if (l < 0 || l >= g.n_layers || e < 0 || e >= g.n_expert) return;
+                if (!seen.insert({l, e}).second) return;              // dedup
+                if (exl3_stream->holds(l, e)) return;                 // never duplicate primary weights
+                const std::string b = "model.language_model.layers." + std::to_string(l) +
+                                      ".mlp.experts." + std::to_string(e) + ".";
+                const strata::Exl3Linear gl = pmodel.linear(b + "gate_proj");
+                const strata::Exl3Linear ul = pmodel.linear(b + "up_proj");
+                const strata::Exl3Linear dl = pmodel.linear(b + "down_proj");
+                size_t bytes = 0;
+                for (const strata::Exl3Linear* m : {&gl, &ul, &dl}) {
+                    const size_t tr = (size_t) m->ki * (size_t) m->nj * 32u * (unsigned) m->bits;
+                    bytes += tr + (size_t) m->in() * 2 + (size_t) m->out() * 2;
+                }
+                if (bytes == 0 || used > budget || bytes > budget - used) return;   // checked fit
+                used += bytes;
+                ranked.push_back({l, e});
+            };
+            if (!profile.empty()) {
+                for (const auto& pr : profile) consider(pr.first, pr.second);
+            } else {   // deterministic round-robin coverage of every layer
+                for (int32_t e = 0; e < g.n_expert && (int64_t) ranked.size() < bound; ++e)
+                    for (int64_t l = 0; l < g.n_layers && (int64_t) ranked.size() < bound; ++l)
+                        consider((int32_t) l, e);
+            }
+            if (ranked.empty()) {
+                std::fprintf(stderr, "strata generate: the EXL3 peer tier has no eligible (layer, expert) pair\n");
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: EXL3 peer subset: %zu pairs, %zu MiB (slots bound %lld)\n",
+                         ranked.size(), used >> 20, (long long) bound);
+        std::vector<strata::kernels::Exl3Peer::Entry> entries;
+        entries.reserve(ranked.size());
+        peer_owned.assign((size_t) g.n_layers * (size_t) g.n_expert, 0);
+        for (const auto& pr : ranked) {
+            const std::string b = "model.language_model.layers." + std::to_string(pr.first) +
+                                  ".mlp.experts." + std::to_string(pr.second) + ".";
+            const strata::Exl3Linear gl = pmodel.linear(b + "gate_proj");
+            const strata::Exl3Linear ul = pmodel.linear(b + "up_proj");
+            const strata::Exl3Linear dl = pmodel.linear(b + "down_proj");
+            strata::kernels::Exl3Peer::Entry en;
+            en.layer = pr.first;
+            en.expert = pr.second;
+            auto set = [](strata::kernels::Exl3Mat& m, const strata::Exl3Linear& l) {
+                m.trellis = l.trellis; m.suh = l.suh; m.svh = l.svh;
+                m.ki = l.ki; m.nj = l.nj; m.bits = l.bits; m.cb = l.cb;
+            };
+            set(en.g, gl); set(en.u, ul); set(en.d, dl);
+            entries.push_back(en);
+            peer_owned[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
+        }
+        exl3_drive.peer_buf_init(8 * 64, g.n_embd);   // worst verify window; no callback allocations
+        peer_exl3 = std::make_unique<strata::kernels::Exl3Peer>();
+        const auto peer_fill_t0 = std::chrono::steady_clock::now();
+        if (!peer_exl3->open(o.peer_device, (int) g.n_embd, entries, 8, 64, err)) {
+            std::fprintf(stderr, "strata generate: the EXL3 peer tier failed to open: %s\n", err.c_str());
+            return 1;
+        }
+        exl3_stream->set_owned_elsewhere(peer_owned.data(), g.n_layers, g.n_expert);
+        exl3_drive.peer = peer_exl3.get();
+        std::fprintf(stderr, "strata generate: EXL3 peer tier on device %d: %lld static experts "
+                     "(%.2f GiB) FILLED in %.1f s; the primary excludes their weights\n", o.peer_device,
+                     (long long) entries.size(), (double) peer_exl3->bytes() / (double) (1ull << 30),
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - peer_fill_t0).count());
+        if (exl3_peer_adapt_on) {
+            try {
+                peer_exl3_adapt = std::make_unique<strata::kernels::Exl3PeerAdapt>(*peer_exl3, *exl3_stream,
+                    o.exl3_dir, (int) g.n_layers, (int) g.n_expert, peer_owned, exl3_peer_adapt_options);
+                exl3_drive.peer_adapt = peer_exl3_adapt.get();
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "strata generate: %s\n", e.what()); return 1;
+            }
+        }
+    }
+    if(const char* v=std::getenv("STRATA_EXL3_PEER_DEVICE_OUT");v && v[0] && v[0]!='0') {
+        if(!peer_exl3 || !peer_exl3->valid() || exl3_cpu || multi_gpu || !stages.empty() || o.batch>0) {
+            std::fprintf(stderr,"strata: peer device output requires the EXL3 peer, one serial stage and GPU expert service\n"); return 2;
+        }
+        int primary=0;(void)cudaGetDevice(&primary);
+        peer_exl3_output=std::make_unique<strata::kernels::Exl3PeerOutput>();
+        if(!peer_exl3_output->open(primary,o.peer_device,(int)g.n_embd,8*64,err,std::atoi(v)>=2,std::atoi(v)>=3)) {
+            std::fprintf(stderr,"strata: peer output setup failed: %s\n",err.c_str());return 2;
+        }
+        exl3_drive.peer_output=peer_exl3_output.get();
     }
     // #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tiers leave an expert a helper GPU holds out of the primary's
     // promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache (RemoteExperts::holds,
@@ -7753,10 +8559,55 @@ int main(int argc, char** argv) {
                                  "%lld MiB free\n",
                          (long long) o.prefill_chunk, (long long) (borrow_bytes >> 20), (long long) (free_b >> 20));
         }
+        // ---- the EXL3 arena loan (experimental STRATA_EXL3_PREFILL_BORROW): the prompt path's buffers are the
+        // arena's TAIL RANKS (lend_tail) instead of its own allocation, and every window/decode boundary refills
+        // them (restore_tail) - the SAME PfPart/lend/refill lifecycle the GGUF cache loan uses, one participant
+        // wide.  Decided ONCE, here, BEFORE init_prompt_paths carves anything: a loan opened after the carve would
+        // hand the prompt path ranks whose bytes the cache still owns.  Narrow initial scope on purpose: single
+        // GPU, one ordinary session (--batch off), an operator-NAMED chunk (auto chunks are not sized for this
+        // cache), no head alias, no split, the arena exists and can lend the WHOLE fixed chunk.  Everything else -
+        // and any refusal below - keeps today's owned buffers, byte for byte.  The reserve is NOT reduced: the
+        // cache is still sized as if the owned buffers were allocated (correctness first; capacity tuning is a
+        // later, separately reviewed stage), so the bytes this saves simply stay free.
+        struct Exl3Loan {
+            strata::kernels::Exl3ExpertStream* stream = nullptr;   // the CUDA0 stream (single GPU only)
+            strata::prefill::Prefill* pf = nullptr;
+            int ranks = 0;             // the FIXED chunk-sized loan, reopened as-is for every batched read
+            int64_t chunk = 0;
+        } exl3_loan;
+        if (!o.exl3_dir.empty() && o.prefill_explicit && o.prefill_chunk > 0 && !o.no_prefill_borrow &&
+            !o.prefill_head_alias && stages.empty() && !multi_gpu && o.batch <= 0 &&
+            exl3_stream != nullptr && exl3_stream->loan_available()) {
+            const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk, false);
+            const uint64_t rb = exl3_stream->loan_rank_bytes();
+            const int64_t ranks = rb > 0 ? (int64_t) ((need + rb - 1) / rb) : 0;   // exact ceil
+            if (ranks >= 1 && ranks <= exl3_stream->loan_max_ranks()) {
+                // the startup loan: the cache is still cold, so the saved tail is EMPTY - an active loan
+                // with nothing saved is still a loan (loan_active, not the saved list's size)
+                const auto first = exl3_stream->lend_tail((int) ranks);
+                if (first.address != nullptr) {
+                    exl3_loan = {exl3_stream.get(), &sp, (int) ranks, o.prefill_chunk};
+                    borrow = first.address;
+                    borrow_bytes = first.bytes;
+                    std::fprintf(stderr, "strata serve: EXL3 prompt path borrows %lld of the arena's %d ranks "
+                                         "(%.2f GiB) for %lld-token chunks; %d active ranks while lent\n",
+                                 (long long) ranks, exl3_stream->slots_per_layer(),
+                                 (double) first.bytes / 1073741824.0, (long long) o.prefill_chunk,
+                                 exl3_stream->loan_active_ranks());
+                } else {
+                    std::fprintf(stderr, "strata serve: EXL3 prompt path: the loan was refused (a stream drain "
+                                         "failed); owned buffers\n");
+                }
+            } else {
+                std::fprintf(stderr, "strata serve: EXL3 prompt path: a %lld-token chunk needs %lld ranks of %d; "
+                                     "owned buffers\n", (long long) o.prefill_chunk, (long long) ranks,
+                             exl3_stream->loan_max_ranks());
+            }
+        }
         bool any_loan = borrow != nullptr;
         for (size_t i = 1; i < pf_parts.size(); ++i) any_loan = any_loan || pf_parts[i].first >= 0;
         if (any_loan) {
-            if (borrow != nullptr)
+            if (exl3_loan.stream == nullptr && borrow != nullptr)
                 std::fprintf(stderr, "strata serve: the prompt path borrows %lld CUDA0 cache slots (%.2f GiB)\n",
                              (long long) (xcache.slots() - lend_first), (double) borrow_bytes / 1073741824.0);
             for (size_t i = 1; i < pf_parts.size(); ++i)   // one loan per stage, from that stage's own cache
@@ -7862,7 +8713,13 @@ int main(int argc, char** argv) {
         mem_mark("before the prompt path init");
         for (;;) {
             const int r = init_prompt_paths();
-            if (r == 0) break;
+            if (r == 0) {
+                // a stepped-down init carved a smaller T_max than the loan was sized for: relayout
+                // must never ask for more than that (the loan's RANKS still cover it - sizes only
+                // shrank, and the loan is never re-sized mid-session)
+                if (exl3_loan.stream != nullptr) exl3_loan.chunk = o.prefill_chunk;
+                break;
+            }
             int64_t next = 0;
             for (const int64_t c : kStepChunks)
                 if (c < o.prefill_chunk) { next = c; break; }
@@ -7878,7 +8735,7 @@ int main(int argc, char** argv) {
                 sp.reset();
                 (void) cudaGetLastError();
                 o.prefill_chunk = next;
-                if (any_loan) {                  // smaller loans for the smaller chunk
+                if (any_loan && !pf_parts.empty()) {   // smaller loans for the smaller chunk
                     for (PfPart& p : pf_parts)
                         if (p.first >= 0) {
                             p.first = (int32_t) (p.cache->slots() - part_slots(p, next));
@@ -7888,6 +8745,8 @@ int main(int argc, char** argv) {
                     borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
                     borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
                 }
+                // the EXL3 loan keeps its original size across the step-down: a smaller chunk only carves
+                // less of the same ranks, and the loan is never re-sized mid-session
                 err.clear();
                 continue;
             }
@@ -7903,6 +8762,32 @@ int main(int argc, char** argv) {
             if (!sp.set_peer(&peer, rows, err)) {
                 std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
                 err.clear();
+            }
+        }
+        // STRATA_EXL3_PEER_PREFILL=1: the EXL3 peer tier's prompt share (the same shape as the
+        // GGUF --peer-device prompt path above, on the EXL3 stack; see Prefill::set_exl3_peer).
+        // One serial stage, no batch, top-10 routing; the peer tier must be open.  A refusal
+        // only leaves the prompt path on the primary - the engine keeps running.
+        if (strata::core::exl3_flag("STRATA_EXL3_PEER_PREFILL", nullptr, true)) {
+            if (peer_exl3 && peer_exl3->valid() && !multi_gpu && stages.empty() && o.batch == 0 && K == 10) {
+                bool ok = peer_exl3->enable_prefill(o.prefill_chunk, (int) K, g.n_expert,
+                                                    o.prefill_chunk * K, err);
+                if (ok) {
+                    std::vector<int32_t> res;
+                    peer_exl3->residency((int) g.n_layers, (int) g.n_expert, res);
+                    std::vector<uint8_t> ownedpf(res.size());
+                    for (size_t i = 0; i < res.size(); ++i) ownedpf[i] = res[i] >= 0 ? 1 : 0;
+                    ok = sp.set_exl3_peer(peer_exl3.get(), ownedpf.data(), g.n_layers, g.n_expert,
+                                          o.prefill_chunk, err);
+                }
+                if (!ok) {
+                    std::fprintf(stderr, "strata serve: %s - the EXL3 prompt path stays on the primary GPU\n",
+                                 err.c_str());
+                    err.clear();
+                }
+            } else {
+                std::fprintf(stderr, "strata serve: STRATA_EXL3_PEER_PREFILL needs the EXL3 peer tier, one serial "
+                                     "stage, no batch and top-10 routing - the prompt path stays on the primary GPU\n");
             }
         }
         // a layer split: a one-chunk prompt runs the stages one after the other, so each stage's prompt path gets the
@@ -7973,6 +8858,7 @@ int main(int argc, char** argv) {
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.external_experts = !o.exl3_dir.empty();
+        configure_exl3_verify_graph(vh, exl3_stream.get(), (int) ss.k,exl3_drive.peer_output);
         vh.d_res = thits.d_res;
         // STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, with STRATA_ROUTE_RESIDENT=<margin>; changes the output): the MTP
         // draft's router gets the same residency bias, with the last layer's residency row as its table (single GPU)
@@ -10860,6 +11746,9 @@ int main(int argc, char** argv) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
                 continue;
             }
+            if (peer_exl3_adapt && !peer_exl3_adapt->drain(err)) {
+                std::printf("ERR %s\n", err.c_str()); return 1;
+            }
             char* endp = nullptr;
             const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
             // optional sampling keys between max_new and the ids: temperature=F, top_p=F, top_k=N, min_p=F,
@@ -11673,6 +12562,24 @@ int main(int argc, char** argv) {
             auto refill = [&](std::string& e) -> bool {
                 const auto t_rf = Clock::now();
                 int64_t n_lent = 0, n_parts = 0;
+                // the EXL3 arena participant: restore BEFORE any window or decode reads.  The borrower's streams
+                // first (a completed read is already drained, a cancelled one may not be); restore_tail then
+                // refills the saved experts and publishes.  A failed restore already invalidated the cache and
+                // closed the loan - the caller must not continue decoding, and does not (ERR + return 1).
+                if (exl3_loan.stream != nullptr && exl3_loan.stream->loan_active()) {
+                    if (!exl3_loan.pf->sync_streams(e)) return false;
+                    const auto t_ex = Clock::now();
+                    if (!exl3_loan.stream->restore_tail()) {
+                        e = "prefill: restoring the EXL3 loan's ranks failed (the expert cache was invalidated)";
+                        return false;
+                    }
+                    n_lent += exl3_loan.ranks;
+                    ++n_parts;
+                    if (trace)
+                        std::fprintf(stderr, "strata trace: EXL3 loan restored %d ranks in %.1f ms\n",
+                                     exl3_loan.ranks,
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t_ex).count());
+                }
                 for (PfPart& p : pf_parts)
                     if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
                 if (n_parts > 1 && !refill_serial) {
@@ -11697,6 +12604,18 @@ int main(int argc, char** argv) {
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
             auto lend = [&](int64_t tokens, std::string& e) -> bool {
+                // the EXL3 arena participant: the FIXED chunk-sized loan, reopened exactly as startup sized it -
+                // no per-request sizing (a short request simply uses less of it, a longer one reads in chunks of
+                // it), so the same address comes back every time and relayout re-carves the per-run metadata.
+                // relayout itself waits the prompt path's streams ("between prompts").
+                if (exl3_loan.stream != nullptr && !exl3_loan.stream->loan_active()) {
+                    const auto re = exl3_loan.stream->lend_tail(exl3_loan.ranks);
+                    if (re.address == nullptr) {
+                        e = "prefill: the EXL3 loan could not reopen its ranks (a stream drain failed)";
+                        return false;
+                    }
+                    if (!exl3_loan.pf->relayout(exl3_loan.chunk, re.address, re.bytes, e)) return false;
+                }
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
@@ -12103,6 +13022,8 @@ int main(int argc, char** argv) {
             for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
+            strata::platform::DecodeTrace decode_trace;
+            const auto exl3_profile_before = exl3_drive.profile_snapshot();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
             struct DecSnap {
@@ -12877,6 +13798,9 @@ int main(int argc, char** argv) {
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                if (peer_exl3_adapt && !peer_exl3_adapt->before_window(err)) {
+                    std::printf("ERR %s\n", err.c_str()); return 1;
+                }
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -12981,12 +13905,17 @@ int main(int argc, char** argv) {
                 x = outv[(size_t) a];
                 p += a + 1;
             }
+            if (peer_exl3_adapt && !peer_exl3_adapt->drain(err)) {
+                std::printf("ERR %s\n", err.c_str()); return 1;
+            }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.wait_commit(err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            decode_trace.stop();
+            exl3_drive.profile_request(exl3_profile_before);
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
                 const double w = (double) dec_windows, L = (double) g.n_layers;
@@ -13763,6 +14692,7 @@ int main(int argc, char** argv) {
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.external_experts = !o.exl3_dir.empty();
+        configure_exl3_verify_graph(vh, exl3_stream.get(), (int) ss.k,exl3_drive.peer_output);
         vh.d_res = thits.d_res;
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
@@ -14038,6 +14968,9 @@ int main(int argc, char** argv) {
             if (adapt_nowait()) apply_pending(false);
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+            if (peer_exl3_adapt && !peer_exl3_adapt->before_window(err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1;
+            }
             if (!ver.run(T, window.data(), p, !o.exl3_dir.empty() ? &drive_exl3_pool_multi : &drive_pool_multi,
                           !o.exl3_dir.empty() ? (void*) &exl3_drive : (void*) &drive, outv.data(), err) || drive.d.failed) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());

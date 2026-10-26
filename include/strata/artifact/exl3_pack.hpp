@@ -42,6 +42,13 @@ public:
     /// Bytes of GPU memory held by all per-layer expert stores, once `experts_ready`.
     uint64_t expert_bytes() const { return expert_bytes_; }
 
+    /// GGUF parity for host RAM: after `build()` every tensor the pack read is on the GPU, so unmap
+    /// the pack's shards and drop exactly those byte ranges from the host page cache
+    /// (madvise-then-fadvise, as GGUF's #1250 drop does).  The EXPERT tensors - the only model bytes
+    /// that belong in host RAM, the expert stream stages from its own mappings - keep their pages.
+    /// Returns the bytes released; `note` says how.  Idempotent; POSIX only (0 on Windows).
+    uint64_t release_host_pages(std::string& note);
+
     struct Impl;
 
 private:

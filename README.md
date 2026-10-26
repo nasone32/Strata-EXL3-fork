@@ -1,243 +1,235 @@
-<h1 align="center">Strata</h1>
+# Strata-EXL3-fork
 
-**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+**EXL3 support for Strata, developed and measured on Linux/HIP (RDNA3).** A working fork of
+[Strata](https://github.com/Niko1221/Strata), forked through
+[Ryutaku/Strata](https://github.com/Ryutaku/Strata). The Git history preserves that base for
+future contributions and rebasing. This AMD community-test branch builds on Strata `0.1.44.1`
+and Ryutaku's EXL3 integration. The upstream README is preserved as
+[docs/UPSTREAM_README.md](docs/UPSTREAM_README.md).
 
-<p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
-NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
+## What this fork is
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+Strata runs **Qwen3.8-Flash-Next** on a normal PC. This fork adds an **EXL3** model backend
+(`--exl3`): weights load from turboderp's `safetensors` EXL3 format instead of a GGUF pack, with
+an optional n-gram embedding table (`--ple-exl3`) and a second GPU as a peer expert tier
+(`--peer-device`). It exists to run the model on AMD Radeon cards under Linux/HIP and to collect
+community measurements. It is **not** a general release: the setup wizard remains GGUF-oriented,
+and nothing here automates downloading models.
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
-large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
-and coding agents. Nothing leaves your PC.
+**Setting up with an AI agent?** Point it to [docs/AI_SETUP_EXL3_AMD.md](docs/AI_SETUP_EXL3_AMD.md). This is the EXL3-specific AMD Linux setup guide; the upstream `docs/AI_SETUP.md` and setup wizard remain GGUF-oriented.
 
-## How fast is it?
+**Status of the backends in this fork:**
 
-We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
-
-- **Writes answers:** how fast the reply appears in a short chat. 60 tokens per second is faster than you can read.
-- **Reads your prompt:** how fast it takes in what you send (here a 32K-token document, code or chat history).
-
-<table>
-<tr><th>NVIDIA: RTX 5070 (12 GB), Ryzen 5 7600, 64 GB RAM</th><th>AMD: RX 9070 XT (16 GB), Ryzen 9 3900X, 47 GB RAM</th></tr>
-<tr><td>
-
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 94 tokens/s | 2,650 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 1,620 tokens/s |
-| **Coder** | 55 tokens/s | 2,180 tokens/s |
-
-</td><td>
-
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 60 tokens/s | 1,160 tokens/s |
-| **IQ2_XS** | 52 tokens/s | 1,110 tokens/s |
-| **Coder** | 44 tokens/s | 1,420 tokens/s |
-
-</td></tr>
-</table>
-
-NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K prompts). The full tables are in
-[DETAILS.md](docs/DETAILS.md#speed-measured). A card with more VRAM is faster: an RTX 3090 (24 GB) should write
-about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
-[community results](docs/COMMUNITY_BENCHMARKS.md).
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
-
-## What you need
-
-| | |
+| Backend | Status in this fork |
 | --- | --- |
-| **Graphics card** | **NVIDIA** GeForce RTX 20, 30, 40 or 50 series, or **AMD** Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700 or RX 6800 / 6900 series. It needs **12 GB of VRAM or more**. |
-| **RAM** | 32 GB or more. Your RAM decides [which model](#which-model-should-i-pick) fits. 64 GB runs every size. |
-| **Disk** | About 80 GB free. Use an SSD if you can: the first start is much faster. |
-| **System** | Windows 10 / 11 or Linux, and a current graphics driver from NVIDIA or AMD. |
+| Linux + HIP (gfx1100, RDNA3, e.g. RX 7900 XTX) | developed and measured here |
+| Linux + HIP (gfx1200/gfx1201, RDNA4) | the switches exist; **needs testing — no support claim** |
+| CUDA, Windows HIP, Metal, SYCL | carried from upstream; **not validated by this fork** |
 
-The installer sets up everything else. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
+The build checks, default-versus-explicit benchmarks, CPU-affinity results and remaining limits are recorded in [docs/EXL3-RELEASE-VALIDATION.md](docs/EXL3-RELEASE-VALIDATION.md).
 
-Experimental, written and tested by community members on their own machines:
+## Launchers
 
-- **Older graphics cards** (Tesla P40 / V100, GTX 10, Radeon VII / MI50, RX 6700 XT, RX 5500 XT): [Older GPUs](docs/OLDER_GPUS.md).
-- **Intel Arc**, built from source on Linux: [Intel Arc](docs/INTEL_ARC.md).
-- **Apple Silicon Macs (M1 to M5)**, built from source by `./setup.sh` (the Metal engine): [Mac](docs/MAC.md).
-- **AMD Ryzen AI Max (Strix Halo)**, built from source on Linux: [Strix Halo](docs/STRIX_HALO.md).
-- **Older processors without AVX2**: they work, but slowly. [Older CPUs](docs/INSTALL.md#older-cpus-experimental).
+Two Bash launchers start the local web chat and the OpenAI/Anthropic-compatible API with the
+measured EXL3 settings; both accept `--dry-run` to print the configuration without starting the
+server or touching the GPU:
 
-The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
-
-## Install
-
-### Let your AI set it up
-
-Do you use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
-
-```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+```sh
+./run-peer.sh --dry-run --model-dir /path/to/Qwen3.8-Flash-Next-exl3-3bpw        # print the config, start nothing
+./run-peer-4bpw.sh --dry-run --model-dir /path/to/Qwen3.8-Flash-Next-exl3-4bpw   # same, 250K-context preset
+./run-peer.sh --model-dir /path/to/Qwen3.8-Flash-Next-exl3-3bpw --peer-device 1  # real run (needs a built engine)
 ```
 
-It checks your graphics card, RAM and disk and picks the model that fits. Then it installs and starts it and tells
-you how to connect your apps. AI tools can also install, start and stop Strata through its
-[MCP server](docs/MCP_SERVER.md).
+`--model-dir` (or `STRATA_EXL3_MODEL`) is required even for `--dry-run`; the other model inputs
+are detected in that directory: the PLE table (`ngram_embedding.safetensors` or
+`gram_embedding.safetensors`) and a pack-layout tokenizer (`<model-dir>/tokenizer/`, or the model
+directory itself). `--dry-run` prints the config and exits: no server, no engine, no GPU.
 
-### Or do it yourself
+Every knob is a flag or an environment variable; nothing is hard-coded to one machine:
 
-[Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-**Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the Strata folder.
-
-**Mac (Apple Silicon, M1 to M5, macOS 15 or newer):** install Apple's Command Line Tools once
-(`xcode-select --install` in Terminal; Xcode itself is not needed). Then open Terminal in the Strata folder and run
-**`./setup.sh`**. It builds the Mac engine on your Mac (about 7 minutes), asks the same questions, downloads the model
-and starts it. Next time, `./setup.sh` starts it right away. Which size fits your Mac and how fast it is:
-[docs/MAC.md](docs/MAC.md).
-
-The steps are the same for NVIDIA and AMD. The installer finds your card and sets up the right engine for it. It
-asks you a few questions:
-
-- which model and which size,
-- how much context (how much text the model keeps in mind),
-- whether it should read pictures.
-
-Press Enter each time for the recommended answer. Then it downloads the model (about 70 GB) and starts it. If the
-download stops, run it again: it continues where it left off. Your browser opens the Strata app at
-`http://127.0.0.1:8080`.
-
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time).
-> Strata loads 35-55 GB into your RAM and locks part of it for the graphics card. This is normal. Wait, and don't
-> close the window. The window shows what Strata is doing.
-
-**Next time**, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close
-its window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker,
-several cards, where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
-
-**Is it fast on your PC?** Run `BENCH.bat` (`./bench.sh`): about 5-10 minutes, it measures chat, 4K/16K prompts and an agent-style session with your own settings and writes a report to share ([how](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)).
-
-## Which model should I pick?
-
-The installer recommends one for your RAM. The same model comes in several sizes, compressed more or less. Smaller
-sizes are faster. Larger sizes are a bit smarter.
-
-| Your RAM | Take | Why |
+| Flag | Environment variable | Meaning |
 | --- | --- | --- |
-| **32 GB** | **Coder** | it fits 32 GB, and it is made for code (with a 24 GB card, Q2_0 and IQ2_XS run too) |
-| **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
-| **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits; IQ3_S is the best and the slowest |
-| **96 GB or more** | **IQ3_S**, or Unsloth's UD-IQ4_XS (~4-bit) | room for the largest sizes with everything else open |
+| `--model-dir` | `STRATA_EXL3_MODEL` | required: the EXL3 model directory |
+| `--ple-file` | `STRATA_EXL3_PLE_FILE` | the model's n-gram PLE table — required: detected in `<model-dir>` (`ngram_embedding.safetensors` / `gram_embedding.safetensors`) or named |
+| `--tokenizer` | `STRATA_EXL3_TOKENIZER` | pack-layout tokenizer directory; detected in `<model-dir>/tokenizer` (or `<model-dir>` itself) when omitted, else required |
+| `--engine-bin` | `STRATA_EXL3_ENGINE` | engine binary (default `build-hip-exl3/strata` under this folder) |
+| `--expert-profile` | `STRATA_EXL3_EXPERT_PROFILE` | pre-load the VRAM tier from a profile (default: this checkout's `data/expert-profile.bin`; `--no-expert-profile` omits it) |
+| `--peer-device` | `STRATA_EXL3_PEER_DEVICE` | second GPU as peer expert tier (default: none) |
+| `--peer-slots` | `STRATA_EXL3_PEER_SLOTS` | expert slots on the peer card |
+| `--expert-cache` | `STRATA_EXL3_EXPERT_CACHE` | expert slots per layer on the primary |
+| `--max-context` | `STRATA_EXL3_MAX_CONTEXT` | KV/state capacity in tokens |
+| `--prefill` | `STRATA_EXL3_PREFILL` | batched prompt chunk size |
+| `--reserve` | `STRATA_EXL3_RESERVE_MIB` | MiB left free on the primary card |
+| `--peer-reserve` | `STRATA_EXL3_PEER_RESERVE_MIB` | MiB left free on the peer card |
+| `--aux-cpus` | `STRATA_AUX_CPUS` | CPU list for non-pool threads; see the caveat below |
+| `--mtp-dir` | `STRATA_EXL3_MTP_DIR` | optional MTP drafter directory |
+| `--spec` / `--spec-min-p` | `STRATA_EXL3_SPEC` / `STRATA_EXL3_SPEC_MIN_P` | MTP verify window (with `--mtp-dir`; default 4 / 0.5) |
+| `--gpu` | `STRATA_EXL3_GPUS` | cards, e.g. `0` or `0,1` |
 
-- **[Coder](docs/MODELS.md#coder):** a coding version with half of the experts removed. It reaches 91% of the full
-  model's SWE-bench Verified score (measured by its authors) and fits 32 GB of RAM. It is weaker outside code,
-  including Chinese and other CJK text (#438). For those, take Q2_0, IQ2_XS or IQ3_S, which keep every expert.
-- **[Swift 1.5](docs/MODELS.md#swift-15):** a fine-tune that thinks for a much shorter time before it answers. You
-  get the answer sooner, at about the same quality.
-- **[Unsloth UD-IQ4_XS](docs/MODELS.md#unsloth-ud-iq4_xs):** Unsloth's ~4-bit version, between IQ3_S and
-  UD-Q4_K_XL in quality. A 94 GB download. With less than ~80 GB of RAM, Strata reads part of it from the SSD
-  while it answers, so it is slower there (an NVMe SSD helps).
-- **[Unsloth UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0](docs/MODELS.md#unsloths-files-ud-iq4_xs-to-q8_0):**
-  4- to 8-bit, closer to the full model (93-95% the same next token as Q8_0). Fast where every expert fits in RAM
-  (~88 GB for UD-Q4_K_XL up to ~136 GB for Q8_0); with less RAM Strata reads part of them from the SSD while it
-  answers, which is much slower (7-8.5 tokens/s for UD-Q4_K_XL on a 64 GB PC).
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
-  not in the installer's menu.
+Explicit values always win, including `--aux-cpus 0` / `STRATA_AUX_CPUS=0`: the launcher uses
+`:-`-style defaults, so an exported variable (or flag) overrides the suggestion and an explicit
+`0` is forwarded, not swallowed.
 
-Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add another model later, run
-`SETUP.bat` (Linux: `./setup.sh --setup`).
+### The suggested RDNA settings
 
-## Using it
+The launchers suggest a profile of engine switches measured on the developer's **gfx1100**
+(RDNA3) card, applied only when neither the flag nor the environment names them; export any of
+them to override, or to turn one off explicitly:
 
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
-
-- **In the browser:** open `http://127.0.0.1:8080`. It has **Chat**, a live **Monitor** of the model and your
-  GPU/CPU/RAM, and **About** with the settings and addresses.
-- **Your apps and coding agents:** add an "OpenAI-compatible" provider with the base URL
-  **`http://127.0.0.1:8080/v1`**. Any API key and any model name work.
-  - Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages` (Claude Code:
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`).
-  - Codex CLI and other apps that use the OpenAI Responses API: `/v1/responses`
-    ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)).
-- **Thinking:** choose **off, low, medium or high** in the chat menu or in your app's "reasoning effort". Off is the
-  fastest. High is best for hard questions.
-- **Pictures:** say yes to "Images?" in setup. Then click **Picture** in the chat, or attach pictures in your app.
-  AMD cards read pictures on Linux through the processor; on Windows they can't yet.
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
-- **One request at a time:** by default Strata answers one request, and the others wait. To answer several at once,
-  set `"parallel": 2` ([BATCHING.md](docs/BATCHING.md)). On a 12 GB card this makes each answer slower.
-- **Long prompts:** Strata reads the first message of a chat in full, about 1 minute per 30,000 tokens. Follow-up
-  messages start in seconds.
-
-More: [where your chats are stored](docs/INSTALL.md#where-things-are-stored), [the API](docs/DETAILS.md#using-it).
-
-### Optional: more speed on one card when the whole model fits in RAM
-
-Two opt-in settings (by RubenTorney, #1904 and #1905). They help when you run one graphics card and your RAM holds
-every expert (Strata's arena mode, for example Q2_0 or IQ3_XXS on a 64 GB PC). Open your config,
-`strata-<model>.json` in the Strata data folder ([where](docs/INSTALL.md#where-things-are-stored)), and add:
-
-- **Faster decode:** `"--adapt-async", "1"` to the `"args"` list. The expert cache then updates on a helper thread
-  instead of pausing the answer. Measured on an RTX 5070 (Windows, Q2_0): +4-5% decode, +7-10% on code and long
-  documents. Answers can differ slightly from the default (they stay the same from run to run).
-- **Faster prompt reading on Windows:** `"STRATA_PIN_BY_NEED": "1"` in the `"env"` block. Windows can lock only about
-  half the RAM for the graphics card; this locks the experts the card actually needs first. Measured on the RTX 5070:
-  +4.4% prompt reading.
-
-```json
-"args": [ ..., "--adapt-async", "1" ],
-"env": { "STRATA_PIN_BY_NEED": "1" }
+```sh
+STRATA_EXL3_RDNA=1 STRATA_EXL3_FUSE=3 STRATA_EXL3_WMMA=1 STRATA_WMMA_GEMM=1 \
+STRATA_HIP_WMMA=1 STRATA_EXL3_PRIMARY_MULTIROW=2 STRATA_EXL3_PEER_MULTIROW=4 \
+STRATA_EXL3_EXPERT_BATCH=1 STRATA_EXL3_PEER_BATCH=1 STRATA_EXL3_PEER_PREFILL=1 \
+./run-peer.sh --model-dir /path/to/Qwen3.8-Flash-Next-exl3-3bpw
 ```
 
-Restart Strata (`START-HERE.bat` or `./setup.sh`) after the change. To undo, remove the two entries.
+(`PEER_PREFILL` is default-on with `--exl3` anyway; the launchers state it explicitly so an
+exported value of yours still wins.)
 
-## Something went wrong?
+With `--exl3` the engine itself turns on the **arch-neutral** EXL3 switches by default
+(`STRATA_EXL3_WAVESYNC`, `STRATA_EXL3_PIPE`, `STRATA_EXL3_OVERLAP`, `STRATA_EXL3_NO_PREAD`,
+`STRATA_EXL3_PACK_STAGE`, `STRATA_EXL3_PREFILL_BORROW`, the peer tier's `PEER`/`PEER_PADDED`/
+`PEER_SPARSE`/`PEER_CONVERT`/`PEER_PACK_PLAN`, `PRIMARY_PACK_PLAN` and
+`STRATA_EXL3_STAGE_INLINE=2`) and defaults `STRATA_QFUSE`, `STRATA_MMVQ_BUNCH` and
+`STRATA_PF_GEMM` to 1 — an explicit value always wins, and the **EXL3-scoped** names
+(`STRATA_EXL3_QFUSE`, `STRATA_EXL3_MMVQ_BUNCH`, `STRATA_EXL3_PF_GEMM`) beat the plain names,
+which otherwise keep their meaning for GGUF models unchanged. The launchers state all of these
+explicitly (and `STRATA_EXL3_PEER=1` with `--peer-device`), so a printed `--dry-run` config is a
+complete, reproducible recipe; every one of them yields to an exported value, `0` included.
 
-- **My PC froze the first time Strata started.** This is normal while it loads the model. Wait, and don't close the
-  window. Still frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
-- **It stopped while downloading or installing.** Run `START-HERE.bat` (or `./setup.sh`) again. It continues where
-  it stopped.
-- **It's very slow and the disk light keeps blinking, or it says "the engine stopped unexpectedly".** Your PC does
-  not have enough free RAM. Close other programs (browsers use a lot), or pick a smaller size (Q2_0 or IQ2_XS).
-- **It says port 8080 is already in use.** Strata is already running. Look for its window.
+The launcher profile above adds only what stays **opt-in** in the engine: the RDNA-specific
+switches (`RDNA`, `FUSE`, `EXL3_WMMA`, `WMMA_GEMM`, `HIP_WMMA`) and the batching/multirow modes
+(`PRIMARY_MULTIROW=2`, `PEER_MULTIROW=4`, `EXPERT_BATCH`, `PEER_BATCH`), measured together on
+RDNA3. **On RDNA4 (gfx12) the same profile is untested** — it is a set of switches the engine
+accepts, not a promise; there is no gfx12-specific tuning in this fork.
 
-More problems and their fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
-[issue](https://github.com/Niko1221/Strata/issues) and attach `strata-<model>.log` from the Strata folder. Found a
-security problem? Report it privately: [SECURITY.md](SECURITY.md).
+### The CPU list caveat
 
-## How does it work?
+`--aux-cpus` / `STRATA_AUX_CPUS` decides where the engine's non-pool threads run
+(`include/strata/platform/aux_cpus.hpp`). The engine pins nothing until you say so: an unset
+`STRATA_AUX_CPUS` leaves the threads unpinned, and a value or flag (`LIST`, `auto` or `off`) is
+forwarded into the engine config verbatim.
 
-Models like this one usually run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes the model fit by **sharing the work across your whole PC**. Think of a kitchen: the things
-you use all the time stay on the counter, and the rest waits in the pantry.
+Measured on this fork's development machine (Ryzen 9 7950X, 16 cores), warm, a short **CODE** and a
+short **PROSE** prompt through the 3 bpw peer preset, all token ids identical between these arms
+of the same engine (two runs each for `20-23` and true `off`; the earlier `unset` arm ran as the
+engine's then-`auto` default, kept for reference):
 
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
+| aux CPUs | CODE tok/s | PROSE tok/s |
+| --- | --- | --- |
+| `20-23` | 75.66 | 62.97 |
+| off (no pinning) | 75.43 | 62.48 |
+| `auto` (engine default at the time) | 72.19 | 60.94 |
 
-- **The model is a team of 24,576 small specialists ("experts").** Each word needs only 10 of them.
-- **Your graphics card** keeps the few thousand experts that are used most often. **Your RAM** holds all of them,
-  and **your processor** works on the rest at the same time. **Your SSD** holds a big lookup table.
+**Opt-in candidate, this machine only:** `--aux-cpus 20-23` — logical CPUs 20-23 are the SMT
+siblings of physical cores 4-7. Against true `off` it measures **+0.3% CODE / +0.8% PROSE** —
+within noise, so it is a *tested candidate*, not a proven optimum. It is **not** a universal
+16-core rule: another CPU's best list depends on its layout, so measure your own before setting
+one.
 
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
+The launchers therefore leave `STRATA_AUX_CPUS` **unset by default** (no machine-specific value is
+baked in, and the engine's unpinned default is sensible): export it or pass `--aux-cpus` to
+forward your own list, including an explicit `off` or `0`.
 
-- **Guess, then check:** a small helper guesses the next few words. The big model checks them all at once. You get
-  the same answer, 1.6-1.8x sooner.
-- **Long texts are read in big pieces** (up to 8,192 tokens at a time), at over 1,000 tokens per second.
+## Building
 
-The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers:
-[the details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
+A normal build fetches the pinned llama.cpp commit (`third_party/ggml/VERSION.txt`) over the
+network during configure — reading a public source repository, not publishing anything. To build
+without that fetch, point CMake at a local llama.cpp checkout with `-DSTRATA_GGML_DIR=`:
 
-## Credits and license
+```sh
+python3 -m venv .venv && . .venv/bin/activate
+python -m pip install -r requirements.txt -r tools/exl3/requirements.txt
+cmake -B build-hip-exl3 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_BUILD_TESTS=ON \
+      -DCMAKE_HIP_ARCHITECTURES=gfx1100
+cmake --build build-hip-exl3 --target strata exl3_flags_test exl3_route_plan_test \
+      peer_adapt_plan_test exl3_moe_multi_parity exl3_peer_test -j2
+ctest --test-dir build-hip-exl3 \
+      -R '^(exl3_flags_test|exl3_route_plan_test|peer_adapt_plan_test|exl3_moe_multi_parity|exl3_peer_test)$' \
+      --output-on-failure
+```
 
-The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was
-compressed by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5)
-and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE). A few
-parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
+`-DSTRATA_GGML_DIR=/path/to/llama.cpp` replaces the fetch with a local checkout of the pinned
+commit. Building needs a ROCm 7 hipcc with hipBLAS (`docs/AMD_HIP.md`); the engine ends up at
+`build-hip-exl3/strata`, which is the launchers' default `--engine-bin`. `docs/AMD_HIP.md` has the
+Windows HIP path and `docs/EXL3-HIP-BENCH.md` the build this fork was measured with.
 
-## Support Strata
+## Getting a model
 
-Strata is free and open source. If it is useful to you, you can support its development:
+**The EXL3 launchers do not download or select a model automatically.** They require a local
+model directory supplied with `--model-dir` or `STRATA_EXL3_MODEL`. The upstream `setup.py`
+model downloader remains in the source tree for GGUF, but it is **not the EXL3 setup flow**:
+do not use it to obtain an EXL3 model or this fork's engine.
 
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+The two model branches tested during this fork's development are:
+
+- [3.05bpw_h5_ng5](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3/tree/3.05bpw_h5_ng5) — use `run-peer.sh`.
+- [4.05bpw_h6_ng6](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3/tree/4.05bpw_h6_ng6) — use `run-peer-4bpw.sh`.
+
+Download one complete branch into its own folder using your preferred HuggingFace client,
+then point the appropriate launcher at that folder. Keep the branch's index, all referenced
+weight shards, configuration, tokenizer assets and matching n-gram table together; do not mix
+files from the two branches. `docs/EXL3.md` describes the expected format. New users should
+follow [docs/AI_SETUP_EXL3_AMD.md](docs/AI_SETUP_EXL3_AMD.md) for hardware-appropriate settings.
+
+Prepare the server's pack-layout tokenizer from the downloaded model with
+`tools/exl3/tokenizer_to_pack.py`:
+
+```sh
+python3 tools/exl3/tokenizer_to_pack.py \
+  --hf /absolute/path/to/model --out /absolute/path/to/tokenizer-pack --check
+```
+
+Do not republish quantized model data you do not have the rights to.
+
+## Contributing a community test
+
+This fork targets a **small circle of AMD Radeon (RDNA3/RDNA4) owners on Linux/HIP** — it is not a
+general release, and reports are how the RDNA4 path and other cards get measured at all. Strata's
+contribution rules apply (see [AGENTS.md](AGENTS.md) and
+[docs/COMMUNITY_BENCHMARKS.md](docs/COMMUNITY_BENCHMARKS.md)): report from real hardware with
+measured numbers, compare against a same-day build, and say what you did not test. For this fork
+a report needs, at minimum:
+
+1. **Output correctness against your baseline.** Same model, same prompts: compare the fork's
+   answers against the *same quantization* on your reference engine — e.g. the model's EXL3 files
+   in ExLlamaV3. EXL3 and GGUF are different quantizations of the same weights, so do not expect
+   bit-identical text across them; compare like with like. `ctest -R 'exl3|ple_exl3'` runs the
+   EXL3 parity tests (`exl3_parity_k`, `exl3_loader_validation`, `exl3_gpu_parity`,
+   `exl3_gemv_parity`, `exl3_moe_multi_parity`, `ple_exl3_parity`, ...), and
+   `tools/exl3/check_real.py` prints a checksum of one real weight as the C++ kernel sees it.
+2. **The architecture, model and flags.** `gfx_target_version`, the card, the ROCm version, the
+   model and its bitrate, and exactly which `STRATA_*` switches were on — a run with the
+   defaults and one with the RDNA profile above, both labeled. AMD-only paths belong here;
+3. **Warm-versus-cold, stated.** The first EXL3 prompt reads tens of GiB from disk; a cold OS
+   page cache is not the steady state. If you drop the page cache between runs
+   (`/proc/sys/vm/drop_caches`, needs root, affects the whole machine), say so.
+   `tools/exl3/warm_session.py --engine <engine> --config <config> --output <dir>` runs two GENs
+   in one engine session so the second measures warm decode; `tools/exl3/bench.py` keeps the raw
+   engine logs and exact prompt/output ids. Label every number cold or warm.
+
+### Roadmap
+
+- **More AMD cards on Linux/HIP** — RDNA3 reports (gfx1100 beyond the development machine) and
+  RDNA4 (gfx1200/gfx1201) are the biggest gap: the switches exist and nothing about them is
+  measured on that generation yet.
+- **NVIDIA** — CUDA EXL3 work was validated on one vGPU and merged from a separate branch (see
+  `docs/EXL3-CUDA-VALIDATION.md`); PRs from NVIDIA owners are welcome, especially parity runs
+  against the same files (`ctest -R 'exl3|ple_exl3'`) on consumer cards.
+- **Upstream** — the plan is to rebase onto the latest upstream Strata and contribute the EXL3
+  work there. The `amd-exl3-community` branch preserves Ryutaku's base history; keep upstream
+  code updates separate from AMD optimization and packaging changes to simplify review.
+
+## License
+
+MIT, as upstream ([LICENSE](LICENSE)); third-party notices in `third_party/` and `SECURITY.md`
+carry over.
+
+## Provenance
+
+Source snapshot of [Strata](https://github.com/Niko1221/Strata) `0.1.44.1` (branch
+`exl3-hip-prefill-pipe`, commit `a27eefef`) with the EXL3/HIP work on top. The upstream README is
+[docs/UPSTREAM_README.md](docs/UPSTREAM_README.md). No claims here are upstream claims: measured
+numbers in the docs come from the machines stated beside them, and every untested path is labeled
+above.

@@ -39,6 +39,11 @@
 
 namespace strata::core {
 
+/// STRATA_EXL3_DENSE_MV=1 (A9): the verify window serves trellis (STRATA_EXL3_DENSE=exl3) dense
+/// projections with the dense multirow GEMV instead of native_data.  Startup gates that demand the
+/// native head / native dense weights check this.
+bool dense_mv_enabled();
+
 /// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
 /// residency tables are the baseline's (the swapped-in experts are resident from the window's first layer), but their
 /// bytes arrive layer by layer: `run` holds a layer's plan (the first thing that lets the GPU read the layer's expert
@@ -66,10 +71,31 @@ class RemoteExpertOpt;
 using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                              int64_t layer);
 
+// Optional device-resident expert provider. Calls made while recording a graph are launch-only.
+// One group/window in flight. publish() snapshots routes and rings; the host provider protects
+// graph hit slots while servicing misses. begin_host() false means an all-hit layer.
+struct VerifyExternalGraph {
+    void* user = nullptr;
+    void (*refresh)(void*, void*) = nullptr;
+    void (*hits)(void*, int, const float*, const int32_t*, int, int, float*, uint32_t, void*) = nullptr;
+    void (*publish)(void*, int, const float*, const int32_t*, int, int, float*, int32_t*,
+                    uint32_t*, uint32_t, void*) = nullptr;
+    const uint32_t* (*skip)(void*) = nullptr;
+    void (*copy_misses)(void*, const float*, float*, int, void*) = nullptr;
+    bool (*begin_host)(void*, int) = nullptr;
+    void (*end_host)(void*, int) = nullptr;
+    // Optional ordered peer transport, consumed on the primary after host misses.
+    void* peer_user = nullptr;
+    void (*copy_peer)(void*, float*, int, const uint32_t*, uint32_t, void*) = nullptr;
+    void (*release_peer)(void*) = nullptr;
+};
+
 struct VerifyHits {
-    // All routed FFN rows are returned by PoolMultiFn (e.g. an EXL3 GPU expert stream).
+    // PoolMultiFn returns routed FFN rows (e.g. EXL3); an external_graph provider may
+    // instead keep its primary hit rows on the device and ask the pool only for misses.
     // No GGUF expert residency table, blob layout, hit kernels or transfer plan is used in this mode.
     bool external_experts = false;
+    VerifyExternalGraph external_graph;
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
     const int32_t* h_res = nullptr;      ///< host [n_layers * n_expert] slot or -1 (when all >= 0 in stage: zero-doorbell)
     const uint8_t* cache_base = nullptr; ///< slot 0 of the VRAM expert arena

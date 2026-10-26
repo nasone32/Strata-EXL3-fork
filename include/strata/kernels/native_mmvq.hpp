@@ -133,6 +133,12 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
 /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream);
+/// A11 STRATA_MMVQ_BUNCH: native_mmvq(w1 -> y1), (w2 -> y2) and optionally (w3 -> y3) - DIFFERENT n_out widths
+/// on one shared q8_1 input - in ONE launch, bitwise the sequential calls. n_out3 <= 0 (or w3/y3 null) is a
+/// two-matrix bunch. Returns false (nothing launched) where the bundle is not eligible (Q8_0, 2-8 columns only).
+bool native_mmvq_bunch(int ggml_type, const void* w1, const void* w2, const void* w3, const void* x_q8_1,
+                       float* y1, float* y2, float* y3, int n_in, int n_out1, int n_out2, int n_out3,
+                       int ncols, void* stream);
 
 // Fork F4 (Eddoursul): 2..4 columns also INTERLEAVED, so one 16-byte load reads a position of every column: CP = 2 (2
 // columns) or 4 (3-4), zero-padded; nb = n_in / 32 blocks; int32 bm[nb][8][CP] (block-major), int32 pm[8][nb][CP]

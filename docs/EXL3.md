@@ -478,3 +478,127 @@ Special tokens (added, ids 248044–248076): `special:true → CONTROL(3)` (matc
 `parse_special`), `special:false → USER_DEFINED(4)` (always matched), base vocab `→ NORMAL(1)`. No BOS;
 EOS is `<|im_end|>` = 248046 (also 248044). A tiktoken-based engine could reproduce the same ids but has
 no C ABI and buys only speed that is irrelevant next to the forward pass, so it is not used.
+
+## AMD HIP (gfx1100) status and opt-ins
+
+Validated on 2 × RX 7900 XTX (gfx1100), ROCm 7.14, the 4.05 bpw `Qwen3.8-NEXT-exl3-4bpw` safetensors
+model with `ng6` PLE. Build commands, the full test/smoke record and every A/B decision live in
+**[docs/EXL3-HIP-BENCH.md](EXL3-HIP-BENCH.md)**. Three opt-ins are measured wins on this hardware and
+are OFF by default (the default paths are unchanged):
+
+```sh
+export STRATA_EXL3_WMMA=1     # gfx11 matrix-core group FFN: the trellis is decoded straight into the
+                              # WMMA fragments (no FP16 weight materialized); +21.5% PP8k, real model
+export STRATA_EXL3_WAVESYNC=1 # one device-FFN stream sync per expert wave instead of per
+                              # (expert-group, tile); +2.2-2.4% PP8k on top, +5-6% at 512 tokens
+export STRATA_EXL3_PIPE=1     # prefill wave pipelining: while one wave's FFN runs, the next wave's
+                              # expert reads and H2D uploads run into slots the current wave is done
+                              # with; +20.7% PP8k, 3.05 bpw model (implies the wave barrier above)
+/path/to/strata --serve --exl3 <model-dir> --ple-exl3 <ple-file> ...   # vars must reach the ENGINE
+```
+
+`STRATA_EXL3_WMMA` applies to the routed group FFN on the prefill (device-IO) path when a group
+holds 16 or more routes, and only where the device (gfx11 wmma family), codebook (mul1), bitrate
+(K3..K6) and 128-multiple shapes all fit; anything else - smaller groups, other parts, other
+codebooks - falls back to the indexed GEMV or the reconstruct+hipBLAS path as before.
+`STRATA_EXL3_WAVESYNC` is separate and architecture-neutral: it changes the device-IO expert-wave
+barrier for EVERY group count, including the indexed groups below 16.  Host-IO decode windows are
+unchanged by either.  Both are measured on gfx1100 only; opting in on an unvalidated backend is
+explicit but unmeasured. `STRATA_EXL3_PIPE=1` pipelines the device-IO waves on top of the wave
+barrier (which it implies): the next wave's expert reads and uploads run on the staging stream
+while the current wave's FFN runs, into slots released by per-slot last-reader events - the same
+release rule the native prefill staging ring uses.  Each call ends at one barrier, and the default
+per-tile path allocates no events and behaves exactly as before.  Host-IO decode windows are
+unchanged by all three. `STRATA_EXL3_TIME=1` adds per-window pool/upload/FFN/stream-sync/cache/
+eviction counters to stderr, and under `STRATA_EXL3_PIPE` an event-measured staging-vs-FFN
+overlap line.
+
+A fourth knob, this one on the host read path rather than the kernels: **`STRATA_EXL3_NO_PREAD=1`
+as an explicit warm-serving choice** (opt-in, OFF by default, no default changed).  It switches
+each expert-plane file read from `pread` through the pinned worker path to a direct pageable copy
+from the model's mmap - the whole read-path bundle (no pread syscalls, no pinned worker buffers,
+no double-buffer event reuse), so it is the bundle that is measured, not any single mechanism
+inside it.  The knob arms on PRESENCE: `=0` still enables it; UNSET it to disable.  Measured on
+3 bpw `Qwen3.8-NEXT-exl3-3bpw` + `ngram_embedding` PLE on one RX 7900 XTX (gfx1100, HIP,
+ROCm 7.14, PCIe 4.0 x16), engine 6bb84c1f, with the decode opt-ins `STRATA_EXL3_WMMA=1
+STRATA_EXL3_WAVESYNC=1 STRATA_EXL3_PIPE=1 STRATA_PF_GEMM=1 STRATA_WMMA_GEMM=1 STRATA_HIP_WMMA=1
+STRATA_EXL3_OVERLAP=1` and the serving flags `--expert-cache 126 --prefill 8192 --max-context
+65536 --kv int8 --spec 4 --ple-io mmap --vram-reserve-mib 2048` (packed MTP additionally
+`--spec-min-p 0.5 --mtp <rt>`): warm sustained decode (essay 512 tokens, warm expert cache)
+21.30 -> 25.48 tok/s net (+19.6%); with the packed MTP drafter (256 tokens) 25.05 -> 31.08 tok/s
+net (+24.1%, two order-varied pairs) and draft acceptance unchanged at 139/231 (60.2%) -
+outputs byte-identical between the arms.  The warm-cache cold-expert prefill also improves
+(~18%, 5.8 -> 4.8 s at 512 prompt tokens).  The ~31 tok/s is THIS model and THIS hardware with
+those flags - do not assume it on another model, bitrate, GPU or config.
+
+**`STRATA_EXL3_SMALL_M=1` (opt-in, prototype, kept for the peer milestone's decision):** on the
+host-IO decode windows (the MTP verification path) the expert GROUP becomes the FFN's dispatch
+unit - a shared expert's trellis window is decoded once for every activation row that needs it
+instead of once per row.  The float arithmetic is unchanged, so outputs are byte-identical to
+the indexed GEMV (verified by a dedicated seam test over mixed/all-hit/all-miss windows and by
+identical engine token streams).  Dispatch is shape-gated to what MEASURED a per-call win in
+the resident kernel bench: window >= 3 tokens, every group <= 6 rows, route reuse >= 1.4; M1/M2
+windows, wider groups and cut tiles stay on the indexed GEMV, the prefill/device arms are
+untouched, and any active ownership-elsewhere tier (peer or remote helper) bypasses it for the
+whole primary service.  The knob's ENTIRE device and host budget is pre-reserved at startup,
+before any verification graph exists, because a device allocation under the graph's host-flag
+spin can deadlock; calls larger than that pre-reserved envelope simply stay on the indexed
+GEMV, and the flag-on path allocates nothing per call.  With the flag unset, nothing new
+allocates and nothing new executes.  Measured on the 3 bpw model + one RX 7900 XTX with the
+fast flags above: M4/M6 verification windows run 70-97% of their routes through the grouped
+path and the net engine throughput is NEUTRAL (prose MTP +0.8%/-0.4%, code MTP -0.1%/-0.1%,
+no-spec M1 +0.08%, all token-identical) - the kernel win is real but did not surface end to
+end on THAT workload (a staging-bound explanation is plausible but not established; see the
+ledger).  This flag buys no end-to-end gain there; it is wiring and evidence for regimes where
+the resident FFN share is larger (the peer tier's device-resident PADDED windows).  No default
+changed.  HIP/gfx1100 only; CUDA/SYCL untested.
+
+**The second-card peer tier (opt-in, experimental):** with TWO HIP cards (validated on 2x RX
+7900 XTX, the 3 bpw Qwen3.8-NEXT model, HIP only - CUDA/SYCL untested), an explicit opt-in moves
+a static slice of experts to the second card and computes their rows there:
+
+```sh
+# presence semantics: the flag arms on ANY non-zero first character; UNSET to disable
+export STRATA_EXL3_PEER=1              # required: without it --peer-device is refused on EXL3
+export STRATA_EXL3_PEER_PADDED=1       # optional: one call per window (recommended candidate;
+                                       # unset = the default bounded-chunk form; "=0" STILL ARMS)
+/path/to/strata --serve --exl3 <model-dir> --ple-exl3 <ple-file> \
+    --peer-device 1 --peer-slots 8192 ...   # a second card; slots bound its static subset
+```
+
+Measured on that hardware (identical token outputs, MTP acceptance unchanged at 139/231):
+warm 512-token decode 25.49 -> 28.42 tok/s (+11.5%), packed-MTP 256 31.10 -> 36.23 (+16.6%)
+with the padded form (the bounded-chunk form: +8.9% warm, -3.6% MTP) - the bounded-chunk
+figures are 2 pairs per workload, the padded figures 1 exploratory run plus 1 fresh confirming
+matched pair (that pair: warm 25.56 -> 28.42, +11.2%; MTP 31.16 -> 36.20, +16.2%); a 256-slot
+tier is too small to help.  Startup fills the tier in 5-6 s (14.2 GiB at 8192
+slots).  This is a decode-side peer speedup - NOT an MTP algorithm improvement.  It is not a
+default and not auto-tuned; the subset is static (no migration); the tier needs roughly 2 GiB
+free on the display-carrying card (keep `--peer-reserve-mib`, default floor 2 GiB).
+
+Conditions and limits, said plainly: every number rides a warm page cache (the model + PLE are
+~81 GB against 93 GB RAM here); when the cache is cold or under pressure the two read paths
+are NOT measured - a controlled scratch-file fixture found them equal within 1.5% cold (both
+disk-bound at ~0.5 GB/s on that volume), but that fixture does not establish real-model cold
+throughput, and the historical in-file note claiming mmap reads collapse to 0.3 GB/s against
+10.4 GB/s for `preadv` on disk fault-in has not been reproduced on this machine.  If your
+model does not fit in page cache, do not assume the gain.  Tested on HIP/gfx1100 only (no CUDA
+or SYCL build of it was possible here); no automatic selector exists and none is proposed - a
+startup residency snapshot (mincore observes it fine) does not predict later residency or
+performance, so enabling the knob is your explicit serving decision.
+
+Running the test suite reproducibly on this machine requires the ROCm library path and the two
+supported GPUs visible (a plain `ctest` fails at `libhipblas` load time without the former, and
+`exl3_moe_multi_parity` aborts on the third GPU — a gfx1036 iGPU with no installed rocBLAS
+TensileLibrary kernels — without the latter; the abort is deliberate, not a silent skip):
+
+```sh
+LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib:/opt/rocm/core-7.14/lib/llvm/lib:/opt/rocm/lib \
+HIP_VISIBLE_DEVICES=0,1 ctest --test-dir build-hip-exl3 -R 'exl3|ple_exl3'
+```
+
+Credits: the EXL3 format and trellis decode are turboderp's ExLlamaV3 (MIT); Yxmura's PR #1764
+brought EXL3 to Strata and Ryutaku added the batched prefill, verifier windows, MTP and CUDA fixes
+this path builds on; the matrix-core technique (trellis decoded into `v_wmma_f32_16x16x16_f16`
+fragments, LDS-staged A tiles, K=32 mma pairing) is nasone32's llama.cpp EXL3 fork (MIT), adapted
+here to Strata's per-(expert-group, tile) calls.

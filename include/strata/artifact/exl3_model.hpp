@@ -96,6 +96,11 @@ public:
     }
     size_t tensor_count() const { return weight_map_.size(); }
 
+    /// Unmap every shard this accessor opened.  The pack calls this once its dense tensors are on the
+    /// GPU: a page that is still mapped survives POSIX_FADV_DONTNEED, so the unmap comes before the
+    /// fadvise.  Later lookups lazily re-map (nothing does after a build).
+    void close_shards() { shards_.clear(); }
+
     Exl3Linear linear(const std::string& base) const {
         auto tr = tensor(base + ".trellis");
         auto suh = tensor(base + ".suh");

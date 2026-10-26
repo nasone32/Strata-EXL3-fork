@@ -74,6 +74,25 @@ struct Exl3RoutePlan {
         experts.swap(next_experts_); offsets.swap(next_offsets_); destinations.swap(next_destinations_);
     }
 
+    // Remove whole groups from the plan (drop[g] != 0 drops group g), compacting offsets and
+    // destinations in place; the surviving groups and their routes keep their relative order.
+    // The CPU-tier pre-pass uses this: refused groups leave the GPU plan entirely, so every
+    // downstream arm (waves, overlap split, batching, tiles) sees only GPU work.
+    void drop_groups(const std::vector<uint8_t>& drop) {
+        if (drop.size() != experts.size())
+            throw std::invalid_argument("exl3: invalid drop-group mask");
+        next_experts_.clear(); next_offsets_.clear(); next_destinations_.clear();
+        for (size_t g = 0; g < experts.size(); ++g) {
+            if (drop[g] != 0) continue;
+            next_experts_.push_back(experts[g]);
+            next_offsets_.push_back((int) next_destinations_.size());
+            next_destinations_.insert(next_destinations_.end(), destinations.begin() + offsets[g],
+                                      destinations.begin() + offsets[g + 1]);
+        }
+        next_offsets_.push_back((int) next_destinations_.size());
+        experts.swap(next_experts_); offsets.swap(next_offsets_); destinations.swap(next_destinations_);
+    }
+
 private:
     std::vector<int> counts_, cursors_;
     std::vector<int> next_experts_, next_offsets_, next_destinations_;

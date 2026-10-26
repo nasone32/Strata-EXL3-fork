@@ -446,6 +446,13 @@ bool PleTable::open_exl3(const std::string& path, std::string& err, const PleIoO
         if (kv.first.rfind(prefix + ".shard_", 0) == 0 && kv.first.size() > 8 &&
             kv.first.compare(kv.first.size() - 8, 8, ".trellis") == 0)
             shards.push_back(&kv.second);
+    // The 3.05 turboderp upload splits the rings into 128 shard_N.trellis tensors; later uploads merge
+    // them into one prefix.trellis of the same [rows, words] shape. One tensor is the one-shard case of
+    // the same contiguity check below.
+    if (shards.empty()) {
+        auto single = tensors.find(prefix + ".trellis");
+        if (single != tensors.end() && single->second.shape.size() == 2) shards.push_back(&single->second);
+    }
     if (shards.empty()) { err = "EXL3 ngram: no shard_N.trellis tensors"; return false; }
     if (shards[0]->shape.size() != 2) { err = "EXL3 ngram: bad ring shape"; return false; }
     const int words = (int) shards[0]->shape[1];

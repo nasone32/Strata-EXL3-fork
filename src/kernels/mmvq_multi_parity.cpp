@@ -210,10 +210,81 @@ int sweep(bool exact, cudaStream_t s, Totals& t) {
 
 }  // namespace
 
+// A11 STRATA_MMVQ_BUNCH: the q|k|v (three widths) and qkv|z (two widths) bundles against the sequential
+// native_mmvq calls on the SAME q8_1 bytes - bitwise, every output, 2-6 columns.
+int bunch_parity(cudaStream_t s) {
+    struct B { int n_out; };
+    const struct { int n_in; int m; B b[3]; } cases[] = {
+        {2560, 3, {{2048}, {512}, {512}}},   // QSA q|k|v
+        {2560, 2, {{10240}, {640}, {0}}},    // GDN qkv|z
+    };
+    int fails = 0;
+    for (const auto& c : cases)
+        for (int T = 2; T <= 6; ++T) {
+            std::mt19937 rng(777u + (unsigned) c.n_in + (unsigned) T);
+            const std::size_t qall = strata::kernels::native_q8_1_bytes(c.n_in, T);
+            void* xq = nullptr;
+            if (!ck(cudaMalloc(&xq, qall), "bunch malloc xq")) return 1;
+            std::vector<float> x((std::size_t) T * c.n_in);
+            std::normal_distribution<float> nd(0.f, 1.f);
+            for (auto& v : x) v = nd(rng);
+            float* dx = nullptr;
+            if (!ck(cudaMalloc(&dx, x.size() * 4), "bunch malloc x")) return 1;
+            if (!ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "bunch copy x")) return 1;
+            strata::kernels::native_quantize_q8_1(dx, xq, c.n_in, T, s);
+            const void* w[3] = {nullptr, nullptr, nullptr};
+            float* yseq[3] = {nullptr, nullptr, nullptr};
+            float* ybun[3] = {nullptr, nullptr, nullptr};
+            std::vector<std::vector<uint8_t>> hw(c.m);
+            for (int m = 0; m < c.m; ++m) {
+                const std::size_t wb = strata::kernels::native_mmvq_weight_bytes(8, c.n_in, c.b[m].n_out);
+                hw[m].resize(wb);
+                for (auto& b : hw[m]) b = (uint8_t) (rng() & 0xff);
+                const std::size_t nb = (std::size_t) c.b[m].n_out * (std::size_t) (c.n_in / 32);
+                for (std::size_t k = 0; k < nb; ++k) {   // the Q80Block's half d at offset 0, finite scales
+                    const uint16_t h = sane_half(rng);
+                    std::memcpy(&hw[m][k * 34], &h, 2);
+                }
+                void* dwm = nullptr;
+                if (!ck(cudaMalloc(&dwm, wb), "bunch malloc w")) return 1;
+                if (!ck(cudaMemcpy(dwm, hw[m].data(), wb, cudaMemcpyHostToDevice), "bunch copy w")) return 1;
+                w[m] = dwm;
+                if (!ck(cudaMalloc(&yseq[m], (std::size_t) T * c.b[m].n_out * 4), "bunch malloc yseq")) return 1;
+                if (!ck(cudaMalloc(&ybun[m], (std::size_t) T * c.b[m].n_out * 4), "bunch malloc ybun")) return 1;
+                strata::kernels::native_mmvq(8, w[m], xq, yseq[m], c.n_in, c.b[m].n_out, T, s);
+            }
+            if (!strata::kernels::native_mmvq_bunch(8, w[0], w[1], c.m > 2 ? w[2] : nullptr, xq, ybun[0], ybun[1],
+                                                    c.m > 2 ? ybun[2] : nullptr, c.n_in, c.b[0].n_out,
+                                                    c.b[1].n_out, c.m > 2 ? c.b[2].n_out : 0, T, s)) {
+                std::printf("bunch n_in=%d m=%d T=%d: declined\n", c.n_in, c.m, T);
+                ++fails;
+            } else {
+                long long diff = 0, nonf = 0;
+                for (int m = 0; m < c.m; ++m) {
+                    std::vector<float> a((std::size_t) T * c.b[m].n_out), b((std::size_t) T * c.b[m].n_out);
+                    if (!ck(cudaMemcpy(a.data(), yseq[m], a.size() * 4, cudaMemcpyDeviceToHost), "bunch cy a")) return 1;
+                    if (!ck(cudaMemcpy(b.data(), ybun[m], b.size() * 4, cudaMemcpyDeviceToHost), "bunch cy b")) return 1;
+                    for (size_t i = 0; i < a.size(); ++i) {
+                        if (!std::isfinite(a[i]) && !std::isfinite(b[i])) { ++nonf; continue; }
+                        if (std::memcmp(&a[i], &b[i], 4) != 0) ++diff;
+                    }
+                }
+                std::printf("bunch n_in=%d m=%d T=%d: %lld differ bitwise, %lld non-finite\n", c.n_in, c.m, T, diff, nonf);
+                if (diff != 0 || nonf != 0) ++fails;
+            }
+            for (int m = 0; m < c.m; ++m) {
+                (void) cudaFree((void*) w[m]); (void) cudaFree(yseq[m]); (void) cudaFree(ybun[m]);
+            }
+            (void) cudaFree(xq); (void) cudaFree(dx);
+        }
+    return fails;
+}
+
 int main() {
     cudaStream_t s;
     if (!ck(cudaStreamCreate(&s), "stream create")) return 1;
 
+    const int bad_bunch = bunch_parity(s);
     Totals on, off;
     const int bad = sweep(true, s, on);
     const int bad_off = sweep(false, s, off);
@@ -227,6 +298,11 @@ int main() {
     if (on.nonfinite != 0 || off.nonfinite != 0) {
         std::printf("\nmmvq_multi_parity: FAILED. %lld non-finite outputs from finite scales and activations: the "
                     "bit comparison is only meaningful on finite outputs.\n", on.nonfinite + off.nonfinite);
+        return 1;
+    }
+    if (bad_bunch != 0) {
+        std::printf("\nmmvq_multi_parity: FAILED. %d bunch case(s) differ from the sequential calls or were declined.\n",
+                    bad_bunch);
         return 1;
     }
     if (bad != 0 || bad_off != 0) {

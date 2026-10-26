@@ -1,0 +1,30 @@
+{
+  "_comment": "Measured 3 bpw EXL3 preset on one RX 7900 XTX (gfx1100, RDNA3), ROCm 7.14 - see docs/EXL3-HIP-BENCH.md. A TEMPLATE: replace ${STRATA_EXL3_MODEL} (and the tokenizer path, a pack layout made with tools/exl3/tokenizer_to_pack.py) with your model's locations, or generate a run config with ./run-peer.sh --dry-run. lib_dirs name this machine's split-layout ROCm; drop the key if yours is on the default linker path.",
+  "cwd": ".",
+  "tokenizer": "${STRATA_EXL3_TOKENIZER}",
+  "lib_dirs": [
+    "/opt/rocm/core-7.14/lib",
+    "/opt/rocm/core-7.14/lib/llvm/lib",
+    "/opt/rocm/lib"
+  ],
+  "env": {
+    "HIP_VISIBLE_DEVICES": "0",
+    "STRATA_EXL3_WMMA": "1",
+    "STRATA_EXL3_WAVESYNC": "1",
+    "STRATA_EXL3_PIPE": "1",
+    "STRATA_PF_GEMM": "1",
+    "STRATA_WMMA_GEMM": "1",
+    "STRATA_HIP_WMMA": "1"
+  },
+  "args": [
+    "--exl3", "${STRATA_EXL3_MODEL}",
+    "--ple-exl3", "${STRATA_EXL3_MODEL}/ngram_embedding.safetensors",
+    "--expert-cache", "126",
+    "--prefill", "8192",
+    "--max-context", "65536",
+    "--kv", "int8",
+    "--spec", "4",
+    "--ple-io", "mmap",
+    "--vram-reserve-mib", "2048"
+  ]
+}
