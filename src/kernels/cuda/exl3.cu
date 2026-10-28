@@ -602,12 +602,23 @@ __global__ void silu_batched_kernel(const uint16_t* __restrict__ g, const uint16
 
 namespace {
 
+// The native forms below need gfx11/gfx12 instructions (v_dot4 = dot8-insts).  STRATA_EXL3_RDNA_DECODE builds
+// the RDNA decode kernels for every target in the arch list, so another family in a mixed list (gfx1030, gfx90a)
+// gets the integer-exact portable form of the same value instead of a compile error.
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__GFX11__) || defined(__GFX12__)
+#define STRATA_EXL3_RDNA_NATIVE 1
+#endif
+
 __device__ __forceinline__ uint32_t rdna_hash16_lo(uint32_t src) {
     // src's LOW 16 bits times 0x83DCD12D mod 2^32: x*C = x*C_lo16 + ((x * C_hi16) mod 2^16) << 16
+#if defined(STRATA_EXL3_RDNA_NATIVE)
     uint32_t r, p;
     asm ("v_pk_mul_lo_u16 %0, %1, %2 op_sel_hi:[0,1]" : "=v"(r) : "v"(src), "s"(0x83DC0000u));
     asm ("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(p) : "v"(src), "s"(0xD12Du), "v"(r));
     return p;
+#else
+    return (src & 0xFFFFu) * 0x83DCD12Du;
+#endif
 }
 
 __device__ __forceinline__ uint32_t rdna_funnel(uint32_t lo, uint32_t hi, uint32_t shift) {
@@ -617,7 +628,11 @@ __device__ __forceinline__ uint32_t rdna_funnel(uint32_t lo, uint32_t hi, uint32
 
 // mul1 decode's byte sum, one v_sudot4 (identical integers to the shift/add chain)
 __device__ __forceinline__ uint32_t rdna_bytesum(uint32_t x) {
+#if defined(STRATA_EXL3_RDNA_NATIVE)
     return (uint32_t) __builtin_amdgcn_sudot4(false, x, false, 0x01010101u, 0x6400u, false);
+#else
+    return (x & 0xFFu) + ((x >> 8) & 0xFFu) + ((x >> 16) & 0xFFu) + (x >> 24) + 0x6400u;
+#endif
 }
 
 // Two hashed windows -> the decoded fp16 weight pair: sad_u8 emits [0x6400+s0 | 0] (the sum fits 16
@@ -642,10 +657,10 @@ __device__ __forceinline__ float rdna_fdot2(__half2 a, __half2 b, float c) {
 // above (wlo | whi << 8 | sh << 16).  K <= 5: one funnel per run; K >= 6: two pair funnels.
 struct RdnaRun { int wlo, whi, sh; };
 
-// STRATA_EXL3_RDNA's level, read once (gfx11 builds only; see the kernel comments below): shared
+// STRATA_EXL3_RDNA's level, read once (gfx11 and gfx12 builds, STRATA_EXL3_RDNA_DECODE; see the kernel comments below): shared
 // by the indexed twin and the grouped twin's dispatcher.
 inline int rdna_level() {
-#if defined(STRATA_WMMA_GFX11)
+#if defined(STRATA_EXL3_RDNA_DECODE)
     static const int v = [] {
         const char* value = std::getenv("STRATA_EXL3_RDNA");
         return value ? std::max(0, std::min(2, std::atoi(value))) : 0;
@@ -664,9 +679,10 @@ __device__ __forceinline__ RdnaRun rdna_span(const int nw, int b_first, int b_la
 }  // namespace
 
 // The helpers above stay outside the gfx11 guard: gemv_grouped_rdna_kernel (below the guard) uses them,
-// so they must compile for every gfx11/gfx12 target (issue #1, gfx1201-only builds).  Without STRATA_WMMA_GFX11
-// rdna_level() is 0, so the RDNA decode paths are never launched there.
-#if defined(STRATA_WMMA_GFX11)
+// so they must compile for every gfx11/gfx12 target (issue #1, gfx1201-only builds).  Without STRATA_EXL3_RDNA_DECODE
+// (the build defines it for gfx11 and gfx12 targets) rdna_level() is 0, so the RDNA decode paths are never launched
+// there.  The WMMA kernels keep STRATA_WMMA_GFX11 (gfx11 only) and their per-device runtime gate.
+#if defined(STRATA_EXL3_RDNA_DECODE)
 namespace {
 
 // gemv_batched_kernel's RDNA twin: same grid, same 256-thread (c, sub) geometry, same shared-tile
@@ -1163,7 +1179,7 @@ __global__ void __launch_bounds__(256, 2) gemv_dense_mr_kernel(const float* __re
 }
 
 }  // namespace
-#endif  // STRATA_WMMA_GFX11
+#endif  // STRATA_EXL3_RDNA_DECODE
 
 __global__ void accum_out_kernel(const uint16_t* __restrict__ d, const float* __restrict__ weights,
                                  int n_experts, int n, uint16_t* __restrict__ out) {
@@ -1743,10 +1759,10 @@ uint16_t* moe_run_experts_dev(Exl3Mat* d_gate, Exl3Mat* d_up, Exl3Mat* d_down, i
         }();
         gy_g = std::min(gy_g, cap); gy_d = std::min(gy_d, cap);
     }
-    // STRATA_EXL3_RDNA (gfx11 builds only): 1 = run-grouped funnel loads + packed-hash decode,
+    // STRATA_EXL3_RDNA (gfx11 and gfx12 builds): 1 = run-grouped funnel loads + packed-hash decode,
     // bit-identical to the scalar kernel; 2 = additionally fp16 weight pairs + v_dot2_f32_f16 over
     // fp16 activations (the reference engine's arithmetic).  0/absent = the established kernel.
-#if defined(STRATA_WMMA_GFX11)
+#if defined(STRATA_EXL3_RDNA_DECODE)
     static const int rdna = [] {
         const char* value = std::getenv("STRATA_EXL3_RDNA");
         return value ? std::max(0, std::min(2, std::atoi(value))) : 0;
@@ -1759,7 +1775,7 @@ uint16_t* moe_run_experts_dev(Exl3Mat* d_gate, Exl3Mat* d_up, Exl3Mat* d_down, i
     // 2 additionally folds postscale into the GEMV epilogue (-> 1 launch per projection);
     // 3 additionally folds the silu*up elementwise product into the down projection's prologue
     // (-> 3 launches per expert FFN: gate, up, down).
-#if defined(STRATA_WMMA_GFX11)
+#if defined(STRATA_EXL3_RDNA_DECODE)
     const int fuse = input_rows != nullptr && rdna >= 1 ? [] {
         const char* value = std::getenv("STRATA_EXL3_FUSE");
         return value ? std::max(0, std::min(3, std::atoi(value))) : 0;
@@ -1803,7 +1819,7 @@ uint16_t* moe_run_experts_dev(Exl3Mat* d_gate, Exl3Mat* d_up, Exl3Mat* d_down, i
         if (input_rows) {
             // Each K partition has its own output. The Hadamard pass sums them in a fixed order,
             // so a route's result does not depend on the other slots or CUDA block scheduling.
-#if defined(STRATA_WMMA_GFX11)
+#if defined(STRATA_EXL3_RDNA_DECODE)
             if (fuse >= 2) {
                 const uint16_t* xin = x;
                 const uint16_t* silu_mul = nullptr;
@@ -1839,7 +1855,7 @@ uint16_t* moe_run_experts_dev(Exl3Mat* d_gate, Exl3Mat* d_up, Exl3Mat* d_down, i
             gemv_batched_kernel<GEMV_T, true, Masked><<<grid, 256, 0, st>>>(d_xh, mats, d_pinv, w.partials.p);
             postscale_batched_kernel<Masked><<<dim3(outputs / HAD, n_experts), HAD, 0, st>>>(w.partials.p, mats, out, outputs, parts);
         } else {
-#if defined(STRATA_WMMA_GFX11)
+#if defined(STRATA_EXL3_RDNA_DECODE)
             if (rdna == 1)
                 gemv_batched_rdna_kernel<GEMV_T, false, 1><<<grid, 256, 0, st>>>(d_xh, d_xh16, mats, d_pinv, d_z);
             else if (rdna == 2)
@@ -2985,7 +3001,7 @@ void exl3_sigmoid_scale_rows(float* out, const float* g, int n, int rows, void* 
 
 void exl3_gemv_f32(const float* x, const uint16_t* suh, const uint16_t* svh, const uint16_t* trellis,
                    int ki, int nj, int bits, int cb, float* y, void* stream) {
-#if defined(STRATA_WMMA_GFX11)
+#if defined(STRATA_EXL3_RDNA_DECODE)
     // STRATA_EXL3_DENSE_RDNA=1: the dense m == 1 GEMV takes the multirow kernel's row tile of 1
     // (2 launches, the RDNA decode core, fp32 end to end) instead of the f32->f16->f32 old pipeline
     if (exl3_dense_rdna_enabled()) {
@@ -3011,7 +3027,7 @@ DenseMrWs g_dense_mr[2];
 }  // namespace
 
 bool exl3_dense_mr_available() {
-#if defined(STRATA_WMMA_GFX11)
+#if defined(STRATA_EXL3_RDNA_DECODE)
     return true;
 #else
     return false;
@@ -3020,7 +3036,7 @@ bool exl3_dense_mr_available() {
 
 bool exl3_dense_rdna_enabled() {
     static const bool on = [] {
-#if defined(STRATA_WMMA_GFX11)
+#if defined(STRATA_EXL3_RDNA_DECODE)
         const char* e = std::getenv("STRATA_EXL3_DENSE_RDNA");
         return e != nullptr && std::atoi(e) > 0;
 #else
@@ -3031,7 +3047,7 @@ bool exl3_dense_rdna_enabled() {
 }
 
 void exl3_dense_mr_reserve_shape(int slot, int ki, int nj) {
-#if defined(STRATA_WMMA_GFX11)
+#if defined(STRATA_EXL3_RDNA_DECODE)
     DenseMrWs& w = g_dense_mr[slot & 1];
     const int k = ki * 16, n = nj * 16;
     int parts = 1;
@@ -3061,7 +3077,7 @@ void exl3_dense_mr_reserve_shape(int slot, int ki, int nj) {
 void exl3_dense_gemv_multi(int slot, const float* x, long x_stride, const uint16_t* trellis,
                            const uint16_t* suh, const uint16_t* svh, int ki, int nj, int bits, int cb,
                            int rows, float* y, long y_stride, void* stream) {
-#if defined(STRATA_WMMA_GFX11)
+#if defined(STRATA_EXL3_RDNA_DECODE)
     const int k = ki * 16, n = nj * 16;
     if (ki <= 0 || nj <= 0 || rows < 1 || k % HAD || n % HAD) {
         std::fprintf(stderr, "exl3_dense_gemv_multi: dims must be multiples of %d (ki=%d nj=%d rows=%d)\n",

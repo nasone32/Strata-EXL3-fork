@@ -49,7 +49,7 @@ void exl3_gemv(const uint16_t* x, const uint16_t* suh, const uint16_t* svh, cons
 void exl3_gemv_f32(const float* x, const uint16_t* suh, const uint16_t* svh, const uint16_t* trellis,
                    int ki, int nj, int bits, int cb, float* y, void* stream);
 
-// ---- the dense multirow trellis GEMV (A9; gfx11 builds only) ----
+// ---- the dense multirow trellis GEMV (A9; gfx11 and gfx12 builds) ----
 // m = 1..8 rows of one matrix through the RDNA decode core: the input rotation runs as its own kernel
 // (suh + H128 into an fp32 scratch), the dot kernel decodes B once per run and feeds every row's fp32
 // accumulator set, and a counter epilogue Hadamards/scales each row.  Row r of an m-row call is
@@ -62,7 +62,7 @@ void exl3_dense_gemv_multi(int slot, const float* x, long x_stride, const uint16
 // Pre-grow that slot's workspace for one (ki, nj) shape.  The engine walks every trellis role and
 // reserves BEFORE any graph capture; a lazy cudaMalloc inside a capture is fatal.
 void exl3_dense_mr_reserve_shape(int slot, int ki, int nj);
-bool exl3_dense_mr_available();   // false on builds without the gfx11 kernels
+bool exl3_dense_mr_available();   // false on builds without a gfx11 or gfx12 target
 bool exl3_dense_rdna_enabled();   // STRATA_EXL3_DENSE_RDNA
 
 // A9's window shared expert: the decode path's fp32 swiglu (silu(g) * u, elementwise; h may alias u)
