@@ -96,6 +96,11 @@ endif()
 if(CMAKE_HIP_ARCHITECTURES MATCHES "gfx11")
   target_compile_definitions(strata_hip_runtime INTERFACE STRATA_WMMA_GFX11=1)
 endif()
+# The EXL3 RDNA decode kernels (STRATA_EXL3_RDNA / _FUSE / _DENSE_RDNA, opt-in at run time) use no WMMA and
+# compile to the same native dot/sad/pk instructions on gfx11 and gfx12, so they build for either family
+if(CMAKE_HIP_ARCHITECTURES MATCHES "gfx1[12]")
+  target_compile_definitions(strata_hip_runtime INTERFACE STRATA_EXL3_RDNA_DECODE=1)
+endif()
 target_link_libraries(strata_hip_runtime INTERFACE hip::host)
 # The shim renames the CUDA runtime to HIP, force-included into every host and device source. On Windows the host
 # compiler is ROCm's clang++ too (tools/hip/build_windows.bat: CMake refuses to mix cl.exe with Clang HIP), which takes
