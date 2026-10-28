@@ -258,7 +258,7 @@ For community performance comparisons:
 | Missing `libhipblas*` / ROCm library | Check `ldd` and library directories from the build's ROCm installation. Do not install a second ROCm blindly. |
 | `/dev/kfd` permission denied | Check render/video membership and session permissions; explain the required permission change and new login. |
 | Unsupported architecture / invalid device function | Confirm actual GPU target and rebuild for it. Do not force gfx1100 on RDNA4. |
-| EXL3 rejects `--layer-split auto` | Use explicit `--gpu 0` for single GPU or `--gpu 0,1 --peer-device 1` for the peer tier. |
+| Where does `--layer-split auto` put the split with EXL3? | By layer count: stage i starts at layer n_layers*i/stages (two GPUs: half each); the startup log names K. Pass explicit K to place it by hand. |
 | VRAM allocation failure | Confirm competing processes; reduce context/prefill/explicit cache or peer cap. Preserve desktop headroom. Do not stop someone else's process. |
 | Very slow first prompt | Inspect model IO, cold expert pages and PLE mode. Keep PLE direct; compare warmed requests before concluding a kernel regression. |
 | Empty/incoherent output | Verify model revision, indexed shards, matching PLE and tokenizer. Stop tuning speed until correctness is established. |
