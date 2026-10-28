@@ -13170,7 +13170,7 @@ int main(int argc, char** argv) {
                     // undo restores everything it wrote).  STRATA_PIPELINE_DOOM_SKIP=0: served in full.
                     static const bool doom_skip = [] { const char* e = pipe_dbg_env("STRATA_PIPELINE_DOOM_SKIP"); return e == nullptr || std::atoi(e) != 0; }();
                     const bool skip = doom_skip && doomed && &w == &D;
-                    if (v.service(skip ? nullptr : &drive_pool_split, SDf(w), err) < 0) return false;
+                    if (v.service(skip ? nullptr : win_pool_fn, SDf(w), err) < 0) return false;
                     if (v.done(err)) {
                         if (!v.pl_finish(nullptr, err)) return false;
                         w.fl = false;
@@ -13365,7 +13365,7 @@ int main(int argc, char** argv) {
                     if ((doomed && !pump0(D)) || !pump0(A) || !pump0(B)) return die(err);
                     if (A.s1 && !A.s1_done) {
                         strata::core::Verifier& v = V1(A);
-                        if (v.service(&drive_pool_split, SDf(A), err) < 0) return die(err);
+                        if (v.service(win_pool_fn, SDf(A), err) < 0) return die(err);
                         if (v.done(err)) {
                             if (!v.pl_finish(outp.data(), err)) return die(err);
                             A.s1_done = true;
