@@ -318,7 +318,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata_core PUBLIC strata_plan strata_warnings ${_strata_gpu_runtime_target})
 
   add_executable(strata-device src/core/device_main.cpp)
-  target_link_libraries(strata-device PRIVATE strata_core)
+  target_link_libraries(strata-device PRIVATE strata_core strata_kernels)
 
   add_executable(strata-load src/core/load_main.cpp)
   target_link_libraries(strata-load PRIVATE strata_core strata_kernels)
@@ -1099,12 +1099,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
   # Plan v0.3 P0.1: working-set lock of a host region (CPU only).
   add_executable(platform_memory_test src/platform/memory_test.cpp)
-  target_link_libraries(platform_memory_test PRIVATE strata_core ${_strata_gpu_runtime_target})
+  target_link_libraries(platform_memory_test PRIVATE strata_core strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME platform_memory_test COMMAND platform_memory_test)
 
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
-    target_link_libraries(pinned_shared_test PRIVATE strata_core ${_strata_gpu_runtime_target})
+    target_link_libraries(pinned_shared_test PRIVATE strata_core strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME pinned_shared_test COMMAND pinned_shared_test)
   endif()
 
