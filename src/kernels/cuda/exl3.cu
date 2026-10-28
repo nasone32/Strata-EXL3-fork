@@ -578,7 +578,6 @@ __global__ void silu_batched_kernel(const uint16_t* __restrict__ g, const uint16
     h[i] = __half_as_ushort(__float2half_rn(s * __half2float(__ushort_as_half(u[i]))));
 }
 
-#if defined(STRATA_WMMA_GFX11)
 // ---- RDNA3 instruction-level decode port (opt-in, STRATA_EXL3_RDNA) ----
 //
 // ExLlamaV3's rdna "tiles" core (exl3_gemv_tiles_rdna.cuh) beats the scalar decode by (a) loading ONE
@@ -661,6 +660,14 @@ __device__ __forceinline__ RdnaRun rdna_span(const int nw, int b_first, int b_la
     const int dlo = b_first >> 5, dhi = (b_last + 15) >> 5;
     return { dlo % nw, dhi % nw, 32 * dhi + 16 - b_last };
 }
+
+}  // namespace
+
+// The helpers above stay outside the gfx11 guard: gemv_grouped_rdna_kernel (below the guard) uses them,
+// so they must compile for every gfx11/gfx12 target (issue #1, gfx1201-only builds).  Without STRATA_WMMA_GFX11
+// rdna_level() is 0, so the RDNA decode paths are never launched there.
+#if defined(STRATA_WMMA_GFX11)
+namespace {
 
 // gemv_batched_kernel's RDNA twin: same grid, same 256-thread (c, sub) geometry, same shared-tile
 // reduction and Partials output, same per-(i, r, t) FMA ORDER for RDNA == 1 - only the loads (one
