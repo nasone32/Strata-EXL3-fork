@@ -2884,10 +2884,9 @@ int main(int argc, char** argv) {
         } else (void) cudaGetLastError();
     }
 #endif
-    if (!o.exl3_dir.empty() && (o.layer_split == "auto" ||
-                               !o.native_preset.empty() || !o.native_head_gguf.empty() ||
+    if (!o.exl3_dir.empty() && (!o.native_preset.empty() || !o.native_head_gguf.empty() ||
                                !o.native_dense_gguf.empty())) {
-        std::fprintf(stderr, "strata generate: --exl3 does not yet accept --layer-split auto or GGUF native weights; use explicit layer boundaries\n");
+        std::fprintf(stderr, "strata generate: --exl3 does not yet accept GGUF native weights\n");
         return 2;
     }
     if (!o.exl3_dir.empty() && (o.spec > 0 || o.batch > 0 || o.prefill_chunk > 0 || o.prefill_auto || !o.layer_split.empty())) {
@@ -3740,6 +3739,19 @@ int main(int argc, char** argv) {
         const char* v = std::getenv("STRATA_STAGE_TRIM");
         return v != nullptr && v[0] != 0 && std::string(v) != "0";
     }();
+    // --exl3 has no expert profile for the split search, so `auto` places the boundaries by layer count before
+    // anything reads split_at: stage i starts at n_layers * i / stages (two GPUs: half the layers each).
+    if (multi_gpu && split_auto && !o.exl3_dir.empty()) {
+        const int64_t ns = (int64_t) split_devs.size() + 1;
+        std::string ks;
+        for (int64_t i = 1; i < ns; ++i) {
+            split_at.push_back(g.n_layers * i / ns);
+            ks += (ks.empty() ? "" : ",") + std::to_string(split_at.back());
+        }
+        split_auto = false;
+        std::fprintf(stderr, "strata generate: --layer-split auto with --exl3: %lld stages by layer count, K=%s of %lld layers\n",
+                     (long long) ns, ks.c_str(), (long long) g.n_layers);
+    }
     // CUDA0'S ARENA IS BUILT BEFORE THE SPLIT IS KNOWN.  The prompt path's PLE tables are read out of it, here,
     // and `auto` does not choose its split points until 590 lines below - so CUDA0 can still only trim an
     // explicit --layer-split.  It is also the cheapest card to leave alone: it runs layers 0..split_at[0] on

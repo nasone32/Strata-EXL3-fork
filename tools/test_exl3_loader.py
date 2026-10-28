@@ -333,12 +333,16 @@ class CommandLineTests(unittest.TestCase):
                 self.assertIn("choose one", result.stderr)
 
     def test_unsupported_modes_fail_before_loading(self):
-        for args in (("--layer-split", "auto"),
-                     ("--native", "fake.gguf")):
+        for args in (("--native", "fake.gguf"),):
             with self.subTest(args=args):
                 result = self.engine("--exl3", "fake", "--no-ple", *args)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("--exl3 does not yet accept", result.stderr)
+
+    def test_layer_split_auto_is_accepted(self):
+        result = self.engine("--exl3", "fake", "--no-ple", "--layer-split", "auto")
+        self.assertNotIn("does not yet accept", result.stderr)
+        self.assertIn("needs --serve", result.stderr)   # got past the EXL3 reject into the split check
 
     def test_help_lists_exl3(self):
         result = self.engine("--help")
