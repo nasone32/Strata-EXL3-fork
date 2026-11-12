@@ -1,0 +1,33 @@
+{
+  "published_commit": "3be4442681404ce7a345d6e74f0e4abe62ba19ed",
+  "candidate": "commit containing this record",
+  "hardware": {
+    "cpu": "Ryzen 9 7950X",
+    "installed_ram_gb": 96,
+    "gpus": [
+      "RX 7900 XTX gfx1100 x16",
+      "RX 7900 XTX gfx1100 chipset x4"
+    ],
+    "runtime": "ROCm core-7.14",
+    "os": "Linux"
+  },
+  "rows": 36,
+  "runtime_source_sha256": {
+    "src/program/generate.cpp": "4558351906907cb497ba58b3fd8d0fc06d1b35550fb080f85bc388320f2a8989",
+    "include/strata/core/exl3_flags.hpp": "0b6d7bfc980f2f419bf0844d32fcebb7ccf4a9b84a5f25eb186ff6cc2874ab2a",
+    "src/kernels/cuda/exl3.cu": "06d9a6be573f5c110175d6d1d8f1883f7bb1de3a11c80620e3e4e0aec21500e2",
+    "src/kernels/cuda/exl3_experts.cu": "9d9ba12ee5341d2604c150d8c4ee34e273e0e7362e74dedc666e83443a48c808",
+    "src/kernels/exl3_peer.cpp": "d1b2324522a07960833b0cdce5f1c06fa1b555268f2cc9a0d87569a13ed6dc02"
+  },
+  "binaries": {
+    "published": "42bd0573b636d596be9c5935208740f6143a39718ec4eb9b098a24fd792e545c",
+    "candidate": "d8379151705e5ff37d65dbb6ce9d9ea18d3d9930e029dcc0ae04dae44bd2b183"
+  },
+  "limitations": [
+    "One short batch; published profile first, no balanced repetition.",
+    "Startup excluded; candidate full residency pays expert IO before READY.",
+    "Several continuations differ; no token-equivalent causal speedup claim.",
+    "One-GPU CPU + RAM-repack is a combined policy comparison.",
+    "No CUDA, Windows, SYCL, Metal or RDNA4 validation."
+  ]
+}

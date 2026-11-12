@@ -97,13 +97,25 @@ uint16_t decode_window(Exl3Codebook cb, uint16_t window) {
 
 // ---- 16-bit sliding windows over one packed tile ----
 
-// The window for stored position `v`: the 16 bits ending at bit (v+1)*bits, read with ExLlamaV3's funnel
-// shift over the packed uint32 words (unpack_trellis / dq).  NOT a linear LSB bitstream read - the encoder
-// packs per 16-value span, MSB-first, then byte-swaps, so the linear read did not reproduce the weights.
-uint16_t window16(const uint16_t* words, int nwords, int bits, int v) {
+// The bit the window of stored position `v` ENDS at inside the tile's ring.  Integer K: every
+// position contributes K new bits, so the end is (v+1)*K.  Half-integer K = KA + 0.5 (exllamav3
+// frac.cuh, mul1-only): positions alternate KA / KA+1 bits within each group of 16 (MASK 0xAAAA -
+// odd positions take the extra bit), so a 16-position group spans 16*KA+8 bits and position v,
+// m = v%16 into its group, ends at (v/16)*(16*KA+8) + KA*(m+1) + (m+1)/2.
+int window_end(int v, int bits, int frac) {
+    if (frac == 0) return (v + 1) * bits;
+    const int m = v & 15;
+    return (v >> 4) * (16 * bits + 8) + bits * (m + 1) + ((m + 1) >> 1);
+}
+
+// The window for stored position `v`: the 16 bits ending at window_end(v), read with ExLlamaV3's funnel
+// shift over the packed uint32 words (unpack_trellis / unpack_trellis_frac / dq).  NOT a linear LSB
+// bitstream read - the encoder packs per 16-value span, MSB-first, then byte-swaps, so the linear
+// read did not reproduce the weights.
+uint16_t window16(const uint16_t* words, int nwords, int bits, int frac, int v) {
     const uint32_t* p32 = (const uint32_t*) words;
-    const int nw = nwords / 2;                          // == bits * 256 / 32
-    const int b0 = v * bits + bits - 16 + 256 * bits;
+    const int nw = nwords / 2;                          // == ring bits / 32
+    const int b0 = window_end(v, bits, frac) - 16 + nwords * 16;   // + ring keeps b0 positive
     const int b2 = b0 + 16;
     const int i0r = b0 >> 5, i1r = (b2 - 1) >> 5;
     const int s1 = (i1r + 1) * 32 - b2;
@@ -130,17 +142,19 @@ void build_perm(int* perm) {
 
 // ---- Hadamard 128 (natural-order Sylvester, scaled 1/sqrt(128)) ----
 
+// The tables are function-local statics on purpose: C++11 initializes them exactly once, and the
+// mimo pack reconstructs several tensors in parallel worker threads through these paths, so a
+// hand-rolled "if (!built) build()" here would hand one thread a half-filled table.
 const float (*had128())[128] {
-    static float h[128][128];
-    static bool init = false;
-    if (!init) {
+    static const auto h = [] {
+        auto table = new float[128][128];
         for (int i = 0; i < 128; ++i)
             for (int j = 0; j < 128; ++j)
-                h[i][j] = ((__builtin_popcount((unsigned)(i & j)) & 1) ? -1.0f : 1.0f) /
-                          std::sqrt(128.0f);
-        init = true;
-    }
-    return (const float (*)[128])h;
+                table[i][j] = ((__builtin_popcount((unsigned)(i & j)) & 1) ? -1.0f : 1.0f) /
+                              std::sqrt(128.0f);
+        return table;
+    }();
+    return h;
 }
 
 void had_rows(std::vector<float>& m, int rows, int cols) {
@@ -179,13 +193,21 @@ void had_cols(std::vector<float>& m, int rows, int cols) {
 }
 
 const uint16_t* lut_for(Exl3Codebook cb) {
-    static std::vector<uint16_t> luts[3];
-    int idx = (int)cb;
-    if (luts[idx].empty()) {
-        luts[idx].resize(1u << 16);
-        exl3_codebook_lut(cb, luts[idx].data());
-    }
-    return luts[idx].data();
+    // one magic static per codebook (see had128): parallel reconstructors must never see a
+    // half-filled lookup table
+    static const std::vector<uint16_t> luts[3] = {
+        std::vector<uint16_t>(1u << 16), std::vector<uint16_t>(1u << 16), std::vector<uint16_t>(1u << 16),
+    };
+    static const bool filled = [] {
+        for (int cb = 0; cb < 3; ++cb) {
+            std::vector<uint16_t> lut(1u << 16);
+            exl3_codebook_lut((Exl3Codebook)cb, lut.data());
+            const_cast<std::vector<uint16_t>&>(luts[cb]) = std::move(lut);
+        }
+        return true;
+    }();
+    (void)filled;
+    return luts[(int)cb].data();
 }
 
 }  // namespace
@@ -195,25 +217,26 @@ void exl3_codebook_lut(Exl3Codebook cb, uint16_t* lut) {
 }
 
 void exl3_decode_tile(const uint16_t* trellis_words, int bits, const uint16_t* lut,
-                      uint16_t* out_row_major) {
+                      uint16_t* out_row_major, int frac) {
     int perm[256];
     build_perm(perm);
     uint16_t tc[256];
+    const int words = 16 * bits + 8 * frac;             // uint16 words per 256-weight tile (16*K)
     for (int t = 0; t < 256; ++t) {
-        tc[t] = lut[window16(trellis_words, 256 * bits / 16, bits, t)];
+        tc[t] = lut[window16(trellis_words, words, bits, frac, t)];
     }
     for (int j = 0; j < 256; ++j) out_row_major[perm[j]] = tc[j];
 }
 
 void exl3_decode_weight_hat(const uint16_t* trellis, int ki, int nj, int bits, Exl3Codebook cb,
-                            uint16_t* out) {
+                            uint16_t* out, int frac) {
     const uint16_t* lut = lut_for(cb);
-    int words = 256 * bits / 16;
+    int words = 16 * bits + 8 * frac;
     int n = nj * 16;
     uint16_t tile[256];
     for (int i = 0; i < ki; ++i)
         for (int j = 0; j < nj; ++j) {
-            exl3_decode_tile(trellis + ((size_t)(i * nj + j)) * words, bits, lut, tile);
+            exl3_decode_tile(trellis + ((size_t)(i * nj + j)) * words, bits, lut, tile, frac);
             for (int r = 0; r < 16; ++r)
                 for (int c = 0; c < 16; ++c)
                     out[(size_t)(i * 16 + r) * n + j * 16 + c] = tile[r * 16 + c];
@@ -221,10 +244,10 @@ void exl3_decode_weight_hat(const uint16_t* trellis, int ki, int nj, int bits, E
 }
 
 void exl3_reconstruct_weight(const uint16_t* trellis, int ki, int nj, int bits, Exl3Codebook cb,
-                             const uint16_t* suh, const uint16_t* svh, uint16_t* out) {
+                             const uint16_t* suh, const uint16_t* svh, uint16_t* out, int frac) {
     int k = ki * 16, n = nj * 16;
     std::vector<uint16_t> what((size_t)k * n);
-    exl3_decode_weight_hat(trellis, ki, nj, bits, cb, what.data());
+    exl3_decode_weight_hat(trellis, ki, nj, bits, cb, what.data(), frac);
     std::vector<float> w((size_t)k * n);
     for (size_t i = 0; i < w.size(); ++i) w[i] = h2f(what[i]);
     had_rows(w, k, n);
@@ -237,10 +260,10 @@ void exl3_reconstruct_weight(const uint16_t* trellis, int ki, int nj, int bits, 
 
 void exl3_folded_gemv(const uint16_t* trellis, int ki, int nj, int bits, Exl3Codebook cb,
                       const uint16_t* suh, const uint16_t* svh, const uint16_t* x, int tokens,
-                      float* y) {
+                      float* y, int frac) {
     int k = ki * 16, n = nj * 16;
     std::vector<uint16_t> what((size_t)k * n);
-    exl3_decode_weight_hat(trellis, ki, nj, bits, cb, what.data());
+    exl3_decode_weight_hat(trellis, ki, nj, bits, cb, what.data(), frac);
     std::vector<float> w((size_t)k * n);
     for (size_t i = 0; i < w.size(); ++i) w[i] = h2f(what[i]);
     std::vector<float> xh((size_t)tokens * k);

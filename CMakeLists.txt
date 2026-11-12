@@ -230,12 +230,46 @@ if(STRATA_WERROR)
 endif()
 
 # ---- strata_artifact -------------------------------------------------------
+option(STRATA_EXPERIMENTAL_BAND8_TEST "Build isolated direct CPU-BAND8 GPU parity prototype" OFF)
+if(STRATA_EXPERIMENTAL_BAND8_TEST AND (STRATA_ENABLE_HIP OR STRATA_ENABLE_CUDA))
+  # Includes exl3.cu in its own diagnostic TU to inspect raw float partials and
+  # compare identical template kernels without linking/rebuilding the engine.
+  add_executable(exl3_band8_gpu_parity EXCLUDE_FROM_ALL
+    src/kernels/exl3_band8_gpu_parity.cu src/kernels/cpu/exl3.cpp)
+  target_include_directories(exl3_band8_gpu_parity PRIVATE include ${_strata_gpu_include_directories})
+  target_link_libraries(exl3_band8_gpu_parity PRIVATE ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+  # Joint CPU+2-GPU offload service-unit bench (same isolated pattern; the checkpoint smoke
+  # lives here before any full-matrix sweep). Links the REAL CPU service TU, compiled fresh
+  # against the current 48-byte Exl3CpuMatrix ABI (engine binaries stay untouched).
+  add_executable(exl3_band8_joint_partition EXCLUDE_FROM_ALL
+    src/kernels/exl3_band8_joint_partition.cu src/kernels/cpu/exl3_moe.cpp)
+  target_include_directories(exl3_band8_joint_partition PRIVATE include src ${_strata_gpu_include_directories})
+  target_link_libraries(exl3_band8_joint_partition PRIVATE ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+  # Focused build mode: no engine/ggml configuration or unrelated targets.
+  return()
+endif()
+
 # Header-only, and that is a deliberate property rather than an unfinished split: the GGUF reader and the
 # scalar dequantizers hold no state worth hiding, and a header-only boundary cannot introduce a
 # duplicate-symbol or missing-declaration bug into code that is already validated against the real artifact.
 add_library(strata_artifact INTERFACE)
 target_include_directories(strata_artifact INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_artifact INTERFACE strata_warnings)
+
+# Persistent shared CPU/GPU band-8 expert cache (notes/EXL3-BAND8-FEASIBILITY-2026-11-06.md).
+# The FIRST compiled artifact target: exl3_model.hpp stays header-only and virtual-only
+# (Exl3ExpertBacking), so native/CPU-only builds keep compiling without this TU. The MiMo
+# library links this once packed-expert integration lands; nothing else needs to. CPU-only,
+# POSIX mmap like safetensors.hpp.
+add_library(strata_exl3_band8_store STATIC src/artifact/exl3_band8_store.cpp src/artifact/exl3_resident.cpp)
+target_include_directories(strata_exl3_band8_store PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_exl3_band8_store PUBLIC strata_warnings)
+# CPU-only cache builder CLI for the SAME generation the engine's STRATA_MIMO_BAND8 path opens
+# (an 80 GiB-class pack job runs beside idle GPUs, holding none of their memory).  Links the
+# store + the CPU-only headers (mimo_geometry/mimo_expert_tensor) ONLY - no GPU context, no
+# engine - and writes nothing unless invoked with an explicit --model/--cache.
+add_executable(exl3_band8_build src/artifact/exl3_band8_build.cpp)
+target_link_libraries(exl3_band8_build PRIVATE strata_exl3_band8_store strata_warnings)
 
 add_executable(strata-gguf src/artifact/gguf_reader.cpp)
 target_link_libraries(strata-gguf PRIVATE strata_artifact)
@@ -305,7 +339,7 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
-                               src/core/layout.cpp src/artifact/exl3_pack.cpp)
+                               src/core/layout.cpp src/artifact/exl3_pack.cpp src/artifact/mimo_pack.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_core PRIVATE strata_kernels_cpu)   # the EXL3 loader dequantizes the indexer via the CPU codec
   if(STRATA_ENABLE_CUDA AND STRATA_EXPERIMENTAL_SM60)
@@ -390,6 +424,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
                           src/kernels/cuda/qsa_prompt_attn.cu
+                          src/kernels/cuda/mimo_attn.cu
+                          src/kernels/cuda/mimo_router.cu
                           src/kernels/cuda/fused_gdn.cu
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
@@ -398,7 +434,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
-  target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact strata_exl3_band8_store)
   target_link_libraries(strata_kernels PRIVATE ${_strata_gpu_blas_target})
   # ngram.cpp decodes EXL3 n-gram rows with the shared CPU codebook/row decoder (strata_kernels_cpu).
   target_link_libraries(strata_kernels PRIVATE strata_kernels_cpu)
@@ -653,6 +689,24 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata PRIVATE strata_qwen35)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_QWEN35=1)
 
+  # MiMo v2 (EXL3, notes/MIMO-V2-PORT.md): the third family's engine path (src/mimo/mimo_engine.cu).  Phase A
+  # is the driver skeleton (argument parsing, config.json geometry via mimo_detect_config, the family switch in
+  # generate.cpp) and the router kernel; the pack load, attention and expert execution are phase B, and the
+  # driver says so cleanly instead of running a wrong model.  Unconditional in the GPU builds: phase A needs no
+  # dependency the tree does not already have (geometry + router are this tree's own).
+  add_library(strata_mimo STATIC src/mimo/mimo_engine.cu src/mimo/mimo_mtp.cu src/mimo/mimo_dflash.cu)
+  target_include_directories(strata_mimo PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
+  # mimo_mtp.cu: the multi-row projections run through prefill::Gemm (cuBLAS / rocBLAS).
+  # strata_exl3_band8_store: the STRATA_MIMO_BAND8 packed-expert backing resolved by
+  # mimo_engine.cu's load_engine - PRIVATE: only this library (and the CLI binaries that link
+  # it) need the concrete store; Native/Qwen models keep no link dependency on it, and the
+  # store's own CPU unit test links it standalone.
+  target_link_libraries(strata_mimo PRIVATE strata_prefill strata_kernels strata_engine strata_warnings strata_exl3_band8_store ${_strata_gpu_runtime_target})
+  add_executable(strata-mimo src/mimo/mimo_main.cpp)
+  target_link_libraries(strata-mimo PRIVATE strata_mimo ${_strata_gpu_runtime_target})
+  target_link_libraries(strata PRIVATE strata_mimo)
+  target_compile_definitions(strata PRIVATE STRATA_HAVE_MIMO=1)
+
   if(STRATA_ENABLE_HIP)
     enable_testing()
     set(_strata_hip_tests)
@@ -812,12 +866,29 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                    "were probed) - the iq_parity fixtures and its test are not registered; the fixtures "
                    "need python3 with numpy and the repository's vendored gguf-py")
   endif()
-  if(STRATA_ENABLE_CUDA)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # native_mmvq's multi_exact contract, bitwise: a T-column call against T single-column calls on the same Q8_1
-    # bytes, with the flag off as the negative control (synthetic, GPU, no model; the control assumes 32-lane warps)
+    # bytes, with the flag off as the negative control (synthetic, GPU, no model; the control assumes 32-lane warps).
+    # HIP too (2026-11-05): the tree's wave32 backend is the same source; the wide/bunch sections cover the MiMo
+    # dense shapes.  (The gfx906 wave64 build keeps its CUDA-layout ctest below; this branch is gfx1100-class.)
     add_executable(mmvq_multi_parity src/kernels/mmvq_multi_parity.cpp)
     target_include_directories(mmvq_multi_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(mmvq_multi_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    # the P1/P2 dense-QKV width choice on the real MiMo shapes (same input bytes, engine loop shapes,
+    # alternating reps; --tsv for the notes table)
+    add_executable(mimo_qkv_bench bench/micro/mimo_qkv_bench.cpp)
+    target_include_directories(mimo_qkv_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(mimo_qkv_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    # R1 prototype's static route-replay microbench (STRATA_EXL3_RESIDENT_DIRECT_DMA): the
+    # staging-transport delta on the REAL model's bytes - one resident backing, two streams
+    # over it (flag unset vs armed), interleaved fixed miss schedules.  Read-only on the
+    # packed cache (reuses the existing generation).  EXCLUDE_FROM_ALL semantics: this
+    # micro bench is not part of any test suite; run it explicitly with a real model.
+    add_executable(exl3_resident_dma_bench EXCLUDE_FROM_ALL bench/micro/exl3_resident_dma_bench.cpp)
+    target_include_directories(exl3_resident_dma_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(exl3_resident_dma_bench PRIVATE strata_kernels strata_engine
+                                                                     strata_exl3_band8_store
+                                                                     ${_strata_gpu_runtime_target})
     add_test(NAME mmvq_multi_parity COMMAND mmvq_multi_parity)
     if(STRATA_HIP_GFX906)   # the CUDA layout, where the negative control has power (the wave64 one is exact at every T)
       add_test(NAME mmvq_multi_parity_cuda_layout COMMAND mmvq_multi_parity)
@@ -1174,6 +1245,13 @@ if(STRATA_BUILD_TESTS)
   add_executable(exl3_flags_test src/core/exl3_flags_test.cpp)
   target_include_directories(exl3_flags_test PRIVATE include)
   add_test(NAME exl3_flags_test COMMAND exl3_flags_test)
+  add_executable(route_digest_test src/core/route_digest_test.cpp)
+  target_include_directories(route_digest_test PRIVATE include)
+  add_test(NAME route_digest_test COMMAND route_digest_test)
+  add_executable(mimo_config_test src/core/mimo_config_test.cpp)
+  target_include_directories(mimo_config_test PRIVATE include)
+  target_compile_definitions(mimo_config_test PRIVATE STRATA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  add_test(NAME mimo_config_test COMMAND mimo_config_test)
   add_executable(suffix_drafter_test src/spec/suffix_drafter_test.cpp)
   target_link_libraries(suffix_drafter_test PRIVATE strata_spec)
   add_test(NAME suffix_drafter_test COMMAND suffix_drafter_test)
@@ -1346,6 +1424,23 @@ if(STRATA_BUILD_TESTS)
   add_executable(peer_adapt_plan_test src/kernels/peer_adapt_plan_test.cpp)
   target_include_directories(peer_adapt_plan_test PRIVATE include)
   add_test(NAME peer_adapt_plan_test COMMAND peer_adapt_plan_test)
+  # Half-integer-K trellis (MiMo v2's 2.26 bpw): the CPU decode against exllamav3's own frac
+  # storage (a golden tile from the real encoder + an in-test reference of the pack/unpack math)
+  # and the loader's relaxed validation.  CPU-only, no model, no python.
+  add_executable(exl3_frac_k_test src/artifact/exl3_frac_k_test.cpp)
+  target_include_directories(exl3_frac_k_test PRIVATE include)
+  target_link_libraries(exl3_frac_k_test PRIVATE strata_kernels_cpu)
+  add_test(NAME exl3_frac_k_test COMMAND exl3_frac_k_test)
+  # Persistent band-8 packed-expert store (notes/EXL3-BAND8-FEASIBILITY-2026-11-06.md): a tiny
+  # synthetic safetensors fixture exercises all four verified rates, the byte-exact permutation
+  # through BOTH linear() pointers and pread(locate()) spans, model integration with a shared
+  # backing (legacy Native unchanged), and every refusal/recovery path (corrupt manifests,
+  # stale fingerprints, locks, interrupted builds, low disk, optional checksums). CPU-only,
+  # writes only under /tmp/opencode, bounded and checked in-test.
+  add_executable(exl3_band8_store_test src/artifact/exl3_band8_store_test.cpp)
+  target_include_directories(exl3_band8_store_test PRIVATE include)
+  target_link_libraries(exl3_band8_store_test PRIVATE strata_exl3_band8_store)
+  add_test(NAME exl3_band8_store_test COMMAND exl3_band8_store_test)
   add_executable(exl3_parity src/kernels/exl3_parity.cpp)
   target_include_directories(exl3_parity PRIVATE include)
   target_link_libraries(exl3_parity PRIVATE strata_kernels_cpu)
@@ -1397,6 +1492,12 @@ endif()
 
 # EXL3 GPU reconstruct against the CPU reference (synthetic, no model).
 if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_HIP OR STRATA_ENABLE_CUDA))
+  # The MiMo v2 pack against a synthetic mini checkpoint the test writes (validate rules, the
+  # o_proj fold, the BF16 embed, the expert-name prefix on a K=2.5 expert layer).
+  add_executable(mimo_pack_test src/artifact/mimo_pack_test.cpp)
+  target_include_directories(mimo_pack_test PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(mimo_pack_test PRIVATE strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  add_test(NAME mimo_pack_test COMMAND mimo_pack_test)
   add_executable(exl3_gpu_parity src/kernels/exl3_gpu_parity.cpp)
   target_include_directories(exl3_gpu_parity PRIVATE ${_strata_gpu_include_directories} include)
   target_link_libraries(exl3_gpu_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
@@ -1415,6 +1516,24 @@ if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_HIP OR STRATA_ENABLE_CUDA))
   target_link_libraries(exl3_moe_multi_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   add_test(NAME exl3_moe_multi_parity COMMAND exl3_moe_multi_parity)
   set_tests_properties(exl3_moe_multi_parity PROPERTIES SKIP_RETURN_CODE 77)
+  # The STRATA_EXL3_WMMA_STG_PAD env=1-at-first-read proof needs a fresh process (the apply-once
+  # flag is spent after the first call), so ctest drives it as a separate invocation with the env
+  # set through cmake -E env - no process spawning inside the test binary (portable).
+  add_test(NAME exl3_moe_multi_parity_stgpad_env
+           COMMAND ${CMAKE_COMMAND} -E env STRATA_EXL3_WMMA_STG_PAD=1 $<TARGET_FILE:exl3_moe_multi_parity> --stg-pad-flag-test)
+  set_tests_properties(exl3_moe_multi_parity_stgpad_env PROPERTIES SKIP_RETURN_CODE 77)
+  # STRATA_EXL3_GEMM_FP16_OUT focused parity (both epilogues of exl3_moe_group_gemm and
+  # exl3_moe_recon_batch vs the double-accum CPU oracle with the engine's F16 boundaries).
+  add_executable(exl3_gemm_fp16_out_parity src/kernels/exl3_gemm_fp16_out_parity.cpp)
+  target_include_directories(exl3_gemm_fp16_out_parity PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(exl3_gemm_fp16_out_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  add_test(NAME exl3_gemm_fp16_out_parity COMMAND exl3_gemm_fp16_out_parity)
+  set_tests_properties(exl3_gemm_fp16_out_parity PROPERTIES SKIP_RETURN_CODE 77)
+  # The STRATA_EXL3_GEMM_FP16_OUT env=1-at-first-read proof needs a fresh process (same rule as
+  # the stg_pad flag above: cmake -E env drives it, no process spawning inside the test binary).
+  add_test(NAME exl3_gemm_fp16_out_parity_env
+           COMMAND ${CMAKE_COMMAND} -E env STRATA_EXL3_GEMM_FP16_OUT=1 $<TARGET_FILE:exl3_gemm_fp16_out_parity> --fp16-out-flag-test)
+  set_tests_properties(exl3_gemm_fp16_out_parity_env PROPERTIES SKIP_RETURN_CODE 77)
   # the async EXL3 peer tier primitive (static subset, PeerExperts shape; tests only at this stage)
   add_executable(exl3_peer_test src/kernels/exl3_peer_test.cpp)
   target_include_directories(exl3_peer_test PRIVATE ${_strata_gpu_include_directories} include)
@@ -1430,6 +1549,86 @@ if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_HIP OR STRATA_ENABLE_CUDA))
   add_executable(exl3_moe_window_bench src/kernels/exl3_moe_window_bench.cpp)
   target_include_directories(exl3_moe_window_bench PRIVATE ${_strata_gpu_include_directories} include)
   target_link_libraries(exl3_moe_window_bench PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  # Bounded rocBLAS GEMM output-dtype probe (candidate #3 of the 2026-11-03 exllamav3-amd survey):
+  # f16-in/f32-out vs f16-out at the engine's real shapes; no engine path changes.
+  add_executable(gemm_outdtype_probe src/kernels/gemm_outdtype_probe.cu)
+  target_include_directories(gemm_outdtype_probe PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(gemm_outdtype_probe PRIVATE ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+  # MiMo v2 attention (notes/MIMO-V2-PORT.md): partial rope + GQA/window/sink attention (K192/V128)
+  # vs the fp64 CPU reference in the test file; positions > 1e6, NaN past seq_len, prefill window edge.
+  add_executable(mimo_attn_parity src/kernels/mimo_attn_parity.cpp)
+  target_include_directories(mimo_attn_parity PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(mimo_attn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME mimo_attn_parity COMMAND mimo_attn_parity)
+  set_tests_properties(mimo_attn_parity PROPERTIES SKIP_RETURN_CODE 77)
+  # MiMo v2 MTP drafter (notes/MIMO-V2-PORT.md §2 "MTP drafter"): the 3-head chain (eh_proj with the
+  # embedding first, pre-norm SWA attention over the head's own flat KV, dense SwiGLU, final norm,
+  # shared lm_head argmax; catch_up / rewind) vs the fp64 CPU reference in the test file; a 6-round
+  # chain, two full rejections, positions > 1500, heads with and without sinks, the K/V-only
+  # committed path vs full forwards.
+  add_executable(mimo_mtp_parity src/mimo/mimo_mtp_parity.cpp)
+  target_include_directories(mimo_mtp_parity PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(mimo_mtp_parity PRIVATE strata_mimo ${_strata_gpu_runtime_target})
+  add_test(NAME mimo_mtp_parity COMMAND mimo_mtp_parity)
+  set_tests_properties(mimo_mtp_parity PROPERTIES SKIP_RETURN_CODE 77)
+  # MiMo v2 ENGINE end-to-end (the pre-weights gate): the full greedy forward on the synthetic mini-MiMo
+  # (dense-full layer 0 + MoE-SWA layer 1 with sinks and K=2.5 experts through the real expert stream, a
+  # ragged prefill chunk, decode past the window edge) driven through strata::mimo::run_greedy - the same
+  # core the CLI uses - against the fp64 CPU reference in the test file; the argmax sequence must match.
+  add_executable(mimo_engine_parity src/mimo/mimo_engine_parity.cpp)
+  add_executable(mimo_window_cpu_plan_test src/mimo/window_cpu_plan_test.cpp)
+  target_include_directories(mimo_window_cpu_plan_test PRIVATE include)
+  add_test(NAME mimo_window_cpu_plan_test COMMAND mimo_window_cpu_plan_test)
+  target_include_directories(mimo_engine_parity PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(mimo_engine_parity PRIVATE strata_mimo strata_kernels_cpu ${_strata_gpu_runtime_target})
+  add_test(NAME mimo_engine_parity COMMAND mimo_engine_parity)
+  set_tests_properties(mimo_engine_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # STRATA_MIMO_BAND8 integration seam (tiny fixture only): teacher-forced logits native vs
+  # band-8 backed bitwise, the opt-in's fast failures, the backing's model intercepts, the
+  # stream's RAM-cache refusal and the peer's refill/open format guards. The packed payload is
+  # fixture-sized (< 1 MiB) under STRATA_BAND8_PARITY_TMP (default: temporary directory) - NO
+  # full-model cache is built or implied by this test. EXCLUDE_FROM_ALL: run explicitly.
+  add_executable(mimo_window_quality EXCLUDE_FROM_ALL src/mimo/mimo_window_quality.cpp)
+  target_include_directories(mimo_window_quality PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(mimo_window_quality PRIVATE strata_mimo strata_exl3_band8_store strata_kernels_cpu ${_strata_gpu_runtime_target})
+  add_executable(mimo_band8_parity EXCLUDE_FROM_ALL src/mimo/mimo_band8_parity.cpp)
+  # The refusal checks invoke the standalone CLI next to this test binary.
+  add_dependencies(mimo_band8_parity strata-mimo)
+  target_include_directories(mimo_band8_parity PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(mimo_band8_parity PRIVATE strata_mimo strata_exl3_band8_store strata_kernels_cpu ${_strata_gpu_runtime_target})
+  # The STRATA_QWEN_BAND8 opt-in's integration battery at the REAL Qwen 4 bpw geometry
+  # (H=2560 FF=640, all projections K4, nj 40/160 - both non-identity band-8 permutations):
+  # store round-trip on the engine's exact request list, CPU-tier parity through the model+
+  # store registration (layout tag included), the RESIDENT=all packed composition, main-stream
+  # run()/run_multi() byte-parity vs the native twin, the peer tier + landing refill at
+  # REQUESTED widths 0/2/4, and the stream's RAM-cache refusal. Fixture-sized payloads
+  # (< 40 MiB) under STRATA_QWEN_BAND8_TEST_TMP (default: temporary directory) - NO full-model cache.
+  # EXCLUDE_FROM_ALL: run explicitly (needs a GPU).
+  add_executable(exl3_qwen_band8_test EXCLUDE_FROM_ALL src/kernels/exl3_qwen_band8_test.cpp)
+  target_include_directories(exl3_qwen_band8_test PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(exl3_qwen_band8_test PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  # MiMo v2 DFlash drafter (notes/MIMO-V2-PORT.md §1): synthetic dirs written as real safetensors
+  # and loaded through from_dir + dflash_load - the plain bf16 shape AND the EXL3-quantized shape
+  # (random K=4 mul1 trellises reconstructed by the loader, raw BF16/F16 tensors in-file, which
+  # also pins the variant-specific o_proj fold: the bf16 dir folds x0.612 at load, the trellis is
+  # pre-folded) - both against the fp64 CPU reference in the test file; mimo_attn_block parity
+  # (GQA 1/8, sinks dominating the max, bidirectionality, right extent, left clamp), one full
+  # commit/draft/commit/draft round trip with a ring shift and P > ring, speculative-row erasure,
+  # q/k_norm-before-rope order, the mask_embedding overwrite; a smoke pass over the REAL dflash/
+  # + dflash-bf16/ pair when STRATA_DFLASH_REAL_DIR (or the default path) has them.
+  add_executable(mimo_dflash_parity src/mimo/mimo_dflash_parity.cpp)
+  target_include_directories(mimo_dflash_parity PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(mimo_dflash_parity PRIVATE strata_mimo strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME mimo_dflash_parity COMMAND mimo_dflash_parity)
+  set_tests_properties(mimo_dflash_parity PROPERTIES SKIP_RETURN_CODE 77)
+  # MiMo v2 router (notes/MIMO-V2-PORT.md §1): the F16 gemv + sigmoid + noaux_tc biased top-8 + unbiased
+  # renormalised combine vs the fp64 CPU reference in the test file; exact-tie ranks, a bias flipping the
+  # top-8 against the raw sigmoid order, a NaN router row, a saturated row, batch rows, two hidden widths.
+  add_executable(mimo_router_parity src/kernels/mimo_router_parity.cpp)
+  target_include_directories(mimo_router_parity PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(mimo_router_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME mimo_router_parity COMMAND mimo_router_parity)
+  set_tests_properties(mimo_router_parity PROPERTIES SKIP_RETURN_CODE 77)
   # PleTable::open_exl3 (the EXL3 n-gram table) against the numpy codec.
   add_executable(ple_exl3_parity src/kernels/ple_exl3_parity.cpp)
   target_include_directories(ple_exl3_parity PRIVATE ${_strata_gpu_include_directories} include)

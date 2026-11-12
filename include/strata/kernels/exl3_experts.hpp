@@ -6,10 +6,15 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "strata/kernels/exl3.hpp"
+
+namespace strata {
+class Exl3ExpertBacking;   // artifact/exl3_expert_backing.hpp - optional packed-expert source
+}
 
 namespace strata::kernels {
 
@@ -17,8 +22,11 @@ class Exl3ExpertStore {
 public:
     // Uploads `n_experts` experts of `layer` from the EXL3 model at `model_dir` to the GPU.  `stream` may
     // be null (default stream).  `layer` is the transformer layer index; expert keys are
-    // `model.language_model.layers.<layer>.mlp.experts.<e>.{gate,up,down}_proj`.
-    Exl3ExpertStore(const std::string& model_dir, int layer, int n_experts, void* stream);
+    // `<layer_prefix><layer>.mlp.experts.<e>.{gate,up,down}_proj` - the default is the Qwen family's
+    // `model.language_model.layers.` layout, a MiMo v2 dir passes `model.layers.` (what
+    // strata::mimo_expert_tensor names, see strata/artifact/mimo_pack.hpp).
+    Exl3ExpertStore(const std::string& model_dir, int layer, int n_experts, void* stream,
+                    const std::string& layer_prefix = "model.language_model.layers.");
     ~Exl3ExpertStore();
     Exl3ExpertStore(const Exl3ExpertStore&) = delete;
     Exl3ExpertStore& operator=(const Exl3ExpertStore&) = delete;
@@ -53,9 +61,21 @@ public:
     /// host cache sits outside whatever reclaim policy evicts those pages and is the design the GGUF path
     /// already uses (`--resident-cpu-experts`): a miss is read into RAM, and every later miss of the same
     /// expert is a memcpy at RAM speed (0.2 ms per 1.86 MB against 3.7 ms from the disk).
+    ///
+    /// `expert_backing` (opt-in, default none): a shared packed-expert source (an Exl3Band8Store through
+    /// the abstract Exl3ExpertBacking).  linear()/locate() then serve the packed planes for covered
+    /// experts and the raw source for the rest; every uploaded descriptor carries the linear's own
+    /// `.layout` tag and this stream's workspaces are switched to the backing's layout exactly once,
+    /// drained, at construction.  The ONE canonical format rule: all experts this stream loads must
+    /// share the model's expert_layout() - a mixed (Native + packed) record throws instead of computing
+    /// on wrong bytes.  A nonzero `ram_cache_bytes` is REFUSED with a backing (a second, managed copy
+    /// of the packed planes would break the one-backing memory goal) - pass 0.  Every pre-existing
+    /// call site (no backing) is unchanged.
     Exl3ExpertStream(const std::string& model_dir, int n_embd, int n_layers, int slots_per_layer, void* stream,
                      size_t ram_cache_bytes = 0, size_t reserve_device_bytes = (size_t) 512 << 20,
-                     int layer_lo = 0, int layer_hi = -1, int prefill_tokens = 0);
+                     int layer_lo = 0, int layer_hi = -1, int prefill_tokens = 0,
+                     const std::string& layer_prefix = "model.language_model.layers.",
+                     std::shared_ptr<const Exl3ExpertBacking> expert_backing = {});
     ~Exl3ExpertStream();
     Exl3ExpertStream(const Exl3ExpertStream&) = delete;
     Exl3ExpertStream& operator=(const Exl3ExpertStream&) = delete;
@@ -69,7 +89,51 @@ public:
     // callers overlap their CPU work with the GPU call, leaves the row untouched).  Null keeps
     // today's evict-and-admit-always behavior.
     bool run(int layer, const float* x_f32, const int* ids, int k, float* out, void* stream,
-             uint8_t* cpu_rows = nullptr);
+              uint8_t* cpu_rows = nullptr);
+    // Single-token DEVICE input/output with HOST ids, distinct experts only. Keeps the run()
+    // cache/admission and hit/miss overlap, but uses pinned indexed plans and enqueues results
+    // without an activation/output host round trip. Caller MUST synchronize this compute stream
+    // (or observe a downstream publication proving its completion) before the next
+    // service/residency mutation (including run_multi/run_device), and before
+    // reading output. Requires PRIMARY_PACK_PLAN (default on); no CPU refusal tier.
+    bool run_decode_device(int layer, const float* x_device, const int* ids, int k,
+                            float* out_device, void* stream, uint8_t* cpu_rows = nullptr);
+    // One decode layer in flight. Setup/refresh only on a drained stream. Publish launches
+    // resident rows before waiting for the mapped routing record (not FFN completion).
+    // Returned payload lives until the next publish; end_host releases admission pins.
+    // max_tokens defaults to 1; opt-in multirow capacity is <=8 and max_tokens*k<=64.
+    // Multirow publications publish empty GPU hits unless set_window_graph_hits(true)
+    // armed the opt-in and the current refresh declared the window's tables valid; they
+    // publish F32 x[T,n] + ids/weights[T,k] either way, and the ordinary host planner's
+    // admission/observation semantics are retained on the miss-only complement.
+    void enable_decode_handoff(int k, int max_tokens = 1);
+    // First actual T1 use of a pre-enabled window frame: caller must drain producer and
+    // host service first. Matches enable_decode_handoff(k)'s permanent indexed-planner gate.
+    void prepare_decode_handoff_t1();
+    void decode_handoff(int layer, const float* x, const int32_t* ids, int k,
+                        float* out, void* stream, const int32_t*& host_ids,
+                        const float*& host_x, const uint8_t*& hits);
+    // Split producer/service protocol: enqueue publish + resident FFNs + completion wait.
+    // A separate host worker collects and serves on a separate preallocated stream.
+    // Complete publishes in service-stream order; the next routing publication proves
+    // previous service scratch/plans are reusable. One nonzero ring per forward.
+    void enqueue_decode_handoff(int layer, const float* x, const int32_t* ids, int k,
+                                float* out, uint32_t ring, void* stream,
+                                int tokens = 1, const float* weights = nullptr);
+    // Poll only a service-owned stream: querying a producer whose host is in a
+    // pageable readback can deadlock on that stream's HIP driver lock.
+    void collect_decode_handoff(int layer, uint32_t ring, void* poll_stream,
+                                const int32_t*& ids, const float*& x, const uint8_t*& hits,
+                                int* tokens = nullptr, const float** weights = nullptr);
+    void complete_decode_handoff(int layer, uint32_t ring, void* service_stream = nullptr);
+    void abort_decode_handoff();
+    // Abort-path recovery for the HOST bookkeeping only. abort_decode_handoff publishes
+    // the failfast flag and never touches host state (the service owner owns it). A frame
+    // that aborted between begin and complete leaves the bracket open; call this from the
+    // SERVICE owner after the unwind, or on a joined/drained frame (the next
+    // refresh_verify_graph also closes it), so no later host-IO call can drop groups
+    // against a stale record. No device effect, no lock.
+    void recover_host_service();
     // HOST x_f32[tokens, n_embd], ids[tokens, k], out[tokens*k, n_embd]. Groups routes by
     // expert, stages each distinct expert once per window, and restores token-major output order.
     // Scratch is bounded by the input and a 4096-route tile, not tokens*k*n_embd device output.
@@ -95,18 +159,73 @@ public:
     // so the caller combines them through the identity slot map with a sentinel for the rest.
     bool run_device(int layer, const float* x_f32, const int32_t* ids, int tokens, int k,
                      float* out, void* stream, const uint8_t* skip = nullptr);
+    // STRATA_MIMO_WINDOW_DEVICE_MISSES (default off): the verify-window service's
+    // device-input/device-output twin of run_multi_complement - it serves BOTH the
+    // complement (peer rows / a live CPU overlay in the same window) and the PLAIN
+    // window the host arm ran through run_multi (there the peer-owned / cpu_skip /
+    // graph-hit drops are provably no-ops: a plain window holds no peer-owned or CPU
+    // row by definition, and armed graph hits drop exactly the rows run_multi's host
+    // bracket dropped, so the plan and its arithmetic are identical). x_f32 and out are
+    // DEVICE (the producer's activation image and route-row slab, both live while the
+    // verifier waits); ids is HOST; cpu_skip is the same whole-group mask. Semantics
+    // are exactly run_multi_complement's - peer-owned groups dropped (skip_owned),
+    // cpu_skip groups dropped, published graph-hit groups dropped against the live
+    // host bracket, misses admitted/staged identically, pending-incoming experts on
+    // GPU scratch - and the FFN arithmetic is the host arm's (the same indexed /
+    // small-M grouped entry points, the host arm's whole-window tile boundaries; the
+    // prefill group arm never runs here).
+    // The differences are transport only: the activation is read in place (no F32 H2D),
+    // plans upload through the same PINNED/PACKED slabs the T1 device arm requires, and
+    // rows scatter straight into `out` on the caller's stream (no result D2H, host memcpy
+    // or re-upload). Requires the packed pinned-plan machinery; check
+    // window_complement_device_ready() once instead of probing per call.
+    bool run_multi_complement_device(int layer, const float* x_device, const int32_t* ids,
+                                     int tokens, int k, float* out_device, void* stream,
+                                     const uint8_t* cpu_skip = nullptr);
+    /// Whether run_multi_complement_device can serve a tokens x k window on this stream:
+    /// the packed pinned-plan slabs exist and cover the window's route count. Pure query,
+    /// no device work; false means the caller keeps the host-IO complement.
+    bool window_complement_device_ready(int tokens, int k) const;
 
     // Opt-in verifier integration. Enable once before capture; one window/group in flight.
     // refresh runs before launch; publish snapshots/pins the routes before hits and host
     // miss service overlap. copy_misses follows its wait; begin/end bracket host service.
     void enable_verify_graph(int max_tokens, int k);
-    void refresh_verify_graph(void* stream = nullptr);
+    // `window_tokens` > 1 additionally arms THIS refresh's tables for multirow handoff
+    // windows: set_window_graph_hits(true) must have armed the mode, and the tables are
+    // published for windows of <= window_tokens rows only while the ACTIVE cache holds
+    // window_tokens*k slots (a whole window's distinct experts fit beside its hits, so
+    // miss admission can always find an unpinned victim). When either condition fails the
+    // tables stay empty and windows publish the NULL table - every route a host-served
+    // miss, byte-identical to the default. The default 0 keeps the T1-only contract:
+    // tables for the single-token handoff, windows keep empty hits. window_tokens is
+    // validated first: it must be 0..max_tokens (negative or oversized values throw, so
+    // the tokens*k gate can never overflow). Called only on a drained frame; that drained
+    // seam is also the recovery point after an abort: a stale host-service bracket is
+    // closed and the sticky abort flag cleared, so the protocol may resume on a fresh
+    // ring (the engine's own worker error stays sticky and never comes through here).
+    void refresh_verify_graph(void* stream = nullptr, int window_tokens = 0);
+    // Opt-in (default off, common API): MULTIROW handoff windows (T=2..8) may publish
+    // RESIDENT-descriptor GPU hits. The producer's stream then computes hit rows inline
+    // (exl3_moe_rows_masked over the same cache slots, both trellis physical formats via
+    // the descriptors) while the service side resolves ONLY miss/peer/CPU routes: collect
+    // runs the begin_host contract for windows with hits (frequency observation and LRU
+    // ticks exactly once, hit slots pinned through miss admission, host_active drops the
+    // hit groups from run_multi/run_multi_complement). Windows without hits keep the
+    // original all-miss statistics and host planner untouched. Requires
+    // enable_decode_handoff(k, max_tokens >= 2) first; false restores the default
+    // (windows publish no hits) for every later refresh.
+    void set_window_graph_hits(bool enabled);
     void verify_graph_hits(int layer, const float* x, const int32_t* ids, int tokens, int k,
                            float* out, uint32_t ring, void* stream);
     const uint32_t* verify_graph_skip() const;
     void verify_graph_publish(int layer, const float* x, const int32_t* ids, int tokens, int k,
-                              float* mapped_x, int32_t* mapped_ids, uint32_t* seq, uint32_t ring, void* stream);
+                              float* mapped_x, int32_t* mapped_ids, uint32_t* seq, uint32_t ring, void* stream,
+                              const float* weights = nullptr);
     void verify_graph_copy_misses(const float* mapped, float* out, int routes, void* stream);
+    /// what the LAST refresh_verify_graph declared for multirow windows: the largest T
+    /// whose tables are valid (0 = windows publish no hits). Read-only diagnostic.
+    int window_hit_tokens() const;
     bool verify_graph_begin_host(int layer);
     void verify_graph_end_host(int layer);
     bool verify_graph_host_active() const;
@@ -129,6 +248,16 @@ public:
     void set_route_observer(RouteObserver observer, void* user);
     /// whether (layer, expert) is currently RESIDENT in this stream's cache (introspection)
     bool holds(int64_t layer, int32_t expert) const;
+    /// whether (layer, expert) is excluded from this stream's ADMISSION by ANY ownership
+    /// table: the STATIC peer-owned table OR the PENDING-incoming reservation an in-flight
+    /// refill holds (Impl::admission_excluded - the same union the admission loop uses).
+    /// Deliberately the union, not owned_elsewhere(): run_multi_complement drops only the
+    /// STATIC table, so a pending-incoming group still computes on this GPU's scratch - a
+    /// caller partitioning work against the peer side (the verify-window CPU planner) must
+    /// treat BOTH states as "not mine", or it would take a group the GPU still computes.
+    /// Read-only host introspection: no GPU query, no sync, no lock beyond holds()'s (none);
+    /// out-of-range layer/expert reports false (nothing excluded).  Policy lives in the caller.
+    bool excluded_elsewhere(int64_t layer, int32_t expert) const;
     /// routes/admissions refused by the ownership exclusion since the last clear (test evidence)
     int64_t owned_exclusions() const;
 
@@ -153,6 +282,9 @@ public:
     void classify(int layer, const int32_t* ids, int tokens, int k, uint8_t* flags) const;
 
     size_t bytes() const;
+    struct CacheStats { uint64_t staged_experts = 0, staged_bytes = 0; double stage_host_ms = 0; };
+    CacheStats cache_stats() const; // diagnostic counters, enabled by STRATA_EXL3_CACHE_STATS=1
+    std::vector<int32_t> cache_lru_order(int layer) const; // diagnostic: oldest first, drained stream
     int slots_per_layer() const;
     /// the host cache's slots per layer and its bytes (0 when it is off)
     int ram_slots_per_layer() const;
@@ -237,12 +369,21 @@ public:
     /// opt-in really dispatched and that no window GREW the workspace after warmup (the
     /// pre-reserve-under-queued-work contract).  Null pointers are skipped.  Call between runs.
     void small_m_debug(long long* calls, long long* routes, long long* stays,
-                       size_t* workspace_bytes) const;
+                       size_t* workspace_bytes, bool* enabled = nullptr) const;
+    /// validation seam for STRATA_EXL3_RESIDENT_DIRECT_DMA (test evidence, not a control):
+    /// lifetime counts of experts uploaded as ONE direct DMA out of the backing's
+    /// GPU-registered arena, the gather-memcpy bytes avoided, and the packed-form experts
+    /// that kept the gather path while the flag was armed (non-contiguous or unproven
+    /// source).  `enabled` reports the flag itself.  Null pointers are skipped.
+    void resident_direct_dma_debug(long long* jobs, long long* bytes, long long* fallbacks,
+                                   bool* enabled = nullptr) const;
 
 private:
+    bool run_single_impl(int layer, const float* x_f32, const int* ids, int k,
+                         float* out, void* stream, uint8_t* cpu_rows, bool device_io);
     bool run_multi_impl(int layer, const float* x_f32, const int32_t* ids, int tokens, int k,
                          float* out, void* stream, bool device_io, uint8_t* cpu_rows,
-                         bool skip_owned = false, const uint8_t* cpu_skip = nullptr);
+                         bool skip_owned, const uint8_t* cpu_skip, bool window_device);
     struct Impl;
     Impl* impl_ = nullptr;
 };

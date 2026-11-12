@@ -2,6 +2,7 @@
 #include "strata/kernels/exl3_experts.hpp"
 #include "strata/artifact/exl3_model.hpp"
 #include "strata/core/exl3_flags.hpp"
+#include "strata/core/expert_frequency.hpp"
 #include "strata/kernels/exl3_route_plan.hpp"
 #include "strata/kernels/exl3_arena_layout.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -66,19 +67,22 @@ Exl3Mat upload(const Exl3Linear& L, std::vector<void*>& allocs, cudaStream_t st,
         bytes += n;
         return p;
     };
-    int words = 256 * L.bits / 16;
+    int words = L.words();
     size_t tr_bytes = (size_t) L.ki * L.nj * words * 2;
     Exl3Mat M;
     M.trellis = (const uint16_t*) alloc(tr_bytes, L.trellis);
     M.suh = (const uint16_t*) alloc((size_t) L.in() * 2, L.suh);
     M.svh = (const uint16_t*) alloc((size_t) L.out() * 2, L.svh);
-    M.ki = L.ki; M.nj = L.nj; M.bits = L.bits; M.cb = L.cb;
+    M.ki = L.ki; M.nj = L.nj; M.bits = L.bits; M.frac = L.frac; M.cb = L.cb;
+    M.layout = L.layout;   // the store's own model has no backing (always Native today), but the
+                           // descriptor's tag must always describe the bytes it points at
     return M;
 }
 
 }  // namespace
 
-Exl3ExpertStore::Exl3ExpertStore(const std::string& model_dir, int layer, int n_experts, void* stream) {
+Exl3ExpertStore::Exl3ExpertStore(const std::string& model_dir, int layer, int n_experts, void* stream,
+                                 const std::string& layer_prefix) {
     if (layer < 0 || layer >= 48 || n_experts <= 0 || n_experts > 512)
         throw std::invalid_argument("exl3: invalid expert store geometry");
     auto pending = std::make_unique<Impl>();
@@ -86,7 +90,7 @@ Exl3ExpertStore::Exl3ExpertStore(const std::string& model_dir, int layer, int n_
     n_experts_ = n_experts;
     cudaStream_t st = (cudaStream_t) stream;
     Exl3Model m(model_dir);
-    const std::string prefix = "model.language_model.layers." + std::to_string(layer) + ".mlp.experts.";
+    const std::string prefix = layer_prefix + std::to_string(layer) + ".mlp.experts.";
     for (int e = 0; e < n_experts; ++e) {
         const std::string b = prefix + std::to_string(e);
         state->gate.push_back(upload(m.linear(b + ".gate_proj"), state->allocs, st, bytes_));
@@ -181,6 +185,15 @@ struct VerifyRecord {
 };
 
 struct VerifyGraphBuffers {
+    MappedBuffer<float> decode_x;
+    MappedBuffer<float> decode_weights; // multirow only, [token*k + route]
+    MappedBuffer<int32_t> decode_ids;
+    MappedBuffer<uint32_t> decode_seq;
+    MappedBuffer<uint32_t> decode_done, decode_abort;
+    cudaEvent_t decode_ready = nullptr;
+    uint32_t decode_ring = 0;
+    std::vector<int> native_rates;
+    std::vector<int> layer_ff;
     int max_tokens = 0, k = 0, max_ff = 0;
     bool host_active = false;
     MappedBuffer<Exl3Mat> table; // [layer, projection, expert], published only between readers
@@ -191,6 +204,13 @@ struct VerifyGraphBuffers {
     float* graph_out = nullptr;
     MappedBuffer<float> reference, actual;
     long long checked_rows = 0;
+    // The multirow window-hit opt-in (set_window_graph_hits): `window_hits` is the armed
+    // mode; `window_hit_tokens` is what the LAST refresh declared valid (0 = windows
+    // publish the null table and stay on the all-miss handoff).
+    bool window_hits = false;
+    int window_hit_tokens = 0;
+    long long window_hit_routes = 0, window_miss_routes = 0, window_layers = 0,
+              window_all_hit_layers = 0;
     StreamBuffer<Exl3Mat> gate, up, down;
     StreamBuffer<int> input_rows;
     StreamBuffer<uint32_t> skip;
@@ -198,24 +218,48 @@ struct VerifyGraphBuffers {
     Exl3MoeWorkspace workspace; // never shared with callback/prefill workspaces
     long long hit_routes = 0, miss_routes = 0, all_hit_layers = 0, layers = 0;
     ~VerifyGraphBuffers() {
-        std::fprintf(stderr, "strata EXL3 verify graph: %lld hit routes stayed on GPU, %lld host routes, "
-                     "%lld/%lld all-hit layers bypassed the GPU host wait\n",
-                     hit_routes, miss_routes, all_hit_layers, layers);
+        if (decode_ready) (void) cudaEventDestroy(decode_ready);
+        std::fprintf(stderr, "strata EXL3 %s: %lld hit routes stayed on GPU, %lld host routes, "
+                      "%lld/%lld all-hit layers bypassed the GPU host wait\n",
+                      decode_ready ? "decode handoff" : "verify graph", hit_routes, miss_routes, all_hit_layers, layers);
         if (check) std::fprintf(stderr, "strata EXL3 verify graph: %lld hit rows checked byte-exact against host FFN\n", checked_rows);
+        if (window_layers)
+            std::fprintf(stderr, "strata EXL3 window hits: %lld multirow-window layers, %lld hit / "
+                                 "%lld miss routes, %lld all-hit windows bypassed host service\n",
+                         window_layers, window_hit_routes, window_miss_routes, window_all_hit_layers);
     }
 };
+
+__global__ void decode_wait_kernel(const volatile uint32_t* done,
+                                   const volatile uint32_t* abort, const uint32_t* skip, uint32_t ring) {
+    if (*skip == ring) return; // all resident: GPU progress does not depend on host bookkeeping
+    while (*done != ring && !*abort) {
+#if defined(__HIP_PLATFORM_AMD__)
+        __builtin_amdgcn_s_sleep(1);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        __nanosleep(64);
+#endif
+    }
+    __threadfence_system();
+}
+
+__global__ void decode_complete_kernel(uint32_t* done, uint32_t ring) {
+    __threadfence_system();
+    *(volatile uint32_t*) done = ring;
+}
 
 __global__ void verify_gather_kernel(const Exl3Mat* table, const int32_t* ids, int routes, int k,
                                       Exl3Mat* gate, Exl3Mat* up, Exl3Mat* down, int* input_rows,
                                       VerifyRecord* record, uint32_t* skip, uint32_t ring,
                                       const float* x, int elements, float* mapped_x,
-                                      int32_t* mapped_ids, uint32_t* seq) {
+                                      int32_t* mapped_ids, uint32_t* seq,
+                                      const float* weights, float* mapped_weights) {
     __shared__ int misses;
     if (threadIdx.x == 0) misses = 0;
     __syncthreads();
     for (int r = threadIdx.x; r < routes; r += blockDim.x) {
         const int e = ids[r];
-        const bool valid = e >= 0 && e < 512;
+        const bool valid = table && e >= 0 && e < 512;
         gate[r] = valid ? table[e] : Exl3Mat{};
         up[r] = valid ? table[512 + e] : Exl3Mat{};
         down[r] = valid ? table[1024 + e] : Exl3Mat{};
@@ -233,6 +277,8 @@ __global__ void verify_gather_kernel(const Exl3Mat* table, const int32_t* ids, i
     if (misses) {
         for (int i = threadIdx.x; i < elements; i += blockDim.x) mapped_x[i] = x[i];
         for (int i = threadIdx.x; i < routes; i += blockDim.x) mapped_ids[i] = ids[i];
+        if (weights && mapped_weights)
+            for (int i = threadIdx.x; i < routes; i += blockDim.x) mapped_weights[i] = weights[i];
     }
     // Every lane's mapped stores precede the sequence. Hits run behind this kernel while
     // the callback protects their slots and stages only the missing experts elsewhere.
@@ -276,6 +322,18 @@ __global__ void scatter_route_output(const float* in, const int* destinations, f
 struct Exl3ExpertStream::Impl {
     std::string dir;
     std::unique_ptr<Exl3Model> model;
+    // Opt-in for checkpoints with mixed bitrates WITHIN a layer. Capacity views
+    // select the largest physical plane, never the weights used for execution.
+    std::unordered_map<std::string, Exl3Linear> slot_caps;
+    Exl3Linear capacity(const std::string& base) {
+        const auto it = slot_caps.find(base);
+        return it == slot_caps.end() ? model->linear(base) : it->second;
+    }
+    // The stream's ONE canonical expert format (the model's expert_layout(), probed at
+    // construction).  Every Exl3Linear loaded later must carry exactly this layout - a mixed
+    // record (backing covers only part of the stream's experts) throws instead of letting
+    // packed bytes reach a native reader or vice versa.
+    Exl3TrellisLayout layout = Exl3TrellisLayout::Native;
     int device = -1;
     cudaStream_t compute_stream = nullptr;
     std::unique_ptr<Exl3MoeWorkspace> workspace;
@@ -286,6 +344,14 @@ struct Exl3ExpertStream::Impl {
     int n_embd = 2560;
     int n_layers = 48;
     int layer_lo = 0, layer_hi = 48;
+    // Every expert tensor name is `<expert_prefix><layer>.mlp.experts.<e>.<proj>_proj`.  The default
+    // is the Qwen family's `model.language_model.layers.`; a MiMo v2 dir is opened with
+    // `model.layers.` (the names strata::mimo_expert_tensor builds).  One field, so the cache, the
+    // staging, the arena and the verify graph cannot drift apart.
+    std::string expert_prefix = "model.language_model.layers.";
+    std::string expert_base(int layer, int expert) const {
+        return expert_prefix + std::to_string(layer) + ".mlp.experts." + std::to_string(expert) + ".";
+    }
     int max_k = 64;
     int cache = 0;                     // slots per layer; 0 = the per-token scratch
     uint16_t* d_x = nullptr;
@@ -306,6 +372,7 @@ struct Exl3ExpertStream::Impl {
 
     Blocks scratch;                    // cache == 0: `max_k` slots, every use overwrites them
     struct Layer : Blocks {
+        strata::core::ExpertFrequency frequency;
         std::vector<void*> allocs;         // one block per (projection, plane), `cache` slots in it
         std::unordered_map<int, int> at;   // expert -> slot
         std::vector<uint32_t> tick;        // per slot: the last use, for the LRU
@@ -315,6 +382,27 @@ struct Exl3ExpertStream::Impl {
         size_t evicted_at = 0;
     };
     std::vector<Layer> layers;         // cache > 0: `cache` slots per layer, resident across tokens
+    bool frequency_policy = false;
+    bool frequency_prefill = false;
+    bool cache_statistics = false;
+    Exl3ExpertStream::CacheStats cache_statistics_value;
+    uint32_t frequency_every = 32;
+    float frequency_decay = .5f;
+    void observe_frequency(int layer, const int32_t* ids, int count, int tokens = 1) {
+        if (frequency_policy && layer >= 0 && layer < (int) layers.size())
+            layers[layer].frequency.observe(ids, count, frequency_every, frequency_decay, 1.f / tokens);
+    }
+    std::array<float, 512> slot_scores(const Layer& layer) const {
+        std::array<float, 512> score{};
+        if (frequency_policy)
+            for (const auto& entry : layer.at) score[entry.second] = layer.frequency.count[entry.first];
+        return score;
+    }
+    bool prefer_victim(const Layer& layer, const std::array<float, 512>& score, int a, int b) const {
+        if (b < 0) return true;
+        if (frequency_policy && score[a] != score[b]) return score[a] < score[b];
+        return layer.tick[a] < layer.tick[b];
+    }
     bool arena_requested = false;      // PREFILL_BORROW currently selects backing only, no loan
     uint8_t* arena = nullptr;          // single owner; Layer::allocs stays empty in this arm
     size_t arena_bytes = 0, arena_rank_bytes = 0;
@@ -364,14 +452,14 @@ struct Exl3ExpertStream::Impl {
             if (!complete && err) *err = "exl3: scratch growth incomplete (destroy the stream)";
             return complete;
         }
-        const std::string b0 = "model.language_model.layers." + std::to_string(layer_lo) + ".mlp.experts.0.";
+        const std::string b0 = expert_prefix + std::to_string(layer_lo) + ".mlp.experts.0.";
         auto grow = [&](std::vector<Slot>& slots, std::vector<Exl3Mat>& mats, const char* proj) -> bool {
-            Exl3Linear L = model->linear(b0 + proj);
+            Exl3Linear L = capacity(b0 + proj);
             size_t trb = 0, suhb = 0, svhb = 0;
             for (int l = layer_lo; l < layer_hi; ++l) {
-                const auto Sz = model->linear("model.language_model.layers." + std::to_string(l) +
+                const auto Sz = capacity(expert_prefix + std::to_string(l) +
                                               ".mlp.experts.0." + proj);
-                trb = std::max(trb, (size_t) Sz.ki * Sz.nj * 32 * Sz.bits);
+                trb = std::max(trb, (size_t) Sz.ki * Sz.nj * (2 * Sz.words()));
                 suhb = std::max(suhb, (size_t) Sz.in() * 2);
                 svhb = std::max(svhb, (size_t) Sz.out() * 2);
             }
@@ -392,7 +480,8 @@ struct Exl3ExpertStream::Impl {
                 }
                 sl.trb = trb; sl.suhb = suhb; sl.svhb = svhb;
                 m.trellis = sl.tr; m.suh = sl.suh; m.svh = sl.svh;
-                m.ki = L.ki; m.nj = L.nj; m.bits = L.bits; m.cb = L.cb;
+                m.ki = L.ki; m.nj = L.nj; m.bits = L.bits; m.frac = L.frac; m.cb = L.cb;
+                m.layout = L.layout;   // the canonical tag travels with the scratch descriptor
                 try {
                     slots.push_back(sl);
                 } catch (...) { release(); return false; }
@@ -460,8 +549,9 @@ struct Exl3ExpertStream::Impl {
     bool prof = false;
     long long prof_routes = 0, prof_groups = 0;
     long long prof_row_hist[8] = {};   // per-group route rows: 1,2,3,4,5,6-8,9-15,>=16
-    long long prof_arm_routes[4] = {}; // routes dispatched: 0 = indexed GEMV, 1 = group (wmma|gemm),
-                                       // 2 = expert-batch, 3 = grouped small-M (STRATA_EXL3_SMALL_M)
+    long long prof_arm_routes[5] = {}; // routes dispatched: 0 = indexed GEMV, 1 = group (wmma|gemm),
+                                       // 2 = expert-batch, 3 = grouped small-M (STRATA_EXL3_SMALL_M),
+                                       // 4 = recon-batch (STRATA_EXL3_RECON_BATCH, C2)
     double prof_plan_ms = 0, prof_prep_ms = 0, prof_join_ms = 0;
 
     // STRATA_EXL3_PIPE (default on, "0" off): prefill wave pipelining (A/B).  While wave W's FFN
@@ -473,7 +563,28 @@ struct Exl3ExpertStream::Impl {
     bool expert_batch = false;  // temporary STRATA_EXL3_EXPERT_BATCH: bounded multi-expert launches
     long long batch_groups = 0, batch_calls = 0, group_hist[5] = {};
     long long ffn_launches = 0, standalone_groups = 0, batch_rejects = 0;
-    long long split_stops[4] = {}; // small next group, route cap, row-tile boundary, eight-group cap
+    long long split_stops[4] = {}; // small next group, route cap, row-tile/K-mix boundary, eight-group cap
+
+    // STRATA_EXL3_RECON_BATCH (opt-in; audit item C2, the batched weight reconstruction): the
+    // wave arm's reconstruct+BLAS group tiles (every >=16-row group the WMMA arm rejects -
+    // MiMo's fractional/low-K experts) batch into bounded subgroups through exl3_moe_recon_batch
+    // - one fused reconstruct launch and one strided-batched GEMM per projection instead of ~17
+    // launches and ~432 MiB of reconstruct traffic per expert.  `recon_batch_max` bounds a
+    // subgroup's expert count (the F16 weight slab is 2 x max matrices; STRATA_EXL3_RECON_BATCH_MAX).
+    bool recon_batch = false;
+    int recon_batch_max = 8;
+    long long recon_groups = 0, recon_calls = 0, recon_rows = 0, recon_rejects = 0, recon_singles = 0;
+    // STRATA_EXL3_GEMM_FP16_OUT's dispatch question: which of the >=16-row group arms actually
+    // runs.  Incremented UNCONDITIONALLY (two integer adds per group tile), printed only under
+    // STRATA_EXL3_TIME with the other counters.
+    long long wmma_group_calls = 0, group_gemm_calls = 0;
+    // C2's non-consecutive member tables: a batch may skip the small groups between its members
+    // (expert-ID order interleaves >=16-row and <16-row groups freely), so its compacted
+    // input-row/destination arrays live in their own scratch instead of the wave's contiguous table.
+    int* recon_scratch_rows = nullptr;
+    int* recon_scratch_dest = nullptr;
+    std::vector<int> recon_rows_host, recon_dest_host;   // a batch's compacted [rows | dests]
+    std::vector<int> recon_members;   // per attempt: the member groups' indices into the wave
 
     // STRATA_EXL3_OVERLAP=1: the HOST-IO arm's waves (run_multi - the verifier decode windows and
     // run()'s duplicate-id redirect; never run_device/prefill) issue the resident routes' FFN
@@ -575,6 +686,9 @@ struct Exl3ExpertStream::Impl {
         std::array<size_t, 9> bytes{};
     };
     // Only allocated by PACK_STAGE. Job fd=-2/src points here; the default Job layout is unchanged.
+    // fd=-3 (STRATA_EXL3_RESIDENT_DIRECT_DMA) instead points src at the backing's arena span:
+    // no PackedExpert is stored, the nine sources were proven contiguous and the single DMA
+    // reads them in place.
     std::unique_ptr<std::array<PackedExpert, 512>> packed_sources;
     size_t packed_count = 0;
     long long packed_jobs = 0;        // TIME evidence: experts actually coalesced
@@ -590,6 +704,23 @@ struct Exl3ExpertStream::Impl {
     bool pinned_mmap = false;          // opt-in: mmap misses use the existing double-buffered stage
     bool pack_stage = false;           // STRATA_EXL3_PACK_STAGE (default on, "0" off): gather an
                                        // arena expert's nine planes into one DMA
+    // STRATA_EXL3_RESIDENT_DIRECT_DMA (R1 prototype, DEFAULT OFF, "0"/unset identical to the
+    // last release): when the packed form's nine-piece gather engages AND the nine SOURCE
+    // planes are themselves contiguous by ACTUAL bytes AND the whole span lies in a range the
+    // expert backing itself declared GPU-registered, immutable RAM (Exl3ExpertBacking::
+    // direct_dma_pinned - an ownership answer, never a pointer-shape guess), ONE
+    // cudaMemcpyAsync reads the arena directly and the host memcpy into the pinned staging
+    // slab is skipped.  Sources that cannot prove all three (file/pread, mmap, the managed
+    // RAM cache, mixed-bit capacity-strided DESTINATIONS, a peer/exchange arena that mutates,
+    // no backing at all) keep today's exact transport - gather for the packed form, the
+    // per-plane direct branch otherwise.  The staging buffers, the api_mu enqueue
+    // serialization, the slot wait events and every lifetime rule are unchanged: the direct
+    // source range is immutable for the DMA's lifetime, exactly the contract the existing
+    // per-plane direct branch already relies on for the same arena.
+    bool resident_direct_dma = false;
+    long long direct_dma_jobs = 0;         // experts uploaded as ONE direct arena DMA
+    long long direct_dma_bytes = 0;        // gather-memcpy bytes avoided (== DMA bytes)
+    long long direct_dma_fallback = 0;     // packed-form experts that kept the gather while armed
     std::map<std::string, int> fds;    // shard path -> fd, opened once
     std::mutex api_mu;                 // concurrent enqueues to one stream are not safe on the null stream
     // the resident/miss split: two output blocks (the FFN of each part writes its own) and the row maps
@@ -624,6 +755,21 @@ struct Exl3ExpertStream::Impl {
     void stage_one(const Job& j, Stage& stg) {
         if (j.bytes == 0) return;
         const uint16_t* src = j.src;
+        if (j.fd == -3) {
+            // STRATA_EXL3_RESIDENT_DIRECT_DMA's direct form: ONE DMA out of the expert
+            // backing's GPU-registered, immutable arena span (queue_expert proved the nine
+            // source planes contiguous by actual bytes and asked the backing, which answered
+            // for bytes it owns).  No staging buffer is touched, so there is no per-buffer
+            // reuse event to record - the source cannot be overwritten by this stream and
+            // outlives the DMA under the same drained-window contract the per-piece direct
+            // branch below already relies on for the same arena.  api_mu still serializes the
+            // enqueue (the recorded null-stream race), and a slot wait still orders the copy
+            // behind an earlier wave's queued readers.
+            const std::lock_guard<std::mutex> lk(api_mu);
+            if (j.wait != nullptr && !staged(cudaStreamWaitEvent(work_stream, j.wait, 0))) return;
+            staged(cudaMemcpyAsync(j.dst, j.src, j.bytes, cudaMemcpyHostToDevice, work_stream));
+            return;
+        }
         if ((j.ram_src != nullptr || (pinned_mmap && j.fd < 0) || j.fd == -2) && stg.buf[0] != nullptr) {
             // **A HIT GOES THROUGH THE PINNED BUFFER TOO.**  `cudaMemcpyAsync` from pageable memory is
             // synchronous: it would stall each worker for the length of the copy, which is exactly what the
@@ -694,8 +840,7 @@ struct Exl3ExpertStream::Impl {
     // the host cache: on a hit the pieces come out of RAM, on a miss the read fills the slot as a side effect.
     void queue_expert(int expert, const Slot* gs, const Slot* us, const Slot* ds,
                       const Exl3Linear& Lg, const Exl3Linear& Lu, const Exl3Linear& Ld) {
-        const std::string b = "model.language_model.layers." + std::to_string(cur_layer) + ".mlp.experts." +
-                              std::to_string(expert) + ".";
+        const std::string b = expert_base(cur_layer, expert);
         const uint8_t* ram_src = nullptr;
         uint8_t* ram_dst = nullptr;
         const Slot* slots[] = {gs, us, ds};
@@ -705,7 +850,7 @@ struct Exl3ExpertStream::Impl {
         size_t plane_at = 0;
         for (int i = 0; i < 3; ++i) {
             const auto& L = *linears[i];
-            sizes[(size_t) i * 3] = (size_t) L.ki * L.nj * 32 * L.bits;
+            sizes[(size_t) i * 3] = (size_t) L.ki * L.nj * (2 * L.words());
             sizes[(size_t) i * 3 + 1] = (size_t) L.in() * 2;
             sizes[(size_t) i * 3 + 2] = (size_t) L.out() * 2;
             if (sizes[(size_t) i * 3] > slots[i]->trb || sizes[(size_t) i * 3 + 1] > slots[i]->suhb ||
@@ -753,6 +898,10 @@ struct Exl3ExpertStream::Impl {
         }
         const std::array<size_t, 9>& ro = ram_off[(size_t) cur_layer];
         const size_t job0 = jobs.size();
+        if (cache_statistics) {
+            ++cache_statistics_value.staged_experts;
+            for (const size_t bytes : sizes) cache_statistics_value.staged_bytes += bytes;
+        }
         std::string path; size_t off = 0, bytes = 0;
         int piece = 0;
         auto push = [&](uint16_t* dst, const std::string& base, const char* plane, const uint16_t* src, size_t n) {
@@ -796,6 +945,47 @@ struct Exl3ExpertStream::Impl {
                 off += j.bytes;
             }
             if (contiguous && off <= stage_bytes) {
+                // STRATA_EXL3_RESIDENT_DIRECT_DMA (opt-in, default off): with the packed
+                // form's destination contiguity proven, ALSO prove the nine SOURCE planes are
+                // contiguous by ACTUAL bytes and that the whole span lies in a range the
+                // expert backing itself declared GPU-registered immutable RAM - then ONE DMA
+                // reads the arena in place and the gather memcpy below is skipped.  The
+                // backing answers for bytes it owns (Exl3ResidentBacking commits exactly one
+                // registration per expert and arms the answer only for the full, unmutated
+                // arena); nothing here infers pinnability from a pointer's value.  Any
+                // unproven condition keeps the established packed job, and the flag-off path
+                // produces byte-identical jobs to the last release.
+                bool direct = false;
+                if (resident_direct_dma) {
+                    size_t src_off = 0;
+                    bool src_contiguous = true;
+                    for (size_t p = 0; p < 9; ++p) {
+                        const Job& j = jobs[job0 + p];
+                        // INTEGER arithmetic with an explicit overflow guard: the two
+                        // pointers may belong to different allocations, and the running
+                        // offset must never wrap uintptr_t (it cannot here - `off` already
+                        // accumulated the same sizes below stage_bytes - but the guard
+                        // makes that a checked fact rather than an assumption).
+                        src_contiguous = src_contiguous && j.bytes <= SIZE_MAX - src_off &&
+                            (uintptr_t) j.src == (uintptr_t) sources.pieces[0] + src_off;
+                        src_off += j.bytes;
+                    }
+                    const Exl3ExpertBacking* backing = model->expert_backing();
+                    direct = src_contiguous && src_off == off && backing != nullptr &&
+                             backing->direct_dma_pinned(sources.pieces[0], off);
+                    if (!direct) ++direct_dma_fallback;
+                }
+                if (direct) {
+                    Job direct_job = jobs[job0];
+                    direct_job.bytes = off;
+                    direct_job.fd = -3;
+                    direct_job.src = sources.pieces[0];
+                    jobs.resize(job0);
+                    jobs.push_back(direct_job);
+                    ++direct_dma_jobs;
+                    direct_dma_bytes += (long long) off;
+                    return;
+                }
                 auto* stored = &(*packed_sources)[packed_count++];
                 *stored = sources;
                 packed.bytes = off;
@@ -809,8 +999,7 @@ struct Exl3ExpertStream::Impl {
     }
 
     void prepare_expert(Blocks& blocks, int slot, int expert, bool slot_wait = true) {
-        const std::string base = "model.language_model.layers." + std::to_string(cur_layer) + ".mlp.experts." +
-                                  std::to_string(expert) + ".";
+        const std::string base = expert_base(cur_layer, expert);
         const auto g = model->linear(base + "gate_proj");
         const auto u = model->linear(base + "up_proj");
         const auto d = model->linear(base + "down_proj");
@@ -825,8 +1014,14 @@ struct Exl3ExpertStream::Impl {
             const cudaEvent_t ev = blocks.used[(size_t) slot];
             for (size_t i = job0; i < jobs.size(); ++i) jobs[i].wait = ev;
         }
-        auto set = [](Exl3Mat& m, const Exl3Linear& L) {
-            m.ki = L.ki; m.nj = L.nj; m.bits = L.bits; m.cb = L.cb;
+        auto set = [this, &base](Exl3Mat& m, const Exl3Linear& L) {
+            if (L.layout != layout)
+                throw std::runtime_error("exl3: expert " + base + " has trellis layout " +
+                                         std::to_string((uint32_t) L.layout) + " but this stream's canonical "
+                                         "format is " + std::to_string((uint32_t) layout) +
+                                         " - a mixed (packed + native) expert set is refused");
+            m.ki = L.ki; m.nj = L.nj; m.bits = L.bits; m.frac = L.frac; m.cb = L.cb;
+            m.layout = L.layout;   // the tag says what the staged bytes physically are
         };
         set(blocks.gm[(size_t) slot], g); set(blocks.um[(size_t) slot], u); set(blocks.dm[(size_t) slot], d);
     }
@@ -845,6 +1040,12 @@ struct Exl3ExpertStream::Impl {
     }
 
     void stage_parallel(bool host_decode = false) {
+        struct HostSpan {
+            Exl3ExpertStream::CacheStats* stats;
+            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+            ~HostSpan() { if (stats) stats->stage_host_ms += std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - start).count(); }
+        } host_span{cache_statistics && !jobs.empty() ? &cache_statistics_value : nullptr};
         if (prof && host_decode) {
             const size_t count = jobs.size();
             ++prof_stage_jobs[count <= 4 ? count : count <= 8 ? 5 : 6];
@@ -920,6 +1121,11 @@ struct Exl3ExpertStream::Impl {
         if (primary_packed_calls)
             std::fprintf(stderr, "exl3 primary packed plan: %lld passes / %lld routes, one plan H2D and direct FFN output per pass\n",
                          primary_packed_calls, primary_packed_routes);
+        if (resident_direct_dma)
+            std::fprintf(stderr, "exl3 resident direct DMA: %lld experts / %.2f MiB uploaded straight from the "
+                                 "registered arena (gather memcpy avoided); %lld packed experts kept the gather path "
+                                 "(non-contiguous or unproven source)\n",
+                         direct_dma_jobs, (double) direct_dma_bytes / 1048576.0, direct_dma_fallback);
         int previous = -1;
         (void) cudaGetDevice(&previous); (void) cudaSetDevice(device);
         {
@@ -958,6 +1164,8 @@ struct Exl3ExpertStream::Impl {
         for (Layer& l : layers)
             for (void* p : l.allocs) (void) cudaFree(p);
         if (arena) (void) cudaFree(arena);
+        if (recon_scratch_rows) { (void) cudaFree(recon_scratch_rows); recon_scratch_rows = nullptr; }
+        if (recon_scratch_dest) { (void) cudaFree(recon_scratch_dest); recon_scratch_dest = nullptr; }
         workspace.reset();
         for (auto& p : host_plan) if (p.device) { (void)cudaFree(p.device); p.device = nullptr; }
         multi.reset();
@@ -968,14 +1176,31 @@ struct Exl3ExpertStream::Impl {
 };
 
 Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int n_layers, int slots_per_layer,
-                                   void* stream, size_t ram_cache_bytes, size_t reserve_device_bytes,
-                                   int layer_lo, int layer_hi, int prefill_tokens) {
+                                    void* stream, size_t ram_cache_bytes, size_t reserve_device_bytes,
+                                    int layer_lo, int layer_hi, int prefill_tokens,
+                                    const std::string& layer_prefix,
+                                    std::shared_ptr<const Exl3ExpertBacking> expert_backing) {
     if (layer_hi < 0) layer_hi = n_layers;
     if (n_embd <= 0 || n_layers <= 0 || n_layers > 48 || slots_per_layer < -1 || slots_per_layer > 512 ||
         layer_lo < 0 || layer_lo >= layer_hi || layer_hi > n_layers)
         throw std::invalid_argument("exl3: invalid expert stream geometry");
     auto pending = std::make_unique<Impl>();
     impl_ = pending.get();
+    impl_->cache_statistics = strata::core::exl3_flag("STRATA_EXL3_CACHE_STATS", nullptr, false);
+    if (const char* policy = strata::core::exl3_env("STRATA_EXL3_CACHE_POLICY")) {
+        if (std::string(policy) == "lfu") impl_->frequency_policy = true;
+        else if (std::string(policy) != "lru") throw std::invalid_argument("exl3: CACHE_POLICY must be lru or lfu");
+    }
+    if (impl_->frequency_policy) {
+        impl_->frequency_prefill = strata::core::exl3_flag("STRATA_EXL3_CACHE_LFU_PREFILL", nullptr, false);
+        if (const char* v = std::getenv("STRATA_EXL3_CACHE_DECAY_EVERY")) impl_->frequency_every = std::atoi(v);
+        if (const char* v = std::getenv("STRATA_EXL3_CACHE_DECAY")) impl_->frequency_decay = std::strtof(v, nullptr);
+        if (!impl_->frequency_every || impl_->frequency_every > 65536 ||
+            !(impl_->frequency_decay >= 0 && impl_->frequency_decay <= 1))
+            throw std::invalid_argument("exl3: invalid CACHE_DECAY/EVERY");
+        std::fprintf(stderr, "exl3: cache policy aging LFU, every=%u decay=%g (LRU tie-break; prefill %s)\n",
+                     impl_->frequency_every, impl_->frequency_decay, impl_->frequency_prefill ? "LFU" : "LRU");
+    }
     if (cudaGetDevice(&impl_->device) != cudaSuccess ||
         cudaStreamCreateWithFlags(&impl_->compute_stream, cudaStreamNonBlocking) != cudaSuccess)
         throw std::runtime_error("exl3: cannot create expert execution context");
@@ -993,6 +1218,14 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
     impl_->pipe_stage = strata::core::exl3_flag("STRATA_EXL3_PIPE", nullptr, true);
     if (const char* v = std::getenv("STRATA_EXL3_EXPERT_BATCH"); v && v[0]) {
         impl_->expert_batch = v[0] != '0';   // opt-in (RDNA/WMMA batched group FFN, launcher-set)
+    }
+    // STRATA_EXL3_RECON_BATCH (opt-in, the C2 batched weight reconstruction for the frac/low-K
+    // experts - the Qwen-side EXPERT_BATCH's fraternal twin for the reconstruct+BLAS arm).  The
+    // subgroup cap defaults to 8 experts; STRATA_EXL3_RECON_BATCH_MAX overrides (1..16).
+    if (const char* v = std::getenv("STRATA_EXL3_RECON_BATCH"); v && v[0]) {
+        impl_->recon_batch = v[0] != '0';
+        if (const char* m = std::getenv("STRATA_EXL3_RECON_BATCH_MAX"); m && m[0])
+            impl_->recon_batch_max = std::max(2, std::min(16, std::atoi(m)));
     }
     impl_->overlap_stage = strata::core::exl3_flag("STRATA_EXL3_OVERLAP", nullptr, true);
     if (const char* v = std::getenv("STRATA_EXL3_SMALL_M"); v && v[0] && v[0] != '0')
@@ -1024,6 +1257,7 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
         impl_->pinned_mmap = true;
     impl_->pack_stage = strata::core::exl3_flag("STRATA_EXL3_PACK_STAGE", nullptr, true);
     if (impl_->pack_stage) impl_->packed_sources = std::make_unique<std::array<Impl::PackedExpert, 512>>();
+    impl_->resident_direct_dma = strata::core::exl3_flag("STRATA_EXL3_RESIDENT_DIRECT_DMA", nullptr, false);
     if (impl_->overlap_stage && impl_->profile[0] != nullptr)   // the overlap-evidence events, TIME only
         for (auto& event : impl_->ov_ev)
             if (cudaEventCreate(&event) != cudaSuccess) throw std::runtime_error("exl3: profiling event creation failed");
@@ -1032,7 +1266,34 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
         impl_->cpu_tier = true;   // opt-in (B1): a caller's cpu_rows buffer switches the full-cache
                                   // policy from evict-and-admit to REFUSE (the GGUF pool's overflow)
     impl_->dir = model_dir;
-    impl_->model = std::make_unique<Exl3Model>(model_dir);
+    impl_->expert_prefix = layer_prefix;
+    impl_->model = std::make_unique<Exl3Model>(model_dir, std::move(expert_backing));
+    const bool variable_bits = strata::core::exl3_flag("STRATA_EXL3_VARIABLE_EXPERT_BITS", nullptr, false);
+    if (variable_bits) {
+        for (int l = layer_lo; l < layer_hi; ++l) {
+            const std::string stem = layer_prefix + std::to_string(l) + ".mlp.experts.";
+            for (const char* proj : {"gate_proj", "up_proj", "down_proj"}) {
+                auto largest = impl_->model->linear(stem + "0." + proj);
+                for (int e = 1; e < 512; ++e) {
+                    const std::string name = stem + std::to_string(e) + "." + proj;
+                    if (!impl_->model->has(name)) break;
+                    const auto candidate = impl_->model->linear(name);
+                    if (candidate.ki != largest.ki || candidate.nj != largest.nj)
+                        throw std::runtime_error("exl3: variable-bit expert geometry differs: " + name);
+                    if (candidate.words() > largest.words()) largest = candidate;
+                }
+                impl_->slot_caps.emplace(stem + "0." + proj, largest);
+            }
+        }
+        std::fprintf(stderr, "exl3: variable-bit slot capacities scanned across all routed experts\n");
+    }
+    impl_->layout = impl_->model->expert_layout();
+    // The ONE canonical format for this stream: all experts it will ever load share it (the
+    // backing either covers every requested prefix or the mixed record refuses below, at the
+    // first linear whose tag disagrees).  The workspace mode is set exactly once here, on a
+    // fresh, drained workspace (nothing is enqueued or captured yet) - the device-only
+    // descriptor tables (verify/handoff masked hits) read it from there.
+    impl_->workspace->set_trellis_layout(impl_->layout);
     impl_->n_embd = n_embd;
     impl_->n_layers = n_layers;
     impl_->layer_lo = layer_lo; impl_->layer_hi = layer_hi;
@@ -1057,7 +1318,7 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
     if (impl_->small_m) {
         int ff = 0;
         for (int l = layer_lo; l < layer_hi; ++l)
-            ff = std::max(ff, impl_->model->linear("model.language_model.layers." + std::to_string(l) +
+            ff = std::max(ff, impl_->model->linear(impl_->expert_prefix + std::to_string(l) +
                                                    ".mlp.experts.0.gate_proj").out());
         if (impl_->primary_multirow &&
             (size_t) std::max(n_embd, ff) * (impl_->primary_multirow <= 2 ? 2 : 4) * sizeof(float) > 40*1024) {
@@ -1104,12 +1365,17 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
     impl_->ram_slot_bytes.assign((size_t) n_layers, 0);
     impl_->ram_off.assign((size_t) n_layers, {});
     for (int l = layer_lo; l < layer_hi; ++l) {
-        const std::string b = "model.language_model.layers." + std::to_string(l) + ".mlp.experts.0.";
+        const std::string b = impl_->expert_prefix + std::to_string(l) + ".mlp.experts.0.";
         size_t off = 0;
         int piece = 0;
         for (const char* p : {"gate_proj", "up_proj", "down_proj"}) {
-            Exl3Linear L = impl_->model->linear(b + p);
-            const size_t trb = (size_t) L.ki * L.nj * (256 * L.bits / 16) * 2;
+            Exl3Linear L = impl_->capacity(b + p);
+            if (L.layout != impl_->layout)
+                throw std::runtime_error("exl3: expert " + b + p + " has trellis layout " +
+                                         std::to_string((uint32_t) L.layout) + " but this stream's canonical "
+                                         "format is " + std::to_string((uint32_t) impl_->layout) +
+                                         " - a mixed (packed + native) expert set is refused");
+            const size_t trb = (size_t) L.ki * L.nj * (2 * L.words());
             impl_->stage_bytes = std::max(impl_->stage_bytes, std::max(trb, (size_t) (L.in() + L.out()) * 2));
             for (const size_t n : {trb, (size_t) L.in() * 2, (size_t) L.out() * 2}) {
                 impl_->ram_off[(size_t) l][(size_t) piece++] = off;
@@ -1120,6 +1386,12 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
         if (impl_->pack_stage) impl_->stage_bytes = std::max(impl_->stage_bytes, off);
     }
     if (ram_cache_bytes > 0) {
+        // One backing, one copy: the managed RAM cache would hold a SECOND copy of the packed
+        // planes beside the backing's immutable mmap.  Refuse loudly (the caller's explicit
+        // byte count is not silently lowered), instead of doubling host memory behind it.
+        if (impl_->layout != Exl3TrellisLayout::Native)
+            throw std::invalid_argument("exl3: ram_cache_bytes > 0 is not supported beside a packed "
+                                        "(band-8) expert backing - the backing is the single host copy; pass 0");
         size_t per_layer = 0;
         for (size_t n : impl_->ram_slot_bytes) per_layer += n;
         if (per_layer > 0) impl_->ram_slots = (int) std::min<size_t>(ram_cache_bytes / per_layer, 1u << 20);
@@ -1175,14 +1447,14 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
         cudaMalloc((void**) &impl_->d_hit_rows, (size_t) mk * sizeof(int)) != cudaSuccess ||
         cudaMalloc((void**) &impl_->d_miss_rows, (size_t) mk * sizeof(int)) != cudaSuccess) std::abort();
     // size the per-slot weight buffers from expert 0 of layer 0 (all experts in a layer share a shape)
-    const std::string b0 = "model.language_model.layers." + std::to_string(layer_lo) + ".mlp.experts.0.";
+    const std::string b0 = impl_->expert_prefix + std::to_string(layer_lo) + ".mlp.experts.0.";
     auto setup_scratch = [&](std::vector<Impl::Slot>& slots, std::vector<Exl3Mat>& mats, const char* proj) {
-        Exl3Linear L = impl_->model->linear(b0 + proj);
+        Exl3Linear L = impl_->capacity(b0 + proj);
         size_t trb = 0, suhb = 0, svhb = 0;
         for (int l = layer_lo; l < layer_hi; ++l) {
-            const auto S = impl_->model->linear("model.language_model.layers." + std::to_string(l) +
+            const auto S = impl_->capacity(impl_->expert_prefix + std::to_string(l) +
                                                 ".mlp.experts.0." + proj);
-            trb = std::max(trb, (size_t) S.ki * S.nj * 32 * S.bits);
+            trb = std::max(trb, (size_t) S.ki * S.nj * (2 * S.words()));
             suhb = std::max(suhb, (size_t) S.in() * 2);
             svhb = std::max(svhb, (size_t) S.out() * 2);
         }
@@ -1195,7 +1467,9 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
             mats[(size_t) i].trellis = slots[(size_t) i].tr;
             mats[(size_t) i].suh = slots[(size_t) i].suh;
             mats[(size_t) i].svh = slots[(size_t) i].svh;
-            mats[(size_t) i].ki = L.ki; mats[(size_t) i].nj = L.nj; mats[(size_t) i].bits = L.bits; mats[(size_t) i].cb = L.cb;
+            mats[(size_t) i].ki = L.ki; mats[(size_t) i].nj = L.nj; mats[(size_t) i].bits = L.bits;
+            mats[(size_t) i].frac = L.frac; mats[(size_t) i].cb = L.cb;
+            mats[(size_t) i].layout = L.layout;
         }
     };
     setup_scratch(impl_->scratch.g, impl_->scratch.gm, "gate_proj");
@@ -1216,7 +1490,7 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
     // behind the waiting graph, so reserve the whole 8-token, max-k window before any launch.
     int max_ff = 0;
     for (int l = layer_lo; l < layer_hi; ++l)
-        max_ff = std::max(max_ff, impl_->model->linear("model.language_model.layers." + std::to_string(l) +
+        max_ff = std::max(max_ff, impl_->model->linear(impl_->expert_prefix + std::to_string(l) +
                                                       ".mlp.experts.0.gate_proj").out());
     impl_->workspace->reserve(8 * mk, n_embd, max_ff, n_embd, true);
     const auto enabled = [](const char* name) {
@@ -1233,6 +1507,16 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
         impl_->workspace->reserve(4096, n_embd, max_ff, n_embd);
         if (impl_->expert_batch) // charge subgroup scratch before automatic cache sizing
             impl_->workspace->reserve_expert_batch(8, 4096, n_embd, max_ff, n_embd);
+        // C2's slab is charged here too (2 x cap F16 matrices + the padded activations), so the
+        // arena's auto-fill budget shrinks around it exactly like the other prompt scratch.
+        if (impl_->recon_batch) {
+            impl_->workspace->reserve_recon_batch(impl_->recon_batch_max, 4096, n_embd, max_ff, n_embd);
+            if (cudaMalloc((void**) &impl_->recon_scratch_rows, (size_t) 2 * 4096 * sizeof(int)) != cudaSuccess ||
+                cudaMalloc((void**) &impl_->recon_scratch_dest, (size_t) 2 * 4096 * sizeof(int)) != cudaSuccess)
+                throw std::runtime_error("exl3: recon batch plan scratch allocation failed");
+            impl_->recon_rows_host.reserve(4096);
+            impl_->recon_dest_host.reserve(4096);
+        }
     }
     (void) stream;
 
@@ -1244,17 +1528,18 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
     {
         size_t per_slot = 0;
         for (int l = layer_lo; l < layer_hi; ++l) {
-            const std::string b = "model.language_model.layers." + std::to_string(l) + ".mlp.experts.0.";
+            const std::string b = impl_->expert_prefix + std::to_string(l) + ".mlp.experts.0.";
             for (const char* p : {"gate_proj", "up_proj", "down_proj"}) {
-                Exl3Linear L = impl_->model->linear(b + p);
-                per_slot += (size_t) L.ki * L.nj * (256 * L.bits / 16) * 2 + (size_t) (L.in() + L.out()) * 2;
+                Exl3Linear L = impl_->capacity(b + p);
+                per_slot += (size_t) L.ki * L.nj * (2 * L.words()) + (size_t) (L.in() + L.out()) * 2;
             }
         }
-        if (slots < 0) {
+        if (slots < 0 || variable_bits) {
             size_t free_b = 0, total_b = 0;
             (void) cudaMemGetInfo(&free_b, &total_b);
-            const size_t reserve = reserve_device_bytes;
-            slots = (per_slot > 0 && free_b > reserve) ? (int) std::min<size_t>((free_b - reserve) / per_slot, 512) : 0;
+            const size_t reserve = variable_bits ? std::max(reserve_device_bytes, size_t(1) << 30) : reserve_device_bytes;
+            const int fit = (per_slot > 0 && free_b > reserve) ? (int) std::min<size_t>((free_b - reserve) / per_slot, 512) : 0;
+            slots = slots < 0 ? fit : std::min(slots, fit);
             std::fprintf(stderr, "strata generate: EXL3 expert cache auto: %.2f GiB free -> %d slots/layer\n",
                          (double) free_b / 1073741824.0, slots);
         }
@@ -1295,23 +1580,23 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
                 Exl3ArenaLayout::Planes planes{};
                 int p = 0;
                 for (const char* proj : {"gate_proj", "up_proj", "down_proj"}) {
-                    const auto m = impl_->model->linear("model.language_model.layers." + std::to_string(l) +
+                    const auto m = impl_->capacity(impl_->expert_prefix + std::to_string(l) +
                                                        ".mlp.experts.0." + proj);
                     if (m.ki <= 0 || m.nj <= 0 || m.ki > INT32_MAX / 16 || m.nj > INT32_MAX / 16 ||
-                        m.bits < 1 || m.bits > 8 || m.ki % 8 || m.nj % 8)
+                        m.bits < 1 || m.bits > 8 || (m.bits == 8 && m.frac != 0) || m.ki % 8 || m.nj % 8)
                         throw std::invalid_argument("exl3: invalid arena matrix geometry");
                     const size_t tiles = (size_t) m.ki * (size_t) m.nj;
-                    if (tiles > SIZE_MAX / (32u * (unsigned) m.bits))
+                    if (tiles > SIZE_MAX / (size_t) (2 * m.words()))
                         throw std::overflow_error("exl3: arena plane size overflow");
-                    planes[(size_t) p++] = tiles * 32u * (unsigned) m.bits;
+                    planes[(size_t) p++] = tiles * (size_t) (2 * m.words());
                     planes[(size_t) p++] = (size_t) m.in() * 2;
                     planes[(size_t) p++] = (size_t) m.out() * 2;
                 }
-                const auto gate = impl_->model->linear("model.language_model.layers." + std::to_string(l) +
+                const auto gate = impl_->model->linear(impl_->expert_prefix + std::to_string(l) +
                                                        ".mlp.experts.0.gate_proj");
-                const auto up = impl_->model->linear("model.language_model.layers." + std::to_string(l) +
+                const auto up = impl_->model->linear(impl_->expert_prefix + std::to_string(l) +
                                                      ".mlp.experts.0.up_proj");
-                const auto down = impl_->model->linear("model.language_model.layers." + std::to_string(l) +
+                const auto down = impl_->model->linear(impl_->expert_prefix + std::to_string(l) +
                                                        ".mlp.experts.0.down_proj");
                 if (gate.in() != n_embd || up.in() != n_embd || gate.out() != up.out() ||
                     down.in() != gate.out() || down.out() != n_embd)
@@ -1319,9 +1604,11 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
                 sizes.push_back(planes);
             }
             arena_layout = std::make_unique<Exl3ArenaLayout>(sizes, impl_->cache);
-            // Validated ki/nj multiples of8 make scales32*ki/32*nj and trellis32*bits*ki*nj
+            // Validated ki/nj multiples of8 make scales32*ki/32*nj and trellis2*words*ki*nj
             // exact multiples of256. Therefore rank alignment adds ZERO bytes, including mixed K
-            // and hidden widths: the existing raw per-rank auto/cache-event pricing is exact.
+            // (integer or half-integer: ki*nj is a multiple of 64 and a tile is 32*bits+16*frac
+            // bytes, both factors multiples of 16) and hidden widths: the existing raw per-rank
+            // auto/cache-event pricing is exact.
             size_t raw_rank = 0;
             for (const auto& layer : sizes)
                 for (size_t bytes : layer) {
@@ -1348,13 +1635,13 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
         for (int l = layer_lo; l < layer_hi; ++l) {
             Impl::Layer& L = impl_->layers[(size_t) l];
             L.tick.assign((size_t) impl_->cache, 0);
-            const std::string b = "model.language_model.layers." + std::to_string(l) + ".mlp.experts.0.";
+            const std::string b = impl_->expert_prefix + std::to_string(l) + ".mlp.experts.0.";
             std::vector<Impl::Slot>* vs[3] = { &L.g, &L.u, &L.d };
             std::vector<Exl3Mat>* ms[3] = { &L.gm, &L.um, &L.dm };
             const char* projs[3] = { "gate_proj", "up_proj", "down_proj" };
             for (int i = 0; i < 3; ++i) {
-                Exl3Linear S = impl_->model->linear(b + projs[i]);
-                const size_t trb = (size_t) S.ki * S.nj * (256 * S.bits / 16) * 2;
+                Exl3Linear S = impl_->capacity(b + projs[i]);
+                const size_t trb = (size_t) S.ki * S.nj * (2 * S.words());
                 const size_t suhb = (size_t) S.in() * 2, svhb = (size_t) S.out() * 2;
                 uint16_t *tr = nullptr, *suh = nullptr, *svh = nullptr;
                 if (!arena_layout) {
@@ -1381,7 +1668,8 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
                     sl.trb = trb; sl.suhb = suhb; sl.svhb = svhb;
                     Exl3Mat& M = (*ms[i])[(size_t) s];
                     M.trellis = sl.tr; M.suh = sl.suh; M.svh = sl.svh;
-                    M.ki = S.ki; M.nj = S.nj; M.bits = S.bits; M.cb = S.cb;
+                    M.ki = S.ki; M.nj = S.nj; M.bits = S.bits; M.frac = S.frac; M.cb = S.cb;
+                    M.layout = S.layout;   // per-slot descriptors carry the linear's own tag
                 }
             }
         }
@@ -1447,7 +1735,7 @@ void Exl3ExpertStream::overlap_debug(long long* splits, long long* fallbacks) co
 }
 
 void Exl3ExpertStream::small_m_debug(long long* calls, long long* routes, long long* stays,
-                                     size_t* workspace_bytes) const {
+                                     size_t* workspace_bytes, bool* enabled) const {
     // Lifetime counters unless STRATA_EXL3_TIME is printing per-window summaries (its resets make
     // deltas, not absolutes, the stable read).  Test evidence for the opt-in's real dispatch
     // coverage and the pre-reserve contract, not a control.
@@ -1455,6 +1743,19 @@ void Exl3ExpertStream::small_m_debug(long long* calls, long long* routes, long l
     if (routes) *routes = impl_->small_m_routes;
     if (stays) std::copy(std::begin(impl_->small_m_stays), std::end(impl_->small_m_stays), stays);
     if (workspace_bytes) *workspace_bytes = impl_->workspace->allocated_bytes();
+    if (enabled) *enabled = impl_->small_m;
+}
+
+void Exl3ExpertStream::resident_direct_dma_debug(long long* jobs, long long* bytes,
+                                                 long long* fallbacks, bool* enabled) const {
+    // STRATA_EXL3_RESIDENT_DIRECT_DMA test evidence (lifetime counters, no reset): the
+    // fast path must not be vacuous - `jobs` proves experts actually DMA'd straight from
+    // the backing's registered arena, `bytes` the gather memcpy avoided, `fallbacks` the
+    // packed-form experts that kept the gather while the flag was armed.
+    if (jobs) *jobs = impl_->direct_dma_jobs;
+    if (bytes) *bytes = impl_->direct_dma_bytes;
+    if (fallbacks) *fallbacks = impl_->direct_dma_fallback;
+    if (enabled) *enabled = impl_->resident_direct_dma;
 }
 
 void Exl3ExpertStream::set_owned_elsewhere(const uint8_t* table, int64_t n_layers, int64_t n_expert) {
@@ -1503,6 +1804,13 @@ void Exl3ExpertStream::set_owned_elsewhere(const uint8_t* table, int64_t n_layer
 bool Exl3ExpertStream::holds(int64_t layer, int32_t expert) const {
     return layer >= 0 && layer < (int64_t) impl_->layers.size() &&
            impl_->layers[(size_t) layer].at.count(expert) != 0;
+}
+
+bool Exl3ExpertStream::excluded_elsewhere(int64_t layer, int32_t expert) const {
+    // admission_excluded is the static own_table OR the pending-incoming reservation - the
+    // exact union the admission loop refuses on (see the header comment for why callers
+    // partitioning against the peer need this union and not owned_elsewhere alone).
+    return impl_ != nullptr && impl_->admission_excluded(layer, expert);
 }
 
 // `--expert-profile` on the EXL3 cache: the GGUF R4.2e profile fill (generate.cpp) with the same
@@ -1567,9 +1875,9 @@ bool Exl3ExpertStream::warmup_fill(const std::vector<std::pair<int32_t, int32_t>
                 lay.at[e] = s;
                 lay.tick[(size_t) s] = ++lay.clock;
                 if (first.first < 0) { first = {l, e}; first_slot = s; }
-                // nine planes per expert: trellis ki*nj*32*bits, suh ki*32, svh nj*32 bytes
+                // nine planes per expert: trellis ki*nj*2*words, suh ki*32, svh nj*32 bytes
                 for (const Exl3Mat* m : {&lay.gm[(size_t) s], &lay.um[(size_t) s], &lay.dm[(size_t) s]})
-                    bytes += (int64_t) m->ki * m->nj * 32 * m->bits + ((int64_t) m->ki + m->nj) * 32;
+                    bytes += (int64_t) m->ki * m->nj * (2 * m->words()) + ((int64_t) m->ki + m->nj) * 32;
                 ++filled;
             }
             if (!impl_->jobs.empty()) impl_->stage_parallel();       // this layer's planes land
@@ -1596,15 +1904,14 @@ bool Exl3ExpertStream::warmup_fill(const std::vector<std::pair<int32_t, int32_t>
     // ---- one slot verified: every plane read back and compared against its source bytes
     if (first.first >= 0) {
         const int l = first.first, e = first.second;
-        const std::string base = "model.language_model.layers." + std::to_string(l) + ".mlp.experts." +
-                                 std::to_string(e) + ".";
+        const std::string base = impl_->expert_base(l, e);
         const Impl::Layer& lay = impl_->layers[(size_t) l];
         const Impl::Slot* dmm[3] = {&lay.g[(size_t) first_slot], &lay.u[(size_t) first_slot], &lay.d[(size_t) first_slot]};
         const char* proj[3] = {"gate_proj", "up_proj", "down_proj"};
         std::vector<uint8_t> tmp;
         for (int p = 0; p < 3; ++p) {
             const strata::Exl3Linear L = impl_->model->linear(base + proj[p]);
-            const size_t sz[3] = {(size_t) L.ki * L.nj * 32 * L.bits, (size_t) L.in() * 2, (size_t) L.out() * 2};
+            const size_t sz[3] = {(size_t) L.ki * L.nj * (2 * L.words()), (size_t) L.in() * 2, (size_t) L.out() * 2};
             const void* src[3] = {L.trellis, L.suh, L.svh};
             const void* dst[3] = {dmm[p]->tr, dmm[p]->suh, dmm[p]->svh};
             for (int q = 0; q < 3; ++q) {
@@ -1817,16 +2124,34 @@ size_t Exl3ExpertStream::bytes() const {
     return n;
 }
 
+Exl3ExpertStream::CacheStats Exl3ExpertStream::cache_stats() const { return impl_->cache_statistics_value; }
+
+std::vector<int32_t> Exl3ExpertStream::cache_lru_order(int layer) const {
+    const auto& c = impl_->layers.at(layer);
+    std::vector<std::pair<uint32_t, int32_t>> ordered;
+    for (const auto& entry : c.at) ordered.emplace_back(c.tick[entry.second], entry.first);
+    std::sort(ordered.begin(), ordered.end());
+    std::vector<int32_t> ids;
+    for (const auto& entry : ordered) ids.push_back(entry.second);
+    return ids;
+}
+
 void Exl3ExpertStream::enable_verify_graph(int max_tokens, int k) {
     if (impl_->verify_graph) return;
     if (max_tokens < 1 || max_tokens > 8 || k < 1 || k > impl_->max_k)
         throw std::invalid_argument("exl3: invalid verifier graph capacity");
     auto v = std::make_unique<VerifyGraphBuffers>();
     v->max_tokens = max_tokens; v->k = k;
+    v->native_rates.resize(impl_->n_layers, 0);
+    v->layer_ff.resize(impl_->n_layers, 0);
     const int routes = max_tokens * k, n = impl_->n_embd;
-    for (int l = impl_->layer_lo; l < impl_->layer_hi; ++l)
-        v->max_ff = std::max(v->max_ff, impl_->model->linear("model.language_model.layers." +
-            std::to_string(l) + ".mlp.experts.0.gate_proj").out());
+    for (int l = impl_->layer_lo; l < impl_->layer_hi; ++l) {
+        const auto name = impl_->expert_prefix + std::to_string(l) + ".mlp.experts.0.gate_proj";
+        if (impl_->model->has(name)) {
+            v->layer_ff[l] = impl_->model->linear(name).out();
+            v->max_ff = std::max(v->max_ff, v->layer_ff[l]);
+        }
+    }
     v->table.allocate((size_t) impl_->n_layers * 3 * 512);
     v->device_table.reserve((size_t) impl_->n_layers * 3 * 512);
     v->record.allocate(impl_->n_layers);
@@ -1842,6 +2167,12 @@ void Exl3ExpertStream::enable_verify_graph(int max_tokens, int k) {
     v->x.reserve((size_t) max_tokens * n);
     v->workspace.reserve(routes, n, v->max_ff, n, true);
     v->workspace.reserve_runtime_scratch(routes, n, v->max_ff, n);
+    // The graph's OWN workspace: its masked-hit/slot tables are device-only descriptors, so
+    // their physical format is workspace state.  This whole buffer set is BRAND NEW here
+    // (nothing captured, nothing queued - enable_verify_graph returns early if one exists),
+    // which is exactly the drained init window set_trellis_layout requires.  The table content
+    // is published right after by refresh_verify_graph from the cache slots' tagged mats.
+    v->workspace.set_trellis_layout(impl_->layout);
     // The callback's miss count can grow after the first captured window too.
     impl_->workspace->reserve_runtime_scratch(8 * impl_->max_k, n, v->max_ff, n);
     impl_->verify_graph = std::move(v);
@@ -1854,9 +2185,43 @@ void Exl3ExpertStream::enable_verify_graph(int max_tokens, int k) {
                  max_tokens, k);
 }
 
-void Exl3ExpertStream::refresh_verify_graph(void* stream) {
+void Exl3ExpertStream::refresh_verify_graph(void* stream, int window_tokens) {
     auto& v = *impl_->verify_graph;
+    // API contract (set_window_graph_hits/refresh): window_tokens is validated BEFORE any
+    // use - negative values are illegal, and anything above the frame's max_tokens would
+    // publish tables for windows the frame cannot carry. With window_tokens bounded to
+    // [0, max_tokens <= 8] and k <= 64, the tokens*k product below cannot overflow int;
+    // the range check is deliberately first so that property holds by construction.
+    if (window_tokens < 0 || window_tokens > v.max_tokens)
+        throw std::invalid_argument("exl3: refresh_verify_graph window_tokens must be in "
+                                    "[0, " + std::to_string(v.max_tokens) + "] (got " +
+                                    std::to_string(window_tokens) + ")");
+    // Quiescent seam (the documented "no verifier window in flight" contract): a frame
+    // that ABORTED never reached complete_decode_handoff's end_host, so its host bracket
+    // may still be open here. This thread owns the table once the frame is drained; close
+    // any stale bracket so no later host-IO call can drop groups against a stale record.
+    v.host_active = false;
+    // The STICKY abort flag also clears at this drained seam: a caller that has observed
+    // the failfast release and drained both streams may resume the handoff protocol on a
+    // fresh ring. The engine itself never does (its worker error is sticky - every later
+    // forward rethrows); this is the API-level recovery point, deliberately not in
+    // abort_decode_handoff (that one stays publish-only and concurrent-safe). Graph-only
+    // streams have no handoff buffers - the event is the arm marker.
+    if (v.decode_ready) {
+        std::atomic_thread_fence(std::memory_order_release);
+        *(volatile uint32_t*) v.decode_abort.host = 0;
+    }
     if (v.check) std::fill_n(v.completed.host, impl_->n_layers, 0u);
+    // A multirow window's hit snapshot is armed only when the opt-in is on AND the ACTIVE
+    // cache holds window_tokens*k slots: every distinct expert of a T-row window then fits
+    // beside its hits, so the service side's miss admission can always find an unpinned
+    // victim slot and no descriptor a hit still reads is ever evicted mid-window. Failing
+    // either condition, windows fall back to the null table (all-miss handoff).
+    v.window_hit_tokens = v.window_hits && window_tokens > 1 &&
+                                  impl_->active >= window_tokens * v.k
+                              ? window_tokens : 0;
+    const int need = window_tokens > 1 ? window_tokens * v.k
+                                       : (v.decode_ready ? v.k : v.max_tokens * v.k);
     // Called with no verifier window in flight. Prefill, loans and other request paths may
     // have changed residency since the previous window; rebuild from the authoritative map.
     for (int l = impl_->layer_lo; l < impl_->layer_hi; ++l) {
@@ -1864,13 +2229,20 @@ void Exl3ExpertStream::refresh_verify_graph(void* stream) {
         std::fill_n(table, 3 * 512, Exl3Mat{});
         // With a smaller active cache, preserve the existing bounded host waves. A hit
         // snapshot is used only when a whole window's distinct experts fits beside its hits.
-        if (impl_->active < v.max_tokens * v.k) continue;
+        if (impl_->active < need) continue;
         const auto& c = impl_->layers[l];
+        int rates = 0;
+        bool eligible = v.decode_ready && strata::core::exl3_flag("STRATA_EXL3_RDNA_NATIVE", nullptr, false);
         for (const auto& entry : c.at) {
             const int e = entry.first, s = entry.second;
             if (s < 0 || s >= impl_->active || impl_->owned_elsewhere(l, e)) continue;
             table[e] = c.gm[s]; table[512 + e] = c.um[s]; table[1024 + e] = c.dm[s];
+            for (const auto* m : {&c.gm[s], &c.um[s], &c.dm[s]}) {
+                eligible &= m->bits == 2 && m->cb == 2;
+                rates |= m->frac ? 2 : 1;
+            }
         }
+        v.native_rates[l] = eligible ? rates : 0;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (stream && cudaMemcpyAsync(v.device_table.p, v.table.host,
@@ -1879,16 +2251,28 @@ void Exl3ExpertStream::refresh_verify_graph(void* stream) {
         throw std::runtime_error("exl3: verifier table upload failed");
 }
 
+void Exl3ExpertStream::set_window_graph_hits(bool enabled) {
+    if (!impl_->verify_graph)
+        throw std::invalid_argument("exl3: window graph hits need the verifier graph");
+    auto& v = *impl_->verify_graph;
+    if (enabled && !v.decode_ready)
+        throw std::invalid_argument("exl3: window graph hits need the multirow decode handoff "
+                                    "(enable_decode_handoff with max_tokens >= 2)");
+    if (enabled && v.max_tokens < 2)
+        throw std::invalid_argument("exl3: window graph hits need handoff capacity for T=2..8");
+    v.window_hits = enabled;
+    if (!enabled) v.window_hit_tokens = 0;   // later refreshes keep the null-table default
+}
+
 void Exl3ExpertStream::verify_graph_hits(int layer, const float* x, const int32_t*,
                                        int tokens, int k, float* out, uint32_t, void* stream) {
     auto& v = *impl_->verify_graph;
     const int n = impl_->n_embd, routes = tokens * k;
     const auto st = (cudaStream_t) stream;
     f32_to_f16_rows_kernel<<<(tokens * n + 255) / 256, 256, 0, st>>>(x, v.x.p, (long) tokens * n);
-    const int ff = impl_->model->linear("model.language_model.layers." + std::to_string(layer) +
-                                       ".mlp.experts.0.gate_proj").out();
+    const int ff = v.layer_ff[layer];
     const uint16_t* rows = exl3_moe_rows_masked(v.gate.p, v.up.p, v.down.p, routes, n, ff, n, v.x.p,
-                                               v.input_rows.p, stream, v.workspace);
+                                               v.input_rows.p, stream, v.workspace, v.native_rates[layer]);
     verify_output_kernel<false><<<(routes * n + 255) / 256, 256, 0, st>>>(
         v.gate.p, rows, nullptr, out, routes, n);
     if (v.check) {
@@ -1899,15 +2283,26 @@ void Exl3ExpertStream::verify_graph_hits(int layer, const float* x, const int32_
 
 const uint32_t* Exl3ExpertStream::verify_graph_skip() const { return impl_->verify_graph->skip.p; }
 
+int Exl3ExpertStream::window_hit_tokens() const {
+    return impl_->verify_graph ? impl_->verify_graph->window_hit_tokens : 0;
+}
+
 void Exl3ExpertStream::verify_graph_publish(int layer, const float* x, const int32_t* ids, int tokens, int k,
                                           float* mapped_x, int32_t* mapped_ids, uint32_t* seq,
-                                          uint32_t ring, void* stream) {
+                                          uint32_t ring, void* stream, const float* weights) {
     auto& v = *impl_->verify_graph;
     if (tokens < 1 || tokens > v.max_tokens || k != v.k)
         throw std::runtime_error("exl3: verifier graph shape changed");
-    verify_gather_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(v.device_table.p + (size_t) layer * 3 * 512,
+    // A1a: window handoffs have NO GPU hits unless the opt-in armed them AND the last
+    // refresh declared this window's tables valid (refresh's active >= T*k gate). The
+    // null table keeps every route a host-served miss - the original byte path.
+    const bool window = v.decode_ready && tokens > 1;
+    const Exl3Mat* table = v.device_table.p + (size_t) layer * 3 * 512;
+    if (window && v.window_hit_tokens < tokens) table = nullptr;
+    verify_gather_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(table,
         ids, tokens * k, k, v.gate.p, v.up.p, v.down.p, v.input_rows.p,
-        v.record.device + layer, v.skip.p, ring, x, tokens * impl_->n_embd, mapped_x, mapped_ids, seq);
+        v.record.device + layer, v.skip.p, ring, x, tokens * impl_->n_embd, mapped_x, mapped_ids, seq,
+        weights, window ? v.decode_weights.device : nullptr);
 }
 
 void Exl3ExpertStream::verify_graph_copy_misses(const float* mapped, float* out, int routes, void* stream) {
@@ -1920,6 +2315,7 @@ void Exl3ExpertStream::verify_graph_copy_misses(const float* mapped, float* out,
 bool Exl3ExpertStream::verify_graph_begin_host(int layer) {
     auto& v = *impl_->verify_graph;
     const auto& rec = v.record.host[layer]; // doorbell's system fence published this record
+    impl_->observe_frequency(layer, rec.ids, rec.routes, rec.routes / v.k);
     if (impl_->route_observer) impl_->route_observer(impl_->route_observer_user, layer, rec.ids, rec.routes);
     ++v.layers; v.hit_routes += rec.routes - rec.misses; v.miss_routes += rec.misses;
     v.all_hit_layers += rec.misses == 0;
@@ -1981,7 +2377,168 @@ void Exl3ExpertStream::verify_graph_check(int layer, const float* x, const int32
 }
 
 bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k, float* out, void* stream,
-                           uint8_t* cpu_rows) {
+                            uint8_t* cpu_rows) {
+    return run_single_impl(layer, x_f32, ids, k, out, stream, cpu_rows, false);
+}
+
+bool Exl3ExpertStream::run_decode_device(int layer, const float* x_device, const int* ids, int k,
+                                        float* out_device, void* stream, uint8_t* cpu_rows) {
+    if (!impl_->primary_pack || !impl_->pinned_plan || k > impl_->pinned_plan_capacity) return false;
+    return run_single_impl(layer, x_device, ids, k, out_device, stream, cpu_rows, true);
+}
+
+void Exl3ExpertStream::enable_decode_handoff(int k, int max_tokens) {
+    if (max_tokens < 1 || max_tokens > 8 || k < 1 || k > 64 / max_tokens)
+        throw std::invalid_argument("exl3: invalid handoff capacity");
+    const bool small_m = impl_->small_m;
+    enable_verify_graph(max_tokens, k);
+    // Empty-hit windows use the original host planner, including its optional arithmetic arm.
+    if (max_tokens > 1) impl_->small_m = small_m;
+    auto& v = *impl_->verify_graph;
+    if (v.max_tokens != max_tokens || v.k != k) throw std::invalid_argument("exl3: incompatible handoff capacity");
+    if (v.decode_ready) return;
+    v.decode_x.allocate((size_t) max_tokens * impl_->n_embd);
+    v.decode_ids.allocate(max_tokens * k);
+    if (max_tokens > 1) v.decode_weights.allocate(max_tokens * k);
+    v.decode_seq.allocate(impl_->n_layers);
+    v.decode_done.allocate(impl_->n_layers);
+    v.decode_abort.allocate(1);
+    if (cudaEventCreateWithFlags(&v.decode_ready, cudaEventDisableTiming) != cudaSuccess)
+        throw std::runtime_error("exl3: decode handoff event allocation failed");
+}
+
+void Exl3ExpertStream::prepare_decode_handoff_t1() {
+    const std::lock_guard<std::mutex> lock(impl_->run_mu);
+    if (!impl_->verify_graph || !impl_->verify_graph->decode_ready || impl_->verify_graph->host_active)
+        throw std::runtime_error("exl3: T1 handoff preparation needs an idle frame");
+    impl_->small_m = false;
+}
+
+void Exl3ExpertStream::decode_handoff(int layer, const float* x, const int32_t* ids, int k,
+                                     float* out, void* stream, const int32_t*& host_ids,
+                                     const float*& host_x, const uint8_t*& hits) {
+    auto& v = *impl_->verify_graph;
+    if (!v.decode_ready || v.host_active) throw std::runtime_error("exl3: overlapping decode handoff");
+    // Sequence reuse is safe: each publish follows the previous layer's complete compute
+    // on this stream. A stale event/flag is never interpreted as a new publication.
+    const uint32_t ring = ++v.decode_ring;
+    verify_graph_publish(layer, x, ids, 1, k, v.decode_x.device, v.decode_ids.device,
+                         v.decode_seq.device + layer, ring, stream);
+    if (cudaEventRecord(v.decode_ready, (cudaStream_t) stream) != cudaSuccess)
+        throw std::runtime_error("exl3: decode publication event failed");
+    verify_graph_hits(layer, x, ids, 1, k, out, ring, stream);
+    const auto started = std::chrono::steady_clock::now();
+    while (*(volatile uint32_t*) (v.decode_seq.host + layer) != ring) {
+        // Query flushes driver submissions, including WDDM, without waiting for hit FFNs.
+        const auto status = cudaEventQuery(v.decode_ready);
+        if (status != cudaSuccess && status != cudaErrorNotReady)
+            throw std::runtime_error("exl3: decode publication failed");
+        if (std::chrono::steady_clock::now() - started > std::chrono::seconds(30))
+            throw std::runtime_error("exl3: decode publication timeout");
+        std::this_thread::yield();
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    verify_graph_begin_host(layer);
+    host_ids = v.record.host[layer].ids;
+    host_x = v.decode_x.host;
+    hits = v.record.host[layer].hit;
+}
+
+void Exl3ExpertStream::enqueue_decode_handoff(int layer, const float* x, const int32_t* ids, int k,
+                                             float* out, uint32_t ring, void* stream,
+                                             int tokens, const float* weights) {
+    auto& v = *impl_->verify_graph;
+    if (!v.decode_ready || ring == 0 || layer < impl_->layer_lo || layer >= impl_->layer_hi ||
+        v.layer_ff[layer] == 0 || !x || !ids || !out || tokens < 1 || tokens > v.max_tokens ||
+        k != v.k || (tokens > 1 && !weights))
+        throw std::invalid_argument("exl3: invalid decode handoff publication");
+    verify_graph_publish(layer, x, ids, tokens, k, v.decode_x.device, v.decode_ids.device,
+                         v.decode_seq.device + layer, ring, stream, weights);
+    verify_graph_hits(layer, x, ids, tokens, k, out, ring, stream);
+    decode_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(v.decode_done.device + layer,
+                                                        v.decode_abort.device, v.skip.p, ring);
+    if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("exl3: decode enqueue failed");
+}
+
+void Exl3ExpertStream::collect_decode_handoff(int layer, uint32_t ring, void* poll_stream,
+                                             const int32_t*& ids, const float*& x, const uint8_t*& hits,
+                                             int* tokens, const float** weights) {
+    auto& v = *impl_->verify_graph;
+    const auto started = std::chrono::steady_clock::now();
+    while (*(volatile uint32_t*) (v.decode_seq.host + layer) != ring) {
+        if (*(volatile uint32_t*) v.decode_abort.host) throw std::runtime_error("exl3: decode handoff aborted");
+        const auto status = cudaStreamQuery((cudaStream_t) poll_stream);
+        if (status != cudaSuccess && status != cudaErrorNotReady)
+            throw std::runtime_error("exl3: decode producer failed");
+        if (std::chrono::steady_clock::now() - started > std::chrono::seconds(30))
+            throw std::runtime_error("exl3: decode producer timeout");
+        std::this_thread::yield();
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const int rows = v.record.host[layer].routes;
+    if (rows < v.k || rows % v.k || rows > v.max_tokens * v.k)
+        throw std::runtime_error("exl3: invalid handoff record");
+    if (rows == v.k) verify_graph_begin_host(layer);
+    else {
+        // Multirow window. With NO hits this keeps the original accounting: the host
+        // planner (run_multi below) observes frequency and admits exactly once by itself.
+        // With hits (the set_window_graph_hits opt-in), the SAME begin_host contract as
+        // T1 applies: observation and LRU ticks exactly once, hit slots pinned through
+        // miss admission, and host_active drops the hit groups from the complement.
+        const auto& rec = v.record.host[layer];
+        bool any_hit = false;
+        for (int r = 0; r < rows; ++r) any_hit |= rec.hit[r] != 0;
+        if (any_hit) {
+            verify_graph_begin_host(layer);
+            ++v.window_layers;
+            v.window_hit_routes += rec.routes - rec.misses;
+            v.window_miss_routes += rec.misses;
+            v.window_all_hit_layers += rec.misses == 0;
+        } else {
+            ++v.layers; v.miss_routes += rows;
+        }
+    }
+    if (tokens) *tokens = rows / v.k;
+    if (weights) *weights = rows > v.k ? v.decode_weights.host : nullptr;
+    ids = v.record.host[layer].ids;
+    x = v.decode_x.host;
+    hits = v.record.host[layer].hit;
+}
+
+void Exl3ExpertStream::complete_decode_handoff(int layer, uint32_t ring, void* service_stream) {
+    auto& v = *impl_->verify_graph;
+    verify_graph_end_host(layer);
+    if (service_stream) {
+        decode_complete_kernel<<<1, 1, 0, (cudaStream_t) service_stream>>>(v.decode_done.device + layer, ring);
+        if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("exl3: decode completion failed");
+        return;
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+    *(volatile uint32_t*) (v.decode_done.host + layer) = ring;
+}
+
+void Exl3ExpertStream::abort_decode_handoff() {
+    // Failfast ONLY: this publishes the abort flag and nothing else. host_active belongs
+    // to the service owner's thread between begin/complete; writing it here (from the
+    // producer or the shutdown path) would race the worker's own read/write. The stale
+    // bracket an aborted frame leaves behind is cleared by recover_host_service() from
+    // the owner after unwind, or by the next refresh on a drained frame - never here.
+    std::atomic_thread_fence(std::memory_order_release);
+    *(volatile uint32_t*) impl_->verify_graph->decode_abort.host = 1;
+}
+
+void Exl3ExpertStream::recover_host_service() {
+    // The ABORT-PATH recovery for the host bookkeeping only. Call from the SERVICE owner
+    // after an aborted frame's unwind, or with the frame quiescent (joined/drained):
+    // clears a host-service bracket a frame that never reached complete_decode_handoff
+    // left open, so no later host-IO call can drop groups against that stale record.
+    // Never publishes, never touches device state; abort_decode_handoff stays the
+    // concurrent-safe failfast. No mutex: not reachable while the owner is inside a call.
+    if (impl_->verify_graph) impl_->verify_graph->host_active = false;
+}
+
+bool Exl3ExpertStream::run_single_impl(int layer, const float* x_f32, const int* ids, int k, float* out,
+                                      void* stream, uint8_t* cpu_rows, bool device_io) {
     if (k == 0) return true;
     if (k < 0 || k > impl_->max_k || layer < impl_->layer_lo || layer >= impl_->layer_hi ||
         x_f32 == nullptr || ids == nullptr || out == nullptr) return false;
@@ -1991,7 +2548,7 @@ bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k,
     for (int i = 0; i < k; ++i) if (ids[i] < 0 || ids[i] >= 512) return false;
     for (int i = 0; i < k; ++i)
         for (int j = 0; j < i; ++j)
-            if (ids[i] == ids[j]) return run_multi(layer, x_f32, ids, 1, k, out, stream, cpu_rows);
+            if (ids[i] == ids[j]) return device_io ? false : run_multi(layer, x_f32, ids, 1, k, out, stream, cpu_rows);
     const std::lock_guard<std::mutex> run_lock(impl_->run_mu);
     int previous = -1;
     if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(impl_->device) != cudaSuccess) return false;
@@ -2003,12 +2560,43 @@ bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k,
     if (stream == nullptr) stream = (void*) impl_->compute_stream;
     cudaStream_t st = (cudaStream_t) stream;
     const long n = impl_->n_embd;
-    static const bool timing = std::getenv("STRATA_EXL3_TIME") != nullptr;
+    static const bool timing_env = std::getenv("STRATA_EXL3_TIME") != nullptr;
+    const bool timing = timing_env && !device_io;   // async work is timed on the caller's stream
+    // run_multi already uses the small-wave policy. Opt in separately for the legacy
+    // single-token host API, whose packed expert misses otherwise wake the entire pool.
+    static const bool run_stage = strata::core::exl3_flag("STRATA_EXL3_RUN_STAGE", nullptr, false);
     const auto t_call0 = std::chrono::steady_clock::now();
     const auto t_up0 = std::chrono::steady_clock::now();
-    if (cudaMemcpyAsync(impl_->d_input, x_f32, (size_t) n * sizeof(float), cudaMemcpyHostToDevice, st) != cudaSuccess)
+    if (!device_io && cudaMemcpyAsync(impl_->d_input, x_f32, (size_t) n * sizeof(float), cudaMemcpyHostToDevice, st) != cudaSuccess)
         return false;
-    f32_to_f16_rows_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(impl_->d_input, impl_->d_x, n);
+    f32_to_f16_rows_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(device_io ? x_f32 : impl_->d_input, impl_->d_x, n);
+
+    const int* device_maps[2] = {impl_->d_hit_rows, impl_->d_miss_rows};
+    auto dispatch = [&](int pass, const std::vector<Exl3Mat>& g, const std::vector<Exl3Mat>& u,
+                        const std::vector<Exl3Mat>& d, const std::vector<int>& destinations, uint16_t* output) {
+        if (!device_io) {
+            exl3_moe_rows_part(g.data(), u.data(), d.data(), (int) g.size(), impl_->d_x,
+                               output, stream, impl_->workspace.get());
+            return;
+        }
+        const int rows = (int) g.size();
+        const size_t bytes = (size_t) rows * sizeof(Exl3Mat);
+        auto& p = impl_->host_plan[pass];
+        auto* base = (uint8_t*) p.allocation;
+        std::memcpy(base, g.data(), bytes);
+        std::memcpy(base + bytes, u.data(), bytes);
+        std::memcpy(base + 2 * bytes, d.data(), bytes);
+        std::memset(base + 3 * bytes, 0, (size_t) rows * sizeof(int));   // one shared input token
+        std::memcpy(base + 3 * bytes + (size_t) rows * sizeof(int), destinations.data(), (size_t) rows * sizeof(int));
+        if (cudaMemcpyAsync(p.device, base, 3 * bytes + 2 * (size_t) rows * sizeof(int),
+                            cudaMemcpyHostToDevice, st) != cudaSuccess)
+            throw std::runtime_error("exl3: decode device plan upload failed");
+        const Exl3MoeDevicePlan plan{(const Exl3Mat*) p.device, (const Exl3Mat*) (p.device + bytes),
+                                     (const Exl3Mat*) (p.device + 2 * bytes), nullptr, nullptr};
+        device_maps[pass] = (const int*) (p.device + 3 * bytes + (size_t) rows * sizeof(int));
+        exl3_moe_rows_indexed_device_plan(g.data(), u.data(), d.data(), rows, impl_->d_x,
+            (const int*) (p.device + 3 * bytes), output, plan, stream, *impl_->workspace);
+    };
 
     impl_->jobs.clear();
     impl_->ram_pinned.assign((size_t) impl_->ram_slots, 0);
@@ -2023,7 +2611,15 @@ bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k,
     Impl::Layer* cache = (impl_->cache > 0 && layer >= 0 && layer < (int) impl_->layers.size() &&
                           k <= active) ? &impl_->layers[(size_t) layer] : nullptr;
     impl_->cur_layer = layer;
+    if (device_io) {
+        // Reserve for BOTH passes before any hit kernels enqueue: miss growth must never free
+        // scratch still being read by hits. No allocations occur against a pending peer wait.
+        const int ff = impl_->model->linear(impl_->expert_base(layer, ids[0]) + "gate_proj").out();
+        impl_->workspace->reserve_runtime_scratch(k, (int) n, ff, (int) n);
+    }
     if (cache != nullptr) {
+        if (!verify_graph_host_active()) impl_->observe_frequency(layer, ids, k);
+        auto score = impl_->slot_scores(*cache);
         hg.reserve((size_t) k); hu.reserve((size_t) k); hd.reserve((size_t) k);
         mg.reserve((size_t) k); mu.reserve((size_t) k); md.reserve((size_t) k);
         hrow.reserve((size_t) k); mrow.reserve((size_t) k);
@@ -2068,13 +2664,35 @@ bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k,
                 if (cache->filled < active) {
                     s = cache->filled++;                 // still filling: the slots are handed out in order
                 } else {
-                    s = (int) (std::min_element(cache->tick.begin(), cache->tick.begin() + active) -
-                               cache->tick.begin());
+                    s = -1;
+                    if (!verify_graph_host_active() && !impl_->frequency_policy) {
+                        s = (int) (std::min_element(cache->tick.begin(), cache->tick.begin() + active) -
+                                   cache->tick.begin());
+                    }
+                    for (int candidate = 0; (verify_graph_host_active() || impl_->frequency_policy) && candidate < active; ++candidate) {
+                        bool pinned = false;
+                        // Protect the current route set, including GPU snapshot hits omitted
+                        // from this compact miss call. Admission cannot overwrite live weights.
+                        for (int q = 0; q < k; ++q) {
+                            const auto at = cache->at.find(ids[q]);
+                            pinned |= at != cache->at.end() && at->second == candidate;
+                        }
+                        if (verify_graph_host_active()) {
+                            const auto& rec = impl_->verify_graph->record.host[layer];
+                            for (int q = 0; q < rec.routes; ++q) if (rec.hit[q]) {
+                                const auto at = cache->at.find(rec.ids[q]);
+                                pinned |= at != cache->at.end() && at->second == candidate;
+                            }
+                        }
+                        if (!pinned && impl_->prefer_victim(*cache, score, candidate, s)) s = candidate;
+                    }
+                    if (s < 0) throw std::runtime_error("exl3: no unpinned decode admission slot");
                     for (auto victim = cache->at.begin(); victim != cache->at.end(); ++victim)
                         if (victim->second == s) { cache->at.erase(victim); break; }
                 }
                 impl_->prepare_expert(*cache, s, e);
                 cache->at[e] = s;
+                if (impl_->frequency_policy) score[s] = cache->frequency.count[e];
             }
             cache->tick[(size_t) s] = ++cache->clock;
             if (resident) {
@@ -2094,14 +2712,20 @@ bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k,
             dm[(size_t) i] = impl_->scratch.dm[(size_t) i];
         }
         // no cache: nothing is resident, so the whole FFN follows the staging (the split has nothing to run early)
-        impl_->stage_parallel();
+        impl_->stage_parallel(run_stage || device_io);
         // the FFN reads the staged slots, so it waits the staging event HERE: the shared
         // `stage_done` wait below runs after these kernels are already queued, too late for them
         if (!impl_->jobs.empty() &&
             (cudaEventRecord(impl_->stage_done, impl_->work_stream) != cudaSuccess ||
              cudaStreamWaitEvent(st, impl_->stage_done, 0) != cudaSuccess))
             throw std::runtime_error("exl3: expert upload event failed");
-        exl3_moe_rows(gm.data(), um.data(), dm.data(), ids, k, impl_->d_x, impl_->d_rows, stream, impl_->workspace.get());
+        if (device_io) {
+            std::vector<int> identity((size_t) k);
+            for (int i = 0; i < k; ++i) identity[(size_t) i] = i;
+            dispatch(0, gm, um, dm, identity, impl_->d_rows);
+        } else {
+            exl3_moe_rows(gm.data(), um.data(), dm.data(), ids, k, impl_->d_x, impl_->d_rows, stream, impl_->workspace.get());
+        }
         // consumed: the shared tail below must not re-stage them (a duplicate copy would race
         // these kernels)
         impl_->jobs.clear();
@@ -2111,8 +2735,8 @@ bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k,
     // follows the staging copies on the same stream.  Without the split the whole FFN waited for the last
     // miss, which is most of the doorbell.
     if (!hrow.empty())
-        exl3_moe_rows_part(hg.data(), hu.data(), hd.data(), (int) hrow.size(), impl_->d_x, impl_->d_hit, stream, impl_->workspace.get());
-    impl_->stage_parallel();
+        dispatch(0, hg, hu, hd, hrow, impl_->d_hit);
+    impl_->stage_parallel(run_stage || device_io);
     const auto t_up1 = std::chrono::steady_clock::now();
     // the miss FFN (and the scatter) read what the staging wrote: order them after it
     if (!impl_->jobs.empty()) {
@@ -2120,21 +2744,34 @@ bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k,
         (void) cudaStreamWaitEvent(st, impl_->stage_done, 0);
     }
     if (!mrow.empty()) {
-        (void) cudaMemcpyAsync(impl_->d_hit_rows, hrow.data(), hrow.size() * sizeof(int), cudaMemcpyHostToDevice, st);
-        (void) cudaMemcpyAsync(impl_->d_miss_rows, mrow.data(), mrow.size() * sizeof(int), cudaMemcpyHostToDevice, st);
-        exl3_moe_rows_part(mg.data(), mu.data(), md.data(), (int) mrow.size(), impl_->d_x, impl_->d_miss, stream, impl_->workspace.get());
-        exl3_rows_scatter(impl_->d_hit, impl_->d_hit_rows, (int) hrow.size(), impl_->d_miss, impl_->d_miss_rows,
+        if (!device_io) {
+            (void) cudaMemcpyAsync(impl_->d_hit_rows, hrow.data(), hrow.size() * sizeof(int), cudaMemcpyHostToDevice, st);
+            (void) cudaMemcpyAsync(impl_->d_miss_rows, mrow.data(), mrow.size() * sizeof(int), cudaMemcpyHostToDevice, st);
+        }
+        dispatch(1, mg, mu, md, mrow, impl_->d_miss);
+        exl3_rows_scatter(impl_->d_hit, device_maps[0], (int) hrow.size(), impl_->d_miss, device_maps[1],
                           (int) mrow.size(), (int) n, impl_->d_rows, stream);
     } else if (!hrow.empty()) {
-        (void) cudaMemcpyAsync(impl_->d_hit_rows, hrow.data(), hrow.size() * sizeof(int), cudaMemcpyHostToDevice, st);
-        exl3_rows_scatter(impl_->d_hit, impl_->d_hit_rows, (int) hrow.size(), nullptr, nullptr, 0, (int) n,
+        if (!device_io)
+            (void) cudaMemcpyAsync(impl_->d_hit_rows, hrow.data(), hrow.size() * sizeof(int), cudaMemcpyHostToDevice, st);
+        exl3_rows_scatter(impl_->d_hit, device_maps[0], (int) hrow.size(), nullptr, nullptr, 0, (int) n,
                           impl_->d_rows, stream);
     }
     const auto t_ffn1 = std::chrono::steady_clock::now();
-    f16_to_f32_rows_kernel<<<(unsigned)((n * k + 255) / 256), 256, 0, st>>>(impl_->d_rows, impl_->d_out, n * k);
+    if (device_io && cpu_rows) for (int i = 0; i < k; ++i) if (cpu_rows[i])
+        if (cudaMemsetAsync(impl_->d_rows + (size_t) i * n, 0, (size_t) n * sizeof(uint16_t), st) != cudaSuccess)
+            throw std::runtime_error("exl3: cannot clear CPU-refused device row");
+    f16_to_f32_rows_kernel<<<(unsigned)((n * k + 255) / 256), 256, 0, st>>>(impl_->d_rows, device_io ? out : impl_->d_out, n * k);
+    if (device_io) return cudaGetLastError() == cudaSuccess;
     if (cudaMemcpyAsync(out, impl_->d_out, (size_t) n * k * 4, cudaMemcpyDeviceToHost, st) != cudaSuccess) return false;
     const cudaError_t se = cudaStreamSynchronize(st);
-    if (impl_->work_stream != nullptr) (void) cudaStreamSynchronize(impl_->work_stream);   // its copies feed this layer's FFN
+    // The staging-stream barrier only matters when THIS call staged something (a miss read): the
+    // FFN's own reads are already ordered by the stage_done event wait above, and the barrier's
+    // other job - holding the staging buffers until their DMAs drain before the next call reuses
+    // them - is vacuous when jobs is empty, which is every call of a warm window.  Output-
+    // identical either way; a sync of an idle non-blocking stream is pure latency.
+    if (impl_->work_stream != nullptr && !impl_->jobs.empty())
+        (void) cudaStreamSynchronize(impl_->work_stream);   // its copies feed this layer's FFN
     if (se != cudaSuccess) std::fprintf(stderr, "exl3 stream run(layer=%d): %s\n", layer, cudaGetErrorString(se));
     // The scatter above copied every k row from the device, refused ones included (garbage
     // there); the caller overwrites them, but zero them so a skipped overwrite can never leak
@@ -2175,7 +2812,7 @@ bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k,
 
 bool Exl3ExpertStream::run_multi(int layer, const float* x_f32, const int32_t* ids, int tokens, int k,
                                 float* out, void* stream, uint8_t* cpu_rows) {
-    return run_multi_impl(layer, x_f32, ids, tokens, k, out, stream, false, cpu_rows);
+    return run_multi_impl(layer, x_f32, ids, tokens, k, out, stream, false, cpu_rows, false, nullptr, false);
 }
 
 void Exl3ExpertStream::classify(int layer, const int32_t* ids, int tokens, int k, uint8_t* flags) const
@@ -2248,17 +2885,34 @@ void Exl3ExpertStream::classify(int layer, const int32_t* ids, int tokens, int k
 
 bool Exl3ExpertStream::run_device(int layer, const float* x_f32, const int32_t* ids, int tokens, int k,
                                  float* out, void* stream, const uint8_t* skip) {
-    return run_multi_impl(layer, x_f32, ids, tokens, k, out, stream, true, nullptr, false, skip);
+    return run_multi_impl(layer, x_f32, ids, tokens, k, out, stream, true, nullptr, false, skip, false);
 }
 
 bool Exl3ExpertStream::run_multi_complement(int layer, const float* x_f32, const int32_t* ids,
                                           int tokens, int k, float* out, void* stream, const uint8_t* cpu_skip) {
-    return run_multi_impl(layer, x_f32, ids, tokens, k, out, stream, false, nullptr, true, cpu_skip);
+    return run_multi_impl(layer, x_f32, ids, tokens, k, out, stream, false, nullptr, true, cpu_skip, false);
+}
+
+bool Exl3ExpertStream::window_complement_device_ready(int tokens, int k) const {
+    // The device complement rides the SAME pinned/packed dispatch slabs the T1 device arm
+    // requires (run_decode_device's gate): without them the arm's plan uploads would be
+    // pageable - the exact 2026-10-28 regression (five pageable pieces, ~0.5 ms/layer) -
+    // so the caller keeps the host-IO complement instead. Pure host query.
+    return impl_ != nullptr && impl_->primary_pack && impl_->pinned_plan &&
+           tokens > 0 && k > 0 && (int64_t) tokens * k <= impl_->pinned_plan_capacity;
+}
+
+bool Exl3ExpertStream::run_multi_complement_device(int layer, const float* x_device, const int32_t* ids,
+                                                   int tokens, int k, float* out_device, void* stream,
+                                                   const uint8_t* cpu_skip) {
+    if (!window_complement_device_ready(tokens, k)) return false;
+    return run_multi_impl(layer, x_device, ids, tokens, k, out_device, stream, true, nullptr, true,
+                          cpu_skip, true);
 }
 
 bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32_t* ids, int tokens, int k,
                                      float* out, void* stream, bool device_io, uint8_t* cpu_rows, bool skip_owned,
-                                     const uint8_t* cpu_skip) {
+                                     const uint8_t* cpu_skip, bool window_device) {
     if (tokens == 0) return true;
     if (tokens < 0 || k <= 0 || k > impl_->max_k || layer < impl_->layer_lo || layer >= impl_->layer_hi ||
         !x_f32 || !ids || !out || tokens > INT32_MAX / k) return false;
@@ -2295,9 +2949,15 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
             plan.drop_groups(drop);
             if (plan.experts.empty()) return true;
         }
-        if (!device_io && verify_graph_host_active()) {
+        if ((!device_io || window_device) && verify_graph_host_active()) {
             // The GPU's mask is the pre-admission snapshot, not a map that miss service may
             // mutate. Drop whole expert groups while retaining original destinations/tokens.
+            // window_device (STRATA_MIMO_WINDOW_DEVICE_MISSES): the device-input complement
+            // serves the SAME host bracket as the host-IO complement, so it drops the
+            // published hit groups the same way - the producer's inline kernels own those
+            // rows on another stream, and this arm must never write them. The prefill device
+            // arm (run_device) never runs under an open bracket and keeps the original
+            // !device_io behavior.
             const auto& rec = impl_->verify_graph->record.host[layer];
             std::vector<uint8_t> drop(plan.experts.size(), 0);
             for (size_t g = 0; g < plan.experts.size(); ++g)
@@ -2334,13 +2994,22 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
         // envelope - or one where anything would have to grow - simply stays on the indexed
         // GEMV, because a device allocation under the verify graph's flag-spin deadlocks and
         // the host callback must not allocate at all.
-        const bool small_m_on = impl_->small_m && !device_io && (impl_->own_table == nullptr || skip_owned) &&
+        const bool device_small = device_io && tokens <= 8 &&
+            strata::core::exl3_flag("STRATA_EXL3_DEVICE_SMALL_M", nullptr, false);
+        // window_device admits the HOST arm's small-M dispatch on the device complement:
+        // same threshold, same entry points (the packed grouped plan), so the arm matches
+        // the host complement's arithmetic at every shape instead of silently staying
+        // indexed where the host arm grouped (or the reverse).
+        const bool small_m_on = impl_->small_m && (!device_io || device_small || window_device) &&
+                                (impl_->own_table == nullptr || skip_owned || (device_small && cpu_skip)) &&
                                 std::min(tile, tokens * k) <= impl_->small_m_envelope;
         if (impl_->small_m_trace)
             std::fprintf(stderr, "smtrace call layer=%d tokens=%d k=%d groups=%zu small_m_on=%d\n",
                          layer, tokens, k, plan.experts.size(), (int) small_m_on);
         impl_->cur_layer = layer;
         auto* cache = impl_->cache > 0 ? &impl_->layers[(size_t) layer] : nullptr;
+        const bool frequency_selection = impl_->frequency_policy && (tokens == 1 || impl_->frequency_prefill);
+        if (cache && !verify_graph_host_active()) impl_->observe_frequency(layer, ids, tokens * k, tokens);
         // A loan's lent tail is outside every scan below: waves, fills and evictions only ever see
         // the active prefix, so staging never targets a rank the borrower owns.
         const int active = impl_->active;
@@ -2395,7 +3064,11 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
         // in flight while the next wave rebuilds its own bank, so bank (W-2)'s vectors are reused
         // only after wave W-2's wave_done event fires (see the wave loop).
         Impl::WaveHost default_host;   // preserve the baseline's call-local host arrays
-        const bool pipeline = device_io && impl_->pipe_stage;
+        // window_device never pipelines or takes the wave arm: those belong to the prefill
+        // device arm's pageable route tables and slot-release events. The device complement
+        // keeps the host-IO arm's call shape (one whole-window tile, per-call barrier), so
+        // its stream/lifetime contracts are the worker's existing ones.
+        const bool pipeline = device_io && !window_device && impl_->pipe_stage && !device_small;
         auto reserve_host = [&](Impl::WaveHost& bank) {
             bank.input_rows.reserve((size_t) tile);
             bank.route_g.reserve((size_t) tile); bank.route_u.reserve((size_t) tile); bank.route_d.reserve((size_t) tile);
@@ -2419,7 +3092,7 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
             }
             return true;
         };
-        const bool pin_plan=impl_->pinned_plan && !device_io && tokens*k<=impl_->pinned_plan_capacity;
+        const bool pin_plan=impl_->pinned_plan && (!device_io || device_small || window_device) && tokens*k<=impl_->pinned_plan_capacity;
         const bool pack_primary = impl_->primary_pack && pin_plan;
         auto indexed_entry=[&](int pass,const Exl3Mat* g,const Exl3Mat* u,const Exl3Mat* d,int rows,
                                const int* row_index,const int* host_rows,uint16_t* output) {
@@ -2489,7 +3162,7 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
         // before any tile of this call is queued.
         // wave_arm: one barrier per wave (not per tile).  STRATA_EXL3_PIPE pipelines the waves on
         // top of that granularity - it needs the wave batching, so it implies wave_arm.
-        const bool wave_arm = device_io && (impl_->wave_sync || impl_->pipe_stage);
+        const bool wave_arm = device_io && !window_device && !device_small && (impl_->wave_sync || impl_->pipe_stage);
         if (wave_arm) {
             size_t max_wave_routes = 0;
             int max_group_rows = 0;
@@ -2499,7 +3172,7 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
             }
             for (size_t g = 0; g < plan.experts.size(); ++g)
                 max_group_rows = std::max(max_group_rows, std::min(tile, plan.offsets[g + 1] - plan.offsets[g]));
-            const int ff = impl_->model->linear("model.language_model.layers." + std::to_string(layer) +
+            const int ff = impl_->model->linear(impl_->expert_prefix + std::to_string(layer) +
                                                 ".mlp.experts.0.gate_proj").out();
             impl_->workspace->reserve(std::max(1, std::min(15, max_group_rows)), n, ff, n, true);
             if (max_group_rows >= 16) {
@@ -2514,6 +3187,11 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
                 // rejected attempts. This upper bound prevents reallocation under queued copies.
                 for (auto& b : impl_->wave_host) b.groups.reserve(8 * plan.experts.size());
                 default_host.groups.reserve(8 * plan.experts.size());
+            }
+            if (impl_->recon_batch) {   // C2: the same bounded-append rule for its descriptors
+                for (auto& b : impl_->wave_host) b.groups.reserve((size_t) impl_->recon_batch_max * plan.experts.size());
+                if (!impl_->expert_batch)
+                    default_host.groups.reserve((size_t) impl_->recon_batch_max * plan.experts.size());
             }
         }
         // On an exception the local staging vectors above are destroyed during unwinding, before the
@@ -2576,6 +3254,8 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
             impl_->ram_pinned.assign((size_t) impl_->ram_slots, 0);
             // Slots referenced by this wave cannot be evicted until its final tile has completed.
             std::vector<uint8_t> pinned(cache ? (size_t) active : 0, 0);
+            std::array<float, 512> score{};
+            if (cache && frequency_selection) score = impl_->slot_scores(*cache);
             if (cache && verify_graph_host_active()) {
                 // The graph runs these hits concurrently with miss upload/compute. Keep their
                 // slots out of the replacement set until this callback has finished staging.
@@ -2590,6 +3270,9 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
             // The wave's per-group slot map: each group's slot is released (used event) right after
             // its last tile is queued, so later waves' staging may reuse it early.
             std::vector<int> wave_slots(pipeline ? end - first : 0);
+            // STRATA_EXL3_RECON_BATCH: per-wave "already consumed by an earlier batch" marks (a
+            // batch may take non-consecutive groups; the tile loop skips them at their boundary)
+            std::vector<uint8_t> recon_done(wave_arm && impl_->recon_batch ? end - first : 0, 0);
             std::vector<uint8_t> wave_scratch;   // only with an ownership table (default: none)
             if (impl_->own_table != nullptr && pipeline) wave_scratch.assign(end - first, 0);
             // STRATA_EXL3_OVERLAP wants this host-IO wave's groups classified hit/miss.  The
@@ -2627,7 +3310,7 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
                         else {
                             slot = -1;
                             for (int s = 0; s < active; ++s)
-                                if (!pinned[(size_t) s] && (slot < 0 || cache->tick[(size_t) s] < cache->tick[(size_t) slot]))
+                                if (!pinned[(size_t) s] && impl_->prefer_victim(*cache, score, s, slot))
                                     slot = s;
                             if (slot < 0) throw std::runtime_error("exl3: all expert slots pinned");
                             for (auto it = cache->at.begin(); it != cache->at.end(); ++it)
@@ -2646,6 +3329,7 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
                         // otherwise wait behind the verifier graph that is waiting for us.
                         impl_->prepare_expert(*cache, slot, expert, !skip_owned && !verify_graph_host_active());
                         cache->at[expert] = slot;
+                        if (frequency_selection) score[slot] = cache->frequency.count[expert];
                     }
                     pinned[(size_t) slot] = 1;
                     cache->tick[(size_t) slot] = ++cache->clock;
@@ -2882,6 +3566,13 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
                     const int rows = plan.offsets[group+1]-route;
                     ++impl_->group_hist[rows<16?0:rows<24?1:rows<64?2:rows<256?3:4];
                 }
+                // a group an earlier recon batch of THIS wave already computed: skip to its end
+                if (wave_arm && impl_->recon_batch && route == plan.offsets[group] &&
+                    recon_done[(size_t) (group - first)]) {
+                    route = plan.offsets[group + 1];
+                    ++group;
+                    continue;
+                }
                 if (wave_arm && impl_->expert_batch && impl_->wmma_group && route == plan.offsets[group]) {
                     const size_t begin = bank.groups.size();
                     int total = 0;
@@ -2896,6 +3587,14 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
                             break;
                         }
                         if ((rows >= 24) != (plan.offsets[group + 1] - route >= 24)) {
+                            if (timing) ++impl_->split_stops[2];
+                            break;
+                        }
+                        // one K per launch: the WMMA batch's trellis stride and decode form are
+                        // per-(bits, frac) - a K2/K2.5 mix (a MiMo layer routes both) ends the run
+                        // here and the next K starts its own batch on the following iteration
+                        if (gates[g - first].bits != gates[group - first].bits ||
+                            gates[g - first].frac != gates[group - first].frac) {
                             if (timing) ++impl_->split_stops[2];
                             break;
                         }
@@ -2932,7 +3631,89 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
                         else ++impl_->standalone_groups;
                     }
                 }
-                const int count = std::min(tile, (device_io ? plan.offsets[group + 1] : route_end) - route);
+                // STRATA_EXL3_RECON_BATCH: the same bounded-subgroup shape for the experts the
+                // WMMA arm cannot take (frac/low-K - MiMo), riding the batched reconstruction.
+                // Members are >=16-row groups of one shape ANYWHERE in the rest of the wave (the
+                // expert-ID plan interleaves big and small groups freely, so a consecutive-only
+                // rule strands about half the eligible groups as singletons), padded to the
+                // batch's widest group within a factor of two, cap `recon_batch_max` experts and
+                // 4096 padded rows (the reserved scratch envelope).  The batch's compacted
+                // input-row/destination tables upload to C2's own scratch; consumed members are
+                // marked in `recon_done` and skipped by the loop head below.  A refusal falls
+                // through to the standalone per-group tiles below.
+                if (wave_arm && impl_->recon_batch && route == plan.offsets[group] &&
+                    !recon_done[(size_t) (group - first)]) {
+                    const size_t begin = bank.groups.size();
+                    int total = 0, widest = 0;
+                    impl_->recon_rows_host.clear();
+                    impl_->recon_dest_host.clear();
+                    impl_->recon_members.clear();
+                    for (size_t g = group; g < end; ++g) {
+                        const int rows = plan.offsets[g + 1] - plan.offsets[g];
+                        const int take = (int) (bank.groups.size() - begin);
+                        if (recon_done[(size_t) (g - first)] || rows < 16 || rows > 4096) continue;
+                        if (take >= impl_->recon_batch_max) break;
+                        if (widest > 0 && (rows < (widest + 1) / 2 || rows > 2 * widest)) continue;  // padding <= 2x
+                        if ((take + 1) * std::max(widest, rows) > 4096) break;  // the padded-row envelope
+                        if (gates[g - first].ki != gates[group - first].ki ||
+                            gates[g - first].nj != gates[group - first].nj ||
+                            downs[g - first].nj != downs[group - first].nj) break;  // one shape per batch
+                        for (int r = plan.offsets[g]; r < plan.offsets[g + 1]; ++r) {
+                            impl_->recon_rows_host.push_back(plan.destinations[(size_t) r] / k);
+                            impl_->recon_dest_host.push_back(plan.destinations[(size_t) r]);
+                        }
+                        bank.groups.push_back({gates[g - first], ups[g - first], downs[g - first], total, rows});
+                        impl_->recon_members.push_back((int) (g - first));
+                        total += rows;
+                        widest = std::max(widest, rows);
+                    }
+                    const int groups = (int) (bank.groups.size() - begin);
+                    if (groups >= 2) {
+                        // the compacted token-row and destination tables, one pageable upload each
+                        // (consumed before the call returns, like every other host upload here)
+                        if (cudaMemcpyAsync(impl_->recon_scratch_rows, impl_->recon_rows_host.data(),
+                                            (size_t) total * sizeof(int), cudaMemcpyHostToDevice, st) != cudaSuccess ||
+                            cudaMemcpyAsync(impl_->recon_scratch_dest, impl_->recon_dest_host.data(),
+                                            (size_t) total * sizeof(int), cudaMemcpyHostToDevice, st) != cudaSuccess)
+                            throw std::runtime_error("exl3: recon batch plan upload failed");
+                    }
+                    if (groups >= 2 && exl3_moe_recon_batch(bank.groups.data() + begin, groups, batch.x.p,
+                            impl_->recon_scratch_rows, impl_->recon_scratch_dest,
+                            out, (void*) st, *impl_->workspace)) {
+                        if (prof) impl_->prof_arm_routes[4] += total;
+                        if (timing) {
+                            impl_->recon_groups += groups;
+                            impl_->recon_rows += total;
+                            ++impl_->recon_calls;
+                            // gather + 2 recon + 3 GEMM + round + silu + scatter; STRATA_EXL3_GEMM_FP16_OUT
+                            // writes the gate/up GEMMs straight to F16, dropping the round kernel
+                            impl_->ffn_launches += 9 - (exl3_gemm_fp16_out_enabled() ? 1 : 0);
+                            // the members' group_hist entries come from the loop head when the
+                            // tile walk later skips each one at its boundary - no double counting
+                        }
+                        // Bounded subgroup releases all readers here, rather than delaying the entire wave.
+                        for (int g = 0; pipeline && g < groups; ++g) {
+                            const size_t member = (size_t) impl_->recon_members[(size_t) g];
+                            if (cudaEventRecord((!wave_scratch.empty() && wave_scratch[member]
+                                                     ? &impl_->scratch : wave_blocks)
+                                                    ->used[(size_t) wave_slots[member]], st) != cudaSuccess)
+                                throw std::runtime_error("exl3: recon batch slot release failed");
+                        }
+                        for (int g = 0; g < groups; ++g) recon_done[(size_t) impl_->recon_members[(size_t) g]] = 1;
+                        route = plan.offsets[group + 1];
+                        group += 1;
+                        continue;
+                    }
+                    bank.groups.resize(begin);   // the refused descriptors are dead; drop them
+                    if (timing) {
+                        if (groups >= 2) ++impl_->recon_rejects;
+                        else ++impl_->recon_singles;
+                    }
+                }
+                // window_device keeps the HOST arm's whole-window tile boundary (all routes
+                // in one indexed/small-M pass); only the prefill device arm extends a tile to
+                // its group boundary for the tensor-core group arm below.
+                const int count = std::min(tile, ((device_io && !window_device) ? plan.offsets[group + 1] : route_end) - route);
                 const size_t tile_off = wave_arm ? (size_t) (route - route_base) : 0;
                 // The group containing this tile's FIRST route.  The input_rows build below
                 // ADVANCES `group` to the tile's last group, so capture the start here.
@@ -2955,7 +3736,7 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
                 const int* tile_rows = batch.input_rows.p + tile_off;
                 const long elements = (long) count * n;
                 if (timing && !wave_arm) (void) cudaEventRecord(impl_->profile[2], st);
-                if (device_io && count >= 16) {
+                if (device_io && !window_device && count >= 16) {
                     if (prof) impl_->prof_arm_routes[1] += count;   // group arm (wmma|gemm)
                     // STRATA_EXL3_WMMA=1: the gfx11 matrix-core group FFN (trellis decoded into the
                     // WMMA fragments, no FP16 weight materialized) against the reconstruct+hipBLAS path.
@@ -2966,11 +3747,15 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
                         // the group entry points touch, so none may grow - and free - under the tiles
                         // already queued.  A violation is a scheduling bug, never a workload condition.
                         throw std::runtime_error("exl3: wave-arm workspace would grow under queued tiles");
-                    if (!(impl_->wmma_group &&
-                          exl3_moe_group_wmma(tile_g[0], tile_u[0], tile_d[0], count, batch.x.p,
-                                              tile_rows, batch.output.p, (void*) st, *impl_->workspace)))
+                    if (impl_->wmma_group &&
+                        exl3_moe_group_wmma(tile_g[0], tile_u[0], tile_d[0], count, batch.x.p,
+                                            tile_rows, batch.output.p, (void*) st, *impl_->workspace))
+                        ++impl_->wmma_group_calls;
+                    else {
                         exl3_moe_group_gemm(tile_g[0], tile_u[0], tile_d[0], count, batch.x.p,
                                             tile_rows, batch.output.p, (void*) st, *impl_->workspace);
+                        ++impl_->group_gemm_calls;
+                    }
                 } else {
                     // STRATA_EXL3_SMALL_M (host-IO decode windows only; the device arms above are
                     // untouched): the grouped arm needs the tile to be a run of WHOLE groups - it
@@ -2981,7 +3766,7 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
                     if (impl_->small_m_trace)
                         std::fprintf(stderr, "smtrace tile route=%d count=%d group0=%d\n",
                                      route, count, (int) (route == plan.offsets[tile_group0]));
-                    if (small_m_on && !device_io && route == plan.offsets[tile_group0]) {
+                    if (small_m_on && (!device_io || device_small || window_device) && route == plan.offsets[tile_group0]) {
                         auto& gf = impl_->sm_gfirst[0]; auto& gr = impl_->sm_grows[0];
                         auto& gg = impl_->sm_gg[0]; auto& gu = impl_->sm_gu[0]; auto& gd = impl_->sm_gd[0];
                         gf.clear(); gr.clear(); gg.clear(); gu.clear(); gd.clear();
@@ -3016,12 +3801,30 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
                 }
                 if (timing && !wave_arm) (void) cudaEventRecord(impl_->profile[3], st);
                 if (device_io) {
-                    if (!wave_arm &&
+                    const int* scatter_dest = batch.destinations.p + tile_off;
+                    if (window_device) {
+                        // The device complement's destinations ride the SAME pinned slab the
+                        // packed plan used (its tail holds two spare int slots per route:
+                        // [3 mats + 3 ints, 3 mats + 4 ints) is untouched by both the indexed
+                        // pack [g|u|d|rows] and the grouped pack [g|u|d|first|rows]). One
+                        // small PINNED upload - never a pageable vector, the 2026-10-28
+                        // lesson the arm exists to fix.
+                        auto& p = impl_->host_plan[0];
+                        const size_t cap = (size_t) impl_->pinned_plan_capacity;
+                        const size_t dest_off = cap * (3 * sizeof(Exl3Mat) + 3 * sizeof(int));
+                        uint8_t* host = (uint8_t*) p.allocation + dest_off;
+                        uint8_t* dev = p.device + dest_off;
+                        std::memcpy(host, plan.destinations.data() + route, (size_t) count * sizeof(int));
+                        if (cudaMemcpyAsync(dev, host, (size_t) count * sizeof(int),
+                                            cudaMemcpyHostToDevice, st) != cudaSuccess)
+                            throw std::runtime_error("exl3: window device destination upload failed");
+                        scatter_dest = (const int*) dev;
+                    } else if (!wave_arm &&
                         cudaMemcpyAsync(batch.destinations.p, plan.destinations.data() + route, (size_t) count * sizeof(int),
                                         cudaMemcpyHostToDevice, st) != cudaSuccess)
                         throw std::runtime_error("exl3: destination upload failed");
                     scatter_route_output<<<(unsigned) ((elements + 255) / 256), 256, 0, st>>>(
-                        batch.output.p, batch.destinations.p + tile_off, out, count, n);
+                        batch.output.p, scatter_dest, out, count, n);
                     if (!wave_arm && sync_compute() != cudaSuccess)
                         throw std::runtime_error("exl3: device FFN failed");
                 } else {
@@ -3169,6 +3972,19 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
                     impl_->standalone_groups,impl_->batch_rejects,impl_->split_stops[0],impl_->split_stops[1],impl_->split_stops[2],impl_->split_stops[3]);
                 impl_->batch_groups=impl_->batch_calls=impl_->ffn_launches=impl_->standalone_groups=impl_->batch_rejects=0;
                 std::fill(std::begin(impl_->split_stops),std::end(impl_->split_stops),0);
+                if (impl_->recon_calls > 0 || impl_->recon_rejects > 0 || impl_->recon_singles > 0)
+                    std::fprintf(stderr, "exl3 recon batch: %lld subgroups, %lld experts / %lld routes "
+                                 "(8-9 dispatches/subgroup - 8 when STRATA_EXL3_GEMM_FP16_OUT drops "
+                                 "the round kernel; the ffn_launches estimate above tracks it); "
+                                 "rejected=%lld single-group starts=%lld\n",
+                                 impl_->recon_calls, impl_->recon_groups, impl_->recon_rows,
+                                 impl_->recon_rejects, impl_->recon_singles);
+                std::fprintf(stderr, "exl3 >=16-row group arms: wmma=%lld group_gemm=%lld "
+                             "(STRATA_EXL3_GEMM_FP16_OUT applies to group_gemm and the recon batch)\n",
+                             impl_->wmma_group_calls, impl_->group_gemm_calls);
+                impl_->wmma_group_calls = impl_->group_gemm_calls = 0;
+                impl_->recon_groups = impl_->recon_calls = impl_->recon_rows = 0;
+                impl_->recon_rejects = impl_->recon_singles = 0;
                 impl_->pipe_stage_ms = impl_->pipe_ffn_ms = impl_->pipe_overlap_ms = 0;
                 impl_->pipe_waves = 0;
             }
@@ -3177,7 +3993,7 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
             std::fprintf(stderr,
                 "exl3 prof [%d,%d) M=%d routes=%lld groups=%lld (groups==distinct experts, expert-major plan; "
                 "route reuse %.2fx): per-expert route rows 1:%lld 2:%lld 3:%lld 4:%lld 5:%lld 6-8:%lld 9-15:%lld "
-                ">=16:%lld; arm routes indexed:%lld group:%lld batch:%lld grouped-smallm:%lld; host elapsed "
+                ">=16:%lld; arm routes indexed:%lld group:%lld batch:%lld grouped-smallm:%lld recon-batch:%lld; host elapsed "
                 "plan %.3f prep %.3f join %.3f ms\n",
                 impl_->layer_lo, impl_->layer_hi, tokens,
                 (long long) impl_->prof_routes, (long long) impl_->prof_groups,
@@ -3188,6 +4004,7 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
                 (long long) impl_->prof_row_hist[6], (long long) impl_->prof_row_hist[7],
                 (long long) impl_->prof_arm_routes[0], (long long) impl_->prof_arm_routes[1],
                 (long long) impl_->prof_arm_routes[2], (long long) impl_->prof_arm_routes[3],
+                (long long) impl_->prof_arm_routes[4],
                 impl_->prof_plan_ms, impl_->prof_prep_ms, impl_->prof_join_ms);
             std::fprintf(stderr, "exl3 prof staging: jobs0:%lld 1:%lld 2:%lld 3:%lld 4:%lld 5..8:%lld >8:%lld\n",
                 impl_->prof_stage_jobs[0], impl_->prof_stage_jobs[1], impl_->prof_stage_jobs[2],

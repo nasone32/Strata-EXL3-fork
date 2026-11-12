@@ -237,6 +237,7 @@ def images_of(messages: list[dict]) -> list[str]:
 # a user quoting "</think>" used to hand the model a real end-of-reasoning token.  Before the template is rendered
 # they are swapped for these private-use characters, and the server encodes the spans they mark as ordinary text.
 THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
+THINK_OPEN = "<think>"
 # #554: the vision markers the same way.  They are special tokens only where the template writes them for an image
 # item; the same strings in a message's text (an agent reading chat_template.jinja, a tool result quoting it) became
 # the same special ids, so text with <|vision_start|><|image_pad|> before a picture took that picture's embeddings
@@ -329,6 +330,25 @@ def _keep_tool_result_wrap(content, tags: dict[str, str]):
             [{**content[-1], "text": wrap(texts[-1], False, True)}])
 
 
+def _unwrap_reasoning(text: str) -> str:
+    """An assistant turn's reasoning_content with a stored wrapper taken off.  This is wrapper compatibility,
+    not a text rule: the exact leading <think> (and the exact trailing </think>, which other servers also put
+    in) is what a server emits around this field when it returns the markers inside it - this one did, before
+    it consumed the model's own opening marker.  reasoning_content is the reasoning text, and every template
+    writes its own markers around the field again, so a stored wrapper doubled them and the re-rendered turn
+    no longer matched the tokens the model generated (the conversation cache's zero reuse).
+
+    The rule cannot eat live text: the reasoning this server returns no longer begins with a bare <think> (that
+    first one is consumed as structural) nor ends with a bare </think> (the real close never reaches the field,
+    and a quoted one keeps its quote around it); a tag written INSIDE the text, or quoted at its start, is the
+    text it is and is left for the literal marking, as is every other field (a user's text is not looked at)."""
+    if text.startswith(THINK_OPEN):
+        text = text[len(THINK_OPEN):]
+    if text.endswith(THINK_END):
+        text = text[:-len(THINK_END)]
+    return text
+
+
 def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str, str] = LITERAL_TAGS):
     """#537: (messages, tools) with every literal <think> / </think> (#554: and vision marker) in their text swapped for
     LITERAL_TAGS' marks (or `tags`': literal_tags() adds the control tokens' texts), and
@@ -342,6 +362,8 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
     for m in messages:
         m = dict(m)
         content = m.get("content")
+        if m.get("role") == "assistant" and isinstance(m.get("reasoning_content"), str):
+            m["reasoning_content"] = _unwrap_reasoning(m["reasoning_content"])
         mine = own if m.get("role") == "assistant" else tags
         for k, v in m.items():
             if k != "role":
@@ -879,6 +901,18 @@ class OutputParser:
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
+        # a template that does not pre-write the opening <think> (MiMo's generation prompt is only
+        # <|im_start|>assistant\n) has the model open its own thinking with that marker.  While this is True the
+        # stream's first tag is still allowed to arrive: it is structural (every template writes its own around
+        # reasoning_content again) and is consumed in feed(), never emitted as reasoning text - a client that
+        # sends the reasoning back must re-render the turn the model wrote, not "<think><think>".
+        self.opener = thinking
+        # set when that marker was actually consumed: the model opened its own thinking.  Such a family's
+        # template renders the answer straight after </think> (no blank line of its own), so the parser keeps
+        # the model's own leading newlines - after </think>, around a call - as the answer's text instead of
+        # dropping them for the template to re-write (a template that PRE-wrote the marker re-writes that blank
+        # line, and for those streams nothing changes).
+        self.self_opened = False
         self.schemas = {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
@@ -1195,6 +1229,20 @@ class OutputParser:
                 else:
                     return out
             elif self.state == "reasoning":
+                if self.opener:
+                    # The thinking's structural opening (#537's round trip): a template that does not pre-write the
+                    # <think> has the model write it as the stream's first tag, and that one is consumed here - the
+                    # template writes its own around reasoning_content again.  Held while the marker may still arrive
+                    # (it can be split across deltas); any other start (a template that pre-wrote it, or a quoted
+                    # tag - a quote or backtick first) opens the reasoning as it is, and a <think> written LATER in
+                    # the reasoning is the text it is.
+                    if self.buf.startswith(THINK_OPEN):
+                        self.buf, self.opener = self.buf[len(THINK_OPEN):], False
+                        self.self_opened = True
+                        continue
+                    if THINK_OPEN.startswith(self.buf):
+                        return out                     # still deciding: the marker may be split across deltas
+                    self.opener = False
                 if self.pending:
                     # calls wait for what follows: more calls or whitespace keep them, `</think>` makes them acts,
                     # any other text means they were quoted
@@ -1248,11 +1296,13 @@ class OutputParser:
                 self.fence, self.line, self.ticks = "", "", 0     # the answer's own text starts here
             elif self.state == "content":
                 if self.lead:                                   # newlines right after </think> or a call
-                    stripped = self.buf.lstrip("\n")
-                    if not stripped:
-                        self.buf = ""
-                        return out
-                    self.buf, self.lead = stripped, False
+                    if not self.self_opened:                    # a template that pre-wrote the marker re-writes
+                        stripped = self.buf.lstrip("\n")        # this blank line itself; one that did not (the
+                        if not stripped:                        # model opened its own thinking) renders the answer
+                            self.buf = ""                       # straight after the tag: its newlines are the
+                            return out                          # answer's own text and stay in it
+                        self.buf = stripped
+                    self.lead = False
                 i = self.buf.find(CALL_START)
                 b, decided = self._bare_opener() if self.recover and self.schemas else (-1, False)
                 if b >= 0 and (i < 0 or b < i):
@@ -1271,15 +1321,17 @@ class OutputParser:
                     continue
                 if i < 0:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
-                    # so emitting them early would make streamed and whole outputs differ.
+                    # so emitting them early would make streamed and whole outputs differ.  (self_opened keeps
+                    # them - such a template writes nothing before a call - so they can go out at once.)
                     j = len(self.buf) - self._hold(self.buf, (CALL_START,))
                     if self.recover and self.schemas:            # a line that may be becoming a bare <function=
                         k = self.buf.rfind("\n") + 1
                         tail = self.buf[k:]
                         if tail and FUNC_START.startswith(tail) and self._ok_at(k):
                             j = min(j, k)
-                    while j > 0 and self.buf[j - 1] == "\n":
-                        j -= 1
+                    if not self.self_opened:
+                        while j > 0 and self.buf[j - 1] == "\n":
+                            j -= 1
                     if j > 0:
                         out.append(Event("content", self._track(self.buf[:j])))
                         self.buf = self.buf[j:]
@@ -1300,8 +1352,9 @@ class OutputParser:
                 after = self.buf[i + len(CALL_START):].lstrip()
                 kind = self._follower(after) if self.recover else None
                 if kind in ("param", "json"):
-                    if i and self.buf[:i].strip():
-                        out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
+                    if i and (self.buf[:i] if self.self_opened else self.buf[:i].strip()):
+                        out.append(Event("content", self._track(
+                            self.buf[:i] if self.self_opened else self.buf[:i].rstrip("\n"))))
                     rest = self.buf[i + len(CALL_START):]
                     if kind == "param":                  # <parameter=NAME> as the opener: the call's <function=NAME>
                         at = len(rest) - len(after)
@@ -1317,14 +1370,16 @@ class OutputParser:
                     continue
                 if not after.startswith(FUNC_START):
                     j = i
-                    while j > 0 and self.buf[j - 1] == "\n":
-                        j -= 1
+                    if not self.self_opened:                     # a pre-written template puts its own blank
+                        while j > 0 and self.buf[j - 1] == "\n":  # line before a call; a self-opened one does not
+                            j -= 1
                     if j > 0:
                         out.append(Event("content", self._track(self.buf[:j])))
                         self.buf = self.buf[j:]
                     return out
-                if i and self.buf[:i].strip():
-                    out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
+                if i and (self.buf[:i] if self.self_opened else self.buf[:i].strip()):
+                    out.append(Event("content", self._track(
+                        self.buf[:i] if self.self_opened else self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
             elif self.state == "json":

@@ -1164,7 +1164,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (g_dense_mv() && w->exl3 != nullptr) {   // STRATA_EXL3_DENSE_MV: the trellis GEMV, n rows
                 const auto* m = (const strata::kernels::Exl3Mat*) w->exl3;
                 strata::kernels::exl3_dense_gemv_multi(0, xf, n_in, m->trellis, m->suh, m->svh, m->ki, m->nj,
-                                                       m->bits, m->cb, n, out, n_out, cs);
+                                                       m->bits, m->cb, n, out, n_out, cs, m->frac);
                 return;
             }
             if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out)) {
@@ -1207,7 +1207,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         const auto* mg = (const strata::kernels::Exl3Mat*) wg->exl3;
                         strata::kernels::exl3_dense_gemv_multi(0, xm, (long) N, mg->trellis, mg->suh, mg->svh,
                                                                mg->ki, mg->nj, mg->bits, mg->cb, n,
-                                                               z_ + (size_t) tb * ZV, (long) ZV, df_side_[1]);
+                                                               z_ + (size_t) tb * ZV, (long) ZV, df_side_[1],
+                                                               mg->frac);
                     } else
                     native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
                                 df_side_[1]);
@@ -1647,15 +1648,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 try {
                     strata::kernels::exl3_dense_gemv_multi(1, xm, N, mg->trellis, mg->suh, mg->svh, mg->ki, mg->nj,
                                                            mg->bits, mg->cb, n, sh_gate_ + (size_t) tb * g.n_ff,
-                                                           g.n_ff, sh_stream);
+                                                           g.n_ff, sh_stream, mg->frac);
                     strata::kernels::exl3_dense_gemv_multi(1, xm, N, mu->trellis, mu->suh, mu->svh, mu->ki, mu->nj,
                                                            mu->bits, mu->cb, n, sh_up_ + (size_t) tb * g.n_ff,
-                                                           g.n_ff, sh_stream);
+                                                           g.n_ff, sh_stream, mu->frac);
                     strata::kernels::exl3_silu_mul_f32(sh_gate_ + (size_t) tb * g.n_ff, sh_up_ + (size_t) tb * g.n_ff,
                                                        sh_up_ + (size_t) tb * g.n_ff, (int64_t) n * g.n_ff, sh_stream);
                     strata::kernels::exl3_dense_gemv_multi(1, sh_up_ + (size_t) tb * g.n_ff, g.n_ff, md->trellis,
                                                            md->suh, md->svh, md->ki, md->nj, md->bits, md->cb, n,
-                                                           shared_ + tb * N, N, sh_stream);
+                                                           shared_ + tb * N, N, sh_stream, md->frac);
                     bf16_gemv_fp32_mmvf_multi(xm, N, (const uint16_t*) wgi->data, sh_g_ + tb, 1, N, 1, n, sh_stream);
                     strata::kernels::exl3_sigmoid_scale_rows(shared_ + tb * N, sh_g_ + tb, (int) N, n, sh_stream);
                 } catch (const std::exception& e) {
@@ -1939,7 +1940,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 const auto* m = (const strata::kernels::Exl3Mat*) whead->exl3;
                 strata::kernels::exl3_dense_gemv_multi(0, head_mixed_, N, m->trellis, m->suh, m->svh, m->ki, m->nj,
-                                                       m->bits, m->cb, T, head_logits_, n_vocab_, cs);
+                                                       m->bits, m->cb, T, head_logits_, n_vocab_, cs, m->frac);
             } else
             for (int t = 0; t < T; ++t) {
                 BlockBuffers bb = ss.block;

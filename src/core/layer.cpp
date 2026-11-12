@@ -159,7 +159,7 @@ bool gemv_quantized(const WeightRef& w, const Planes& p, const strata::kernels::
                   std::to_string(m->nj * 16) + ")";
             return false;
         }
-        exl3_gemv_f32(x_f32, m->suh, m->svh, m->trellis, m->ki, m->nj, m->bits, m->cb, y, stream);
+        exl3_gemv_f32(x_f32, m->suh, m->svh, m->trellis, m->ki, m->nj, m->bits, m->cb, y, stream, m->frac);
         return true;
     }
     if (w.native_data) {

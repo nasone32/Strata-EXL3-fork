@@ -371,7 +371,7 @@ bool stage_exl3(Exl3Pack::Impl& im, const RoleSpec& r, const ModelGeometry& g, c
     if (!im.model.has(hf_base)) { err = "exl3: no EXL3 linear " + hf_base; return false; }
     Exl3Linear L;
     try { L = im.linear_tracked(hf_base); } catch (const std::exception& e) { err = e.what(); return false; }
-    const int words = 256 * L.bits / 16;
+    const int words = L.words();
     int nj = L.nj;
     const uint16_t* svh = L.svh;
     uint16_t* d_trellis = nullptr; uint16_t* d_suh = nullptr; uint16_t* d_svh = nullptr;
@@ -426,7 +426,7 @@ bool stage_exl3(Exl3Pack::Impl& im, const RoleSpec& r, const ModelGeometry& g, c
     bytes_out += (uint64_t) L.ki * nj * words * 2 + (uint64_t) L.in() * 2 + (uint64_t) nj * 16 * 2;
     auto* m = new strata::kernels::Exl3Mat;
     m->trellis = d_trellis; m->suh = d_suh; m->svh = d_svh;
-    m->ki = L.ki; m->nj = nj; m->bits = L.bits; m->cb = L.cb;
+    m->ki = L.ki; m->nj = nj; m->bits = L.bits; m->frac = L.frac; m->cb = L.cb;
     WeightRef w;
     w.exl3 = m;
     w.ne0 = L.in();
@@ -472,7 +472,7 @@ bool stage_exl3_requantized(Exl3Pack::Impl& im, const RoleSpec& r, const ModelGe
     Exl3Linear L;
     try { L = im.linear_tracked(hf_base); } catch (const std::exception& e) { err = e.what(); return false; }
     const int n_in = L.in(), n_out = L.out();
-    const int words = 256 * L.bits / 16;
+    const int words = L.words();
     auto fail = [&](const char* what, cudaError_t e) {
         err = std::string("exl3: ") + engine_name + ": " + what + ": " + cudaGetErrorString(e);
         return false;
@@ -515,7 +515,7 @@ bool stage_exl3_requantized(Exl3Pack::Impl& im, const RoleSpec& r, const ModelGe
     if (cudaMemcpy(d_suh, up_suh, (size_t) n_in * 2, cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(d_svh, up_svh, (size_t) n_out * 2, cudaMemcpyHostToDevice) != cudaSuccess)
         return fail("scale upload", cudaGetLastError());
-    strata::kernels::exl3_reconstruct_weight(d_tr, L.ki, L.nj, L.bits, L.cb, d_suh, d_svh, d_w, nullptr);
+    strata::kernels::exl3_reconstruct_weight(d_tr, L.ki, L.nj, L.bits, L.cb, d_suh, d_svh, d_w, nullptr, L.frac);
     // **THE RECONSTRUCT HANDS BACK [in][out]; A BLOCK QUANT STORES A ROW OF `n_in` PER OUTPUT.**  So the
     // weight is transposed on the GPU (a 32x32 tiled kernel) before it is downloaded and quantized.
     strata::kernels::exl3_transpose_f16(d_w, d_wt, n_in, n_out, nullptr);

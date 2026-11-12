@@ -1,0 +1,33 @@
+{#- A minimal chat template of the family whose generation prompt does NOT pre-write the opening <think>
+    (MiMo's is only <|im_start|>assistant\n, the model opens its own thinking), for CPU tests of the thinking
+    round trip.  The rendering contract this exercises, all of it load-bearing for prefix reuse:
+      * an assistant turn is  <|im_start|>assistant\n<think> reasoning </think> content <|im_end|>  with the
+        markers written by the template and nothing inserted around the reasoning or the content,
+      * the generation prompt adds no <think> (thinking on), or an empty <think></think> block (thinking off),
+      * tool calls render inline (no whitespace added), so a replayed turn re-encodes to the model's own tokens. -#}
+{%- macro text_of(content) -%}
+    {%- if content is string -%}{{- content -}}
+    {%- elif content is iterable -%}
+        {%- for p in content -%}{%- if 'text' in p -%}{{- p['text'] -}}{%- endif -%}{%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+{%- for message in messages -%}
+    {%- if message.role == 'assistant' -%}
+        {{- '<|im_start|>assistant\n<think>' ~ (message.reasoning_content if message.reasoning_content is string else '') ~ '</think>' ~ text_of(message.content) -}}
+        {%- for call in message.tool_calls or [] -%}
+            {%- set call = call.function if call.function is defined else call -%}
+            {{- '<tool_call><function=' ~ call.name ~ '>' -}}
+            {%- for name, value in (call.arguments or {}) | items -%}
+                {{- '<parameter=' ~ name ~ '>' ~ (value if value is string else value | tojson) ~ '</parameter>' -}}
+            {%- endfor -%}
+            {{- '</function></tool_call>' -}}
+        {%- endfor -%}
+        {{- '<|im_end|>' -}}
+    {%- else -%}
+        {{- '<|im_start|>' ~ message.role ~ '\n' ~ text_of(message.content) ~ '<|im_end|>' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|im_start|>assistant\n' -}}
+    {%- if enable_thinking is defined and enable_thinking is false -%}{{- '<think></think>' -}}{%- endif -%}
+{%- endif -%}

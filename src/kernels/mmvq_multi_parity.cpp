@@ -211,16 +211,20 @@ int sweep(bool exact, cudaStream_t s, Totals& t) {
 }  // namespace
 
 // A11 STRATA_MMVQ_BUNCH: the q|k|v (three widths) and qkv|z (two widths) bundles against the sequential
-// native_mmvq calls on the SAME q8_1 bytes - bitwise, every output, 2-6 columns.
+// native_mmvq calls on the SAME q8_1 bytes - bitwise, every output, 2-8 columns.  The MiMo v2 shapes ride
+// along (2026-11-05 dense-prefill design): q 12288 rows, k|v 768 (full) and 1536 (swa) rows, all at
+// n_in = 4096; the engine's verify windows reach T = 8, so the sweep does too.
 int bunch_parity(cudaStream_t s) {
     struct B { int n_out; };
     const struct { int n_in; int m; B b[3]; } cases[] = {
         {2560, 3, {{2048}, {512}, {512}}},   // QSA q|k|v
         {2560, 2, {{10240}, {640}, {0}}},    // GDN qkv|z
+        {4096, 3, {{12288}, {768}, {768}}},   // MiMo q|k|v, full-attention layer
+        {4096, 3, {{12288}, {1536}, {1536}}}, // MiMo q|k|v, SWA layer
     };
     int fails = 0;
     for (const auto& c : cases)
-        for (int T = 2; T <= 6; ++T) {
+        for (int T = 2; T <= 8; ++T) {
             std::mt19937 rng(777u + (unsigned) c.n_in + (unsigned) T);
             const std::size_t qall = strata::kernels::native_q8_1_bytes(c.n_in, T);
             void* xq = nullptr;
@@ -280,6 +284,460 @@ int bunch_parity(cudaStream_t s) {
     return fails;
 }
 
+// ---- P2/P1 (2026-11-05 dense-prefill design) -------------------------------------------------------
+//
+// wide_parity covers, all bitwise on finite outputs:
+//   * native_q8_0_mmvq_wide at NCOLS 16/32 vs the engine's TODAY path (8-column native_mmvq tiles) on the
+//     SAME q8_1 image - the MiMo dense shapes q 12288, kv 768/1536 (n_in 4096) and o 4096 (n_in 8192), with
+//     bounded normals and a saturation-scale magnitude pass, every output column checked written (sentinel);
+//   * native_mmvq_bunch_wide (q|k|v, one launch) vs those same per-matrix tiles;
+//   * P1's shared image: quantizing 32 columns at once == 8 at a time == 1 at a time, byte for byte;
+//   * P1's decode fallback: quantize once + native_q8_0_mmvq(1) == native_q8_0_f32(1);
+//   * native_q8_0_f32_wide == native_quantize_q8_1 + native_q8_0_mmvq_wide (and its quantized bytes);
+//   * the decline guards: multi_exact off (a declined f32_wide leaves the caller's scratch UNTOUCHED - no
+//     enqueue happens before eligibility is decided), a Q8_0-packed-registered weight, wrong widths (8/24),
+//     and STRATA_TSUM=1 / a gfx906 wave build, where the wide entries MUST decline (the exact-layout
+//     comparisons run only where the exact layout is the baseline).
+namespace {
+
+bool wide_env_allows() {
+    const char* t = std::getenv("STRATA_TSUM");
+    if (t && std::string(t) == "1") return false;
+#if defined(STRATA_HIP_GFX906)
+    const char* w = std::getenv("STRATA_MMVQ_WAVE");
+    if (!(w && std::string(w) == "0")) return false;   // the wave kernels are the baseline there
+#endif
+    return true;
+}
+
+std::vector<uint8_t> q8_0_weights(std::mt19937& rng, int n_in, int n_out) {
+    const std::size_t wb = strata::kernels::native_mmvq_weight_bytes(8, n_in, n_out);
+    std::vector<uint8_t> w(wb);
+    for (auto& b : w) b = (uint8_t) (rng() & 0xff);
+    const std::size_t nb = (std::size_t) n_out * (std::size_t) (n_in / 32);
+    for (std::size_t k = 0; k < nb; ++k) {   // Q80Block: a finite fp16 d at offset 0 (the file's data policy)
+        const uint16_t h = sane_half(rng);
+        std::memcpy(&w[k * 34], &h, 2);
+    }
+    return w;
+}
+
+}  // namespace
+
+int wide_parity(cudaStream_t s) {
+    using strata::kernels::native_mmvq;
+    using strata::kernels::native_mmvq_bunch_wide;
+    using strata::kernels::native_mmvq_set_multi_exact;
+    using strata::kernels::native_q8_0_f32_wide;
+    using strata::kernels::native_q8_0_mmvq_wide;
+    using strata::kernels::native_q8_1_bytes;
+    using strata::kernels::native_quantize_q8_1;
+    constexpr uint32_t SENTINEL = 0x7f7f7f7fu;   // cudaMemset 0x7f: ~3.4e38, unreachable for this data
+    int fails = 0;
+    const bool allow = wide_env_allows();
+    if (!allow)
+        std::printf("\nwide: STRATA_TSUM=1 or a gfx906 wave build - the wide entries must DECLINE here; the "
+                    "bitwise sections need the exact layout (on gfx906: STRATA_MMVQ_WAVE=0).\n");
+
+    // ---- the single-matrix wide launch vs today's 8-column tiles -------------------------------
+    struct S { int n_in, n_out; const char* what; };
+    std::vector<S> shapes = {{4096, 12288, "q"}, {4096, 768, "kv-full"}, {4096, 1536, "kv-swa"},
+                             {8192, 4096, "o"}};
+    const char* lm = std::getenv("STRATA_PARITY_LM");
+    if (lm && lm[0] == '1') shapes.push_back({4096, 152576, "lm_head"});   // ~633 MB of weights: opt-in
+    for (const S& sh : shapes)
+        for (int ncols : {16, 32})
+            for (float scale : {1.0f, 1000.0f}) {
+                std::mt19937 rng(91u + (unsigned) sh.n_in + (unsigned) sh.n_out + (unsigned) ncols +
+                                     (unsigned) int(scale));
+                const std::vector<uint8_t> w = q8_0_weights(rng, sh.n_in, sh.n_out);
+                std::vector<float> x((std::size_t) ncols * sh.n_in);
+                std::normal_distribution<float> nd(0.f, 1.f);
+                for (auto& v : x) v = nd(rng) * scale;   // bounded, then saturation-scale magnitudes
+                const std::size_t qall = strata::kernels::native_q8_1_wide_bytes(sh.n_in, ncols);
+                const std::size_t qcol = native_q8_1_bytes(sh.n_in, 1);
+                const std::size_t ybytes = (std::size_t) ncols * sh.n_out * 4;
+                void* dw = nullptr;
+                void* xq = nullptr;
+                float *dx = nullptr, *ywide = nullptr, *ybase = nullptr;
+                if (!ck(cudaMalloc(&dw, w.size()), "wide malloc w") || !ck(cudaMalloc(&xq, qall), "wide malloc xq") ||
+                    !ck(cudaMalloc(&dx, x.size() * 4), "wide malloc x") ||
+                    !ck(cudaMalloc(&ywide, ybytes), "wide malloc ywide") ||
+                    !ck(cudaMalloc(&ybase, ybytes), "wide malloc ybase"))
+                    return 1;
+                if (!ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "wide copy w") ||
+                    !ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "wide copy x"))
+                    return 1;
+                if (!ck(cudaMemset(ywide, 0x7f, ybytes), "wide sentinel") ||
+                    !ck(cudaMemset(ybase, 0x7f, ybytes), "base sentinel"))
+                    return 1;
+                strata::kernels::native_quantize_q8_1_wide(dx, xq, sh.n_in, ncols, s);   // ONE image, shared by both paths
+                for (int r = 0; r < ncols; r += 8)   // today's engine loop: 8-column native_mmvq tiles
+                    native_mmvq(8, dw, (const uint8_t*) xq + (std::size_t) r * qcol,
+                                ybase + (std::size_t) r * sh.n_out, sh.n_in, sh.n_out, 8, s);
+                const bool ran = native_q8_0_mmvq_wide(dw, xq, ywide, sh.n_in, sh.n_out, ncols, s);
+                if (!ck(cudaStreamSynchronize(s), "wide sync")) return 1;
+                bool bad = ran != allow;
+                long long diff = 0, nonf = 0, sentinel = 0;
+                if (ran) {
+                    std::vector<uint32_t> a((std::size_t) ncols * sh.n_out), b(a.size());
+                    if (!ck(cudaMemcpy(a.data(), ywide, ybytes, cudaMemcpyDeviceToHost), "wide read") ||
+                        !ck(cudaMemcpy(b.data(), ybase, ybytes, cudaMemcpyDeviceToHost), "base read"))
+                        return 1;
+                    for (std::size_t i = 0; i < a.size(); ++i) {
+                        float f;
+                        std::memcpy(&f, &a[i], 4);
+                        if (!std::isfinite(f)) ++nonf;
+                        if (a[i] == SENTINEL) ++sentinel;
+                        if (a[i] != b[i]) ++diff;
+                    }
+                }
+                bad = bad || diff != 0 || nonf != 0 || sentinel != 0;
+                if (bad) ++fails;
+                std::printf("wide %-8s n_in=%5d n_out=%6d nc=%2d scale=%5g: %s%lld differ, %lld non-finite, "
+                            "%lld unwritten\n",
+                            sh.what, sh.n_in, sh.n_out, ncols, scale,
+                            ran != allow ? (allow ? "DECLINED-BAD " : "RAN-BAD ") : "", diff, nonf, sentinel);
+                cudaFree(dw);
+                cudaFree(xq);
+                cudaFree(dx);
+                cudaFree(ywide);
+                cudaFree(ybase);
+            }
+
+    // ---- the q|k|v bundle at 16/32: one launch vs the same per-matrix 8-column tiles -------------
+    const struct { int n_out[3]; const char* what; } bq[] = {{{12288, 768, 768}, "full"},
+                                                             {{12288, 1536, 1536}, "swa"}};
+    for (const auto& c : bq)
+        for (int ncols : {16, 32}) {
+            std::mt19937 rng(4242u + (unsigned) c.n_out[1] + (unsigned) ncols);
+            std::vector<std::vector<uint8_t>> w;
+            for (int m = 0; m < 3; ++m) w.push_back(q8_0_weights(rng, 4096, c.n_out[m]));
+            std::vector<float> x((std::size_t) ncols * 4096);
+            std::normal_distribution<float> nd(0.f, 1.f);
+            for (auto& v : x) v = nd(rng);
+            const std::size_t qall = strata::kernels::native_q8_1_wide_bytes(4096, ncols);
+            const std::size_t qcol = native_q8_1_bytes(4096, 1);
+            void* dw[3] = {nullptr, nullptr, nullptr};
+            void* xq = nullptr;
+            float* dx = nullptr;
+            float *yb[3] = {nullptr, nullptr, nullptr}, *yu[3] = {nullptr, nullptr, nullptr};
+            bool alloc_ok = ck(cudaMalloc(&xq, qall), "bw malloc xq") &&
+                            ck(cudaMalloc(&dx, x.size() * 4), "bw malloc x") &&
+                            ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "bw copy x");
+            for (int m = 0; m < 3; ++m)
+                alloc_ok = alloc_ok && ck(cudaMalloc(&dw[m], w[m].size()), "bw malloc w") &&
+                           ck(cudaMemcpy(dw[m], w[m].data(), w[m].size(), cudaMemcpyHostToDevice), "bw copy w") &&
+                           ck(cudaMalloc(&yb[m], (std::size_t) ncols * c.n_out[m] * 4), "bw malloc yb") &&
+                           ck(cudaMalloc(&yu[m], (std::size_t) ncols * c.n_out[m] * 4), "bw malloc yu") &&
+                           ck(cudaMemset(yb[m], 0x7f, (std::size_t) ncols * c.n_out[m] * 4), "bw sentinel b") &&
+                           ck(cudaMemset(yu[m], 0x7f, (std::size_t) ncols * c.n_out[m] * 4), "bw sentinel u");
+            if (!alloc_ok) return 1;
+            strata::kernels::native_quantize_q8_1_wide(dx, xq, 4096, ncols, s);
+            for (int m = 0; m < 3; ++m)
+                for (int r = 0; r < ncols; r += 8)
+                    native_mmvq(8, dw[m], (const uint8_t*) xq + (std::size_t) r * qcol,
+                                yb[m] + (std::size_t) r * c.n_out[m], 4096, c.n_out[m], 8, s);
+            const bool ran = native_mmvq_bunch_wide(8, dw[0], dw[1], dw[2], xq, yu[0], yu[1], yu[2], 4096,
+                                                    c.n_out[0], c.n_out[1], c.n_out[2], ncols, s);
+            if (!ck(cudaStreamSynchronize(s), "bw sync")) return 1;
+            bool bad = ran != allow;
+            long long diff = 0, nonf = 0, sentinel = 0;
+            if (ran)
+                for (int m = 0; m < 3; ++m) {
+                    std::vector<uint32_t> a((std::size_t) ncols * c.n_out[m]), b(a.size());
+                    if (!ck(cudaMemcpy(a.data(), yu[m], a.size() * 4, cudaMemcpyDeviceToHost), "bw read u") ||
+                        !ck(cudaMemcpy(b.data(), yb[m], b.size() * 4, cudaMemcpyDeviceToHost), "bw read b"))
+                        return 1;
+                    for (std::size_t i = 0; i < a.size(); ++i) {
+                        float f;
+                        std::memcpy(&f, &a[i], 4);
+                        if (!std::isfinite(f)) ++nonf;
+                        if (a[i] == SENTINEL) ++sentinel;
+                        if (a[i] != b[i]) ++diff;
+                    }
+                }
+            bad = bad || diff != 0 || nonf != 0 || sentinel != 0;
+            if (bad) ++fails;
+            std::printf("wide bunch %-4s nc=%2d: %s%lld differ, %lld non-finite, %lld unwritten\n", c.what, ncols,
+                        ran != allow ? (allow ? "DECLINED-BAD " : "RAN-BAD ") : "", diff, nonf, sentinel);
+            for (int m = 0; m < 3; ++m) {
+                if (dw[m]) cudaFree(dw[m]);
+                if (yb[m]) cudaFree(yb[m]);
+                if (yu[m]) cudaFree(yu[m]);
+            }
+            cudaFree(xq);
+            cudaFree(dx);
+        }
+
+    // ---- P1's shared image: 32 columns at once == 8 at a time == 1 at a time, byte for byte -------
+    if (allow) {
+        const int n_in = 4096, ncols = 32;
+        std::mt19937 rng(31337u);
+        std::vector<float> x((std::size_t) ncols * n_in);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        for (auto& v : x) v = nd(rng);
+        const std::size_t qall = strata::kernels::native_q8_1_wide_bytes(n_in, ncols);
+        const std::size_t qcol = native_q8_1_bytes(n_in, 1);
+        float* dx = nullptr;
+        void *q32 = nullptr, *q8 = nullptr, *q1 = nullptr;
+        if (!ck(cudaMalloc(&dx, x.size() * 4), "qi malloc x") || !ck(cudaMalloc(&q32, qall), "qi malloc q32") ||
+            !ck(cudaMalloc(&q8, qall), "qi malloc q8") || !ck(cudaMalloc(&q1, qall), "qi malloc q1"))
+            return 1;
+        if (!ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "qi copy x")) return 1;
+        strata::kernels::native_quantize_q8_1_wide(dx, q32, n_in, ncols, s);
+        for (int r = 0; r < ncols; r += 8)
+            native_quantize_q8_1(dx + (std::size_t) r * n_in, (uint8_t*) q8 + (std::size_t) r * qcol, n_in, 8, s);
+        for (int j = 0; j < ncols; ++j)
+            native_quantize_q8_1(dx + (std::size_t) j * n_in, (uint8_t*) q1 + (std::size_t) j * qcol, n_in, 1, s);
+        if (!ck(cudaStreamSynchronize(s), "qi sync")) return 1;
+        std::vector<uint8_t> h32(qall), h8(qall), h1(qall);
+        if (!ck(cudaMemcpy(h32.data(), q32, qall, cudaMemcpyDeviceToHost), "qi read 32") ||
+            !ck(cudaMemcpy(h8.data(), q8, qall, cudaMemcpyDeviceToHost), "qi read 8") ||
+            !ck(cudaMemcpy(h1.data(), q1, qall, cudaMemcpyDeviceToHost), "qi read 1"))
+            return 1;
+        const bool same = h32 == h8 && h32 == h1;
+        if (!same) ++fails;
+        std::printf("wide q8_1 image: 32-at-once vs 8-at-a-time vs 1-at-a-time: %s\n",
+                    same ? "identical bytes" : "DIFFER");
+        cudaFree(dx);
+        cudaFree(q32);
+        cudaFree(q8);
+        cudaFree(q1);
+    }
+
+    // ---- P1's decode fallback: quantize once + mmvq(1) == native_q8_0_f32(1) ---------------------
+    if (allow)
+        for (const S& sh : std::vector<S>{{4096, 12288, "q"}, {4096, 768, "k/v-full"}, {4096, 1536, "k/v-swa"},
+                                          {8192, 4096, "o"}}) {
+            std::mt19937 rng(5150u + (unsigned) sh.n_out);
+            const std::vector<uint8_t> w = q8_0_weights(rng, sh.n_in, sh.n_out);
+            std::vector<float> x((std::size_t) sh.n_in);
+            std::normal_distribution<float> nd(0.f, 1.f);
+            for (auto& v : x) v = nd(rng);
+            const std::size_t q1 = native_q8_1_bytes(sh.n_in, 1);
+            void* dw = nullptr;
+            void* qa = nullptr;
+            void* qb = nullptr;
+            float *dx = nullptr, *ya = nullptr, *yb = nullptr;
+            if (!ck(cudaMalloc(&dw, w.size()), "nc1 malloc w") || !ck(cudaMalloc(&qa, q1), "nc1 malloc qa") ||
+                !ck(cudaMalloc(&qb, q1), "nc1 malloc qb") || !ck(cudaMalloc(&dx, x.size() * 4), "nc1 malloc x") ||
+                !ck(cudaMalloc(&ya, (std::size_t) sh.n_out * 4), "nc1 malloc ya") ||
+                !ck(cudaMalloc(&yb, (std::size_t) sh.n_out * 4), "nc1 malloc yb"))
+                return 1;
+            if (!ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "nc1 copy w") ||
+                !ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "nc1 copy x"))
+                return 1;
+            strata::kernels::native_q8_0_f32(dw, dx, qa, ya, sh.n_in, sh.n_out, 1, s);   // today's call
+            native_quantize_q8_1(dx, qb, sh.n_in, 1, s);                                 // the shared quantization
+            strata::kernels::native_q8_0_mmvq(dw, qb, yb, sh.n_in, sh.n_out, 1, s);
+            if (!ck(cudaStreamSynchronize(s), "nc1 sync")) return 1;
+            std::vector<uint32_t> a((std::size_t) sh.n_out), b(a.size());
+            std::vector<uint8_t> ha(q1), hb(q1);
+            if (!ck(cudaMemcpy(a.data(), ya, a.size() * 4, cudaMemcpyDeviceToHost), "nc1 read ya") ||
+                !ck(cudaMemcpy(b.data(), yb, b.size() * 4, cudaMemcpyDeviceToHost), "nc1 read yb") ||
+                !ck(cudaMemcpy(ha.data(), qa, q1, cudaMemcpyDeviceToHost), "nc1 read qa") ||
+                !ck(cudaMemcpy(hb.data(), qb, q1, cudaMemcpyDeviceToHost), "nc1 read qb"))
+                return 1;
+            const bool same = a == b && ha == hb;
+            if (!same) ++fails;
+            std::printf("wide nc=1 share %-9s (n_in %d, n_out %d): %s\n", sh.what, sh.n_in, sh.n_out,
+                        same ? "identical bytes" : "DIFFER");
+            cudaFree(dw);
+            cudaFree(qa);
+            cudaFree(qb);
+            cudaFree(dx);
+            cudaFree(ya);
+            cudaFree(yb);
+        }
+
+    // ---- the composed entry == its parts, including the quantized image --------------------------
+    if (allow) {
+        const int n_in = 4096, n_out = 12288, ncols = 32;
+        std::mt19937 rng(6060u);
+        const std::vector<uint8_t> w = q8_0_weights(rng, n_in, n_out);
+        std::vector<float> x((std::size_t) ncols * n_in);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        for (auto& v : x) v = nd(rng);
+        const std::size_t qall = strata::kernels::native_q8_1_wide_bytes(n_in, ncols);
+        void *dw = nullptr, *qa = nullptr, *qb = nullptr;
+        float *dx = nullptr, *ya = nullptr, *yb = nullptr;
+        if (!ck(cudaMalloc(&dw, w.size()), "cw malloc w") || !ck(cudaMalloc(&qa, qall), "cw malloc qa") ||
+            !ck(cudaMalloc(&qb, qall), "cw malloc qb") || !ck(cudaMalloc(&dx, x.size() * 4), "cw malloc x") ||
+            !ck(cudaMalloc(&ya, (std::size_t) ncols * n_out * 4), "cw malloc ya") ||
+            !ck(cudaMalloc(&yb, (std::size_t) ncols * n_out * 4), "cw malloc yb"))
+            return 1;
+        if (!ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "cw copy w") ||
+            !ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "cw copy x"))
+            return 1;
+        strata::kernels::native_quantize_q8_1_wide(dx, qa, n_in, ncols, s);
+        if (!native_q8_0_mmvq_wide(dw, qa, ya, n_in, n_out, ncols, s)) {
+            std::printf("wide composed: the parts ran but mmvq_wide declined - FAIL\n");
+            ++fails;
+        } else if (!native_q8_0_f32_wide(dw, dx, qb, yb, n_in, n_out, ncols, s)) {
+            std::printf("wide composed: f32_wide declined - FAIL\n");
+            ++fails;
+        } else {
+            if (!ck(cudaStreamSynchronize(s), "cw sync")) return 1;
+            std::vector<uint32_t> a((std::size_t) ncols * n_out), b(a.size());
+            std::vector<uint8_t> ha(qall), hb(qall);
+            if (!ck(cudaMemcpy(a.data(), ya, a.size() * 4, cudaMemcpyDeviceToHost), "cw read ya") ||
+                !ck(cudaMemcpy(b.data(), yb, b.size() * 4, cudaMemcpyDeviceToHost), "cw read yb") ||
+                !ck(cudaMemcpy(ha.data(), qa, qall, cudaMemcpyDeviceToHost), "cw read qa") ||
+                !ck(cudaMemcpy(hb.data(), qb, qall, cudaMemcpyDeviceToHost), "cw read qb"))
+                return 1;
+            const bool same = a == b && ha == hb;
+            if (!same) ++fails;
+            std::printf("wide composed f32_wide == quantize + mmvq_wide: %s\n",
+                        same ? "identical bytes" : "DIFFER");
+        }
+        cudaFree(dw);
+        cudaFree(qa);
+        cudaFree(qb);
+        cudaFree(dx);
+        cudaFree(ya);
+        cudaFree(yb);
+    }
+
+    // ---- decline guards ---------------------------------------------------------------------------
+    {
+        // multi_exact off: every new entry declines, bunch_supported reports false, and a declined
+        // f32_wide does not even enqueue the quantize (the caller's scratch bytes stay as they were)
+        native_mmvq_set_multi_exact(false);
+        if (strata::kernels::native_mmvq_bunch_supported(8, 4096, 4)) {
+            std::printf("guard: bunch_supported true under multi_exact off - FAIL\n");
+            ++fails;
+        }
+        const int n_in = 4096, n_out = 768;
+        std::mt19937 rng(77u);
+        const std::vector<uint8_t> w = q8_0_weights(rng, n_in, n_out);
+        std::vector<float> x((std::size_t) 32 * n_in);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        for (auto& v : x) v = nd(rng);
+        const std::size_t qall = strata::kernels::native_q8_1_wide_bytes(n_in, 32);
+        void *dw = nullptr, *scratch = nullptr;
+        float *dx = nullptr, *y = nullptr;
+        if (!ck(cudaMalloc(&dw, w.size()), "gd malloc w") || !ck(cudaMalloc(&scratch, qall), "gd malloc s") ||
+            !ck(cudaMalloc(&dx, x.size() * 4), "gd malloc x") ||
+            !ck(cudaMalloc(&y, (std::size_t) 32 * n_out * 4), "gd malloc y"))
+            return 1;
+        if (!ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "gd copy w") ||
+            !ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "gd copy x") ||
+            !ck(cudaMemset(scratch, 0xa5, qall), "gd sentinel"))
+            return 1;
+        if (native_q8_0_mmvq_wide(dw, scratch, y, n_in, n_out, 32, s) ||
+            native_q8_0_f32_wide(dw, dx, scratch, y, n_in, n_out, 16, s) ||
+            native_mmvq_bunch_wide(8, dw, dw, nullptr, scratch, y, y, nullptr, n_in, n_out, n_out, 0, 32, s)) {
+            std::printf("guard: a wide entry launched under multi_exact off - FAIL\n");
+            ++fails;
+        }
+        if (!ck(cudaStreamSynchronize(s), "gd sync")) return 1;
+        std::vector<uint8_t> h(qall);
+        if (!ck(cudaMemcpy(h.data(), scratch, qall, cudaMemcpyDeviceToHost), "gd read s")) return 1;
+        bool untouched = true;
+        for (uint8_t v : h)
+            if (v != 0xa5) untouched = false;
+        if (!untouched) {
+            std::printf("guard: declined f32_wide left the scratch untouched: FAIL (bytes were written)\n");
+            ++fails;
+        } else {
+            std::printf("guard: multi_exact off - all wide entries decline, scratch untouched\n");
+        }
+        cudaFree(dw);
+        cudaFree(scratch);
+        cudaFree(dx);
+        cudaFree(y);
+        native_mmvq_set_multi_exact(true);
+    }
+    {
+        // a Q8_0-packed-registered weight (STRATA_Q8_PACKED): the wide entries and the bunch decline
+        const int n_in = 1024, n_out = 2048;   // inside native_q8_0_packed_eligible's window
+        std::mt19937 rng(78u);
+        const std::vector<uint8_t> w = q8_0_weights(rng, n_in, n_out);
+        const std::size_t qall = strata::kernels::native_q8_1_wide_bytes(n_in, 32);
+        void *dw = nullptr, *packed = nullptr, *xq = nullptr;
+        float *y1 = nullptr, *y2 = nullptr;
+        if (!ck(cudaMalloc(&dw, w.size()), "gp malloc w") || !ck(cudaMalloc(&packed, w.size()), "gp malloc p") ||
+            !ck(cudaMalloc(&xq, qall), "gp malloc xq") ||
+            !ck(cudaMalloc(&y1, (std::size_t) 32 * n_out * 4), "gp malloc y1") ||
+            !ck(cudaMalloc(&y2, (std::size_t) 32 * n_out * 4), "gp malloc y2"))
+            return 1;
+        if (!ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "gp copy w")) return 1;
+        strata::kernels::native_q8_0_packed_register(dw, packed, n_in, n_out);
+        const bool declined =
+            !native_q8_0_mmvq_wide(dw, xq, y1, n_in, n_out, 32, s) &&
+            !native_q8_0_f32_wide(dw, y1, xq, y1, n_in, n_out, 16, s) &&
+            !native_mmvq_bunch_wide(8, dw, dw, nullptr, xq, y1, y2, nullptr, n_in, n_out, n_out, 0, 32, s) &&
+            !strata::kernels::native_mmvq_bunch(8, dw, dw, nullptr, xq, y1, y2, nullptr, n_in, n_out, n_out, 0,
+                                                 4, s);
+        strata::kernels::native_q8_0_packed_unregister(dw);
+        if (!declined) {
+            std::printf("guard: a packed-registered weight must decline every fused/wide entry - FAIL\n");
+            ++fails;
+        } else {
+            std::printf("guard: Q8_0-packed weight - wide/bunch/bunch_wide all decline\n");
+        }
+        cudaFree(dw);
+        cudaFree(packed);
+        cudaFree(xq);
+        cudaFree(y1);
+        cudaFree(y2);
+    }
+    {   // misaligned pointers, n_out3 < 0 and a grid sum past dim3.x/int all decline BEFORE any enqueue -
+        // the bool contract, not a throw; odd pointers never reach the registry lookup or CUDA
+        void* odd = reinterpret_cast<void*>(0x10002);   // 2-byte aligned only
+        void* aligned = reinterpret_cast<void*>(0x10000);
+        float* odd_y = reinterpret_cast<float*>(0x1000a);
+        const bool ok = !native_q8_0_mmvq_wide(odd, aligned, odd_y, 4096, 768, 32, s) &&
+                        !native_q8_0_mmvq_wide(aligned, odd, odd_y, 4096, 768, 32, s) &&
+                        !native_q8_0_mmvq_wide(aligned, aligned, odd_y, 4096, 768, 32, s) &&
+                        !native_q8_0_f32_wide(odd, (const float*) aligned, aligned, odd_y, 4096, 768, 16, s) &&
+                        !native_q8_0_f32_wide(aligned, (const float*) odd, aligned, odd_y, 4096, 768, 16, s) &&
+                        !native_q8_0_f32_wide(aligned, (const float*) aligned, odd, odd_y, 4096, 768, 16, s) &&
+                        !native_mmvq_bunch_wide(8, odd, aligned, nullptr, aligned, odd_y, odd_y, nullptr, 4096,
+                                                768, 768, 0, 32, s) &&
+                        !native_mmvq_bunch_wide(8, aligned, aligned, nullptr, odd, odd_y, odd_y, nullptr, 4096,
+                                                768, 768, 0, 32, s) &&
+                        !native_mmvq_bunch_wide(8, aligned, aligned, nullptr, aligned, odd_y, odd_y, nullptr,
+                                                4096, 768, 768, -1, 32, s) &&   // n_out3 < 0: rejected
+                        !native_q8_0_mmvq_wide(aligned, aligned, odd_y, 4096, 0, 32, s) &&   // n_out <= 0
+                        !native_q8_0_mmvq_wide(aligned, aligned, reinterpret_cast<float*>(aligned), 4096, 768,
+                                                32, nullptr) &&   // null stream
+                        !native_mmvq_bunch_wide(8, aligned, aligned, aligned, aligned,
+                                                reinterpret_cast<float*>(0x10000),
+                                                reinterpret_cast<float*>(0x10000),
+                                                reinterpret_cast<float*>(0x10000), 4096, 2147483647,
+                                                2147483647, 2147483647, 32,
+                                                s);   // summed grid > dim3.x: rejected in 64 bits
+        if (!ok) {
+            std::printf("guard: alignment / n_out3 / overflow rejections wrong - FAIL\n");
+            ++fails;
+        } else {
+            std::printf("guard: misaligned ptrs, n_out3 < 0, null stream and grid overflow all decline\n");
+        }
+    }
+    {   // the width table: 8 and 24 are not wide (the 1..8 cap elsewhere is untouched); bunch_supported
+        // answers its own table under the default layout
+        void* dummy = reinterpret_cast<void*>(16);   // eligibility-only calls never enqueue
+        const bool widths_ok = !native_q8_0_mmvq_wide(dummy, dummy, nullptr, 4096, 768, 8, s) &&
+                               !native_q8_0_mmvq_wide(dummy, dummy, nullptr, 4096, 768, 24, s);
+        bool table_ok = widths_ok;
+        for (int nc = 2; nc <= 8; ++nc)
+            table_ok = strata::kernels::native_mmvq_bunch_supported(8, 4096, nc) && table_ok;
+        table_ok = table_ok && !strata::kernels::native_mmvq_bunch_supported(8, 4096, 1) &&
+                   !strata::kernels::native_mmvq_bunch_supported(8, 4096, 9) &&
+                   !strata::kernels::native_mmvq_bunch_supported(8, 64, 4) &&
+                   !strata::kernels::native_mmvq_bunch_supported(2, 4096, 4);
+        if (!table_ok) {
+            std::printf("guard: width/eligibility table wrong - FAIL\n");
+            ++fails;
+        } else {
+            std::printf("guard: widths 8/24 decline; bunch_supported table ok (nc 2..8 yes, 1/9/short/type no)\n");
+        }
+    }
+    return fails;
+}
+
 int main() {
     cudaStream_t s;
     if (!ck(cudaStreamCreate(&s), "stream create")) return 1;
@@ -289,6 +747,7 @@ int main() {
     const int bad = sweep(true, s, on);
     const int bad_off = sweep(false, s, off);
     strata::kernels::native_mmvq_set_multi_exact(true);   // back to the default
+    const int bad_wide = wide_parity(s);   // the default layout restored: wide needs it
 
     std::printf("\nmulti_exact on:   %lld outputs compared, %lld differ bitwise, %lld non-finite\n",
                 on.checked, on.diff, on.nonfinite);
@@ -303,6 +762,13 @@ int main() {
     if (bad_bunch != 0) {
         std::printf("\nmmvq_multi_parity: FAILED. %d bunch case(s) differ from the sequential calls or were declined.\n",
                     bad_bunch);
+        return 1;
+    }
+    if (bad_wide != 0) {
+        std::printf("\nmmvq_multi_parity: FAILED. %d wide/fused case(s) differ from the 8-column tiles, were "
+                    "declined where they must run, ran where they must decline, or wrote bytes on a declined "
+                    "call.\n",
+                    bad_wide);
         return 1;
     }
     if (bad != 0 || bad_off != 0) {

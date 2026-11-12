@@ -1,4 +1,61 @@
-# AMD community-test snapshot: validation
+# Release validation
+
+## 2026-11-12 update
+
+Prepared as a direct child of the published `3be44426` snapshot. The release
+checkout was built separately from the development checkout; the latter's
+uncommitted work, model assets and packed generations were not replaced.
+
+- Clean HIP/gfx1100 builds of the published baseline and updated `strata` target
+  succeeded with the same ROCm core-7.14 compiler and local pinned llama.cpp tree.
+  A fresh network dependency fetch was not tested. CUDA/SYCL compilers were not
+  available; Windows, Metal, RDNA4 and other machines were not validated.
+- The Qwen gfx1100 fast settings are now engine defaults, preserving explicit
+  environment values including `0`. Memory mode, topology, CPU policy, repacking,
+  affinity, adaptation and drafter selection remain choices. Launchers no longer
+  depend on developer model paths or private benchmark configs.
+- **36 real-model requests** completed: 3.05/4.05 bpw, published vs updated on two
+  GPUs, plus updated 4.05 bpw on one GPU with CPU assistance off vs CPU assistance
+  and RAM repacking on. CODE/PROSE twice each (512 generated tokens), full 32768
+  input tokens twice (16 generated tokens). Every request's counts were checked;
+  no prefix/checkpoint reuse. Individual results and output differences are in
+  [the benchmark record](../bench/release-2026-11-12/README.md). These compare
+  profiles, not isolated flags. Startup is excluded; published ran first.
+- CTest: **8/8 passed**: `exl3_flags_test`, `mimo_config_test`, `exl3_frac_k_test`,
+  `exl3_band8_store_test`, `exl3_moe_multi_parity`, `exl3_peer_test`,
+  `mimo_window_cpu_plan_test`, `mimo_engine_parity`.
+- Extra integration checks: `exl3_qwen_band8_test` PASS (0 failures),
+  `mimo_band8_parity` **115 PASS**, and synthetic `mimo_dflash_parity` OK. Its
+  optional real-model DFlash check was skipped because no model was selected.
+- Python: portable launcher **10 tests**, packed-artifact CLI **21 tests** with
+  the real CPU helper, tokenizer **2 tests**, server/family/thinking/history
+  **39 tests**, all passed. Loader checks: **6 passed, 7 skipped** (optional wave
+  checker/CLI gates not selected). Shell syntax and patch-whitespace checks passed.
+- Tests now use OS temporary directories instead of a developer-specific scratch
+  path. A fresh test build exposed a missing dependency on the `strata-mimo`
+  sibling CLI; that dependency was added, and the full 115-check run then passed.
+  This was test packaging, not an inference change.
+- Models, caches, compiled binaries, private configs, development notes and
+  profiler captures are not part of the release commit. Benchmark JSON includes
+  the exact binary/source hashes and uses path placeholders.
+
+### Remaining limits
+
+Mixed Qwen quants remain untested. Packed Qwen with a peer retains its unresolved
+full-engine output divergence and explicit experimental guard; one GPU plus CPU
+is the validated packed composition. CPU/GPU policy changes can change token
+choices. MiMo's peer teardown may report a sticky invalid-argument diagnostic;
+worker-error release is tested, but silent last-layer hangs and GPU-wedging faults
+are not automatically recovered. No broad speed or fault-recovery claim is made.
+
+Existing community RDNA4/build/layer-split proposals are tracked in the fork's
+open issues/PRs; they were not silently merged into this gfx1100 update. In
+particular, this validation builds named targets, not every upstream diagnostic
+target, and is not an RDNA4 build check.
+
+---
+
+## Historical snapshot: 2026-10-26
 
 Measured on 2026-10-26: Linux, ROCm core-7.14, Ryzen 9 7950X (16 physical cores, 32 logical CPUs), two RX 7900 XTX cards (gfx1100), Qwen3.8-NEXT EXL3 3 bpw. The peer retained its 4096 MiB reserve. This is not RDNA4 or NVIDIA validation.
 

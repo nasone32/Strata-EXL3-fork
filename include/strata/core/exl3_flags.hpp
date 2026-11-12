@@ -57,4 +57,31 @@ inline std::vector<std::string> apply_exl3_defaults() {
     return set;
 }
 
+/// Qwen's tested fast path, selected by the engine, not by a shell recipe.
+/// Only the measured gfx1100 family is selected automatically. Other backends
+/// retain their previous dispatch. No memory, CPU, topology or repack policy here.
+inline std::vector<std::string> apply_exl3_fast_defaults(bool gfx1100) {
+    std::vector<std::string> changed;
+    if (!gfx1100) return changed;
+    const std::pair<const char*, const char*> defaults[] = {
+        {"STRATA_EXL3_RDNA", "1"}, {"STRATA_EXL3_FUSE", "3"},
+        {"STRATA_EXL3_WMMA", "1"}, {"STRATA_WMMA_GEMM", "1"},
+        {"STRATA_HIP_WMMA", "1"}, {"STRATA_EXL3_RDNA_NATIVE", "1"},
+        {"STRATA_EXL3_NATIVE_GROUPED", "1"}, {"STRATA_EXL3_WMMA_STG_PAD", "1"},
+        {"STRATA_EXL3_PRIMARY_MULTIROW", "2"}, {"STRATA_EXL3_PEER_MULTIROW", "4"},
+        {"STRATA_EXL3_EXPERT_BATCH", "1"}, {"STRATA_EXL3_PEER_BATCH", "1"},
+        {"STRATA_EXL3_RESIDENT_DIRECT_DMA", "1"},
+    };
+    for (const auto& [key, value] : defaults) {
+        if (exl3_env(key)) continue; // explicit 0 is a real override
+#if defined(_WIN32)
+        _putenv_s(key, value);
+#else
+        setenv(key, value, 1);
+#endif
+        changed.emplace_back(key);
+    }
+    return changed;
+}
+
 }  // namespace strata::core

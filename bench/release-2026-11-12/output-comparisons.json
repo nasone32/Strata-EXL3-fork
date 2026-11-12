@@ -1,0 +1,218 @@
+[
+  {
+    "batch": "two-gpu",
+    "quant": "3.05",
+    "prompt": "CODE",
+    "run": 1,
+    "arms": [
+      "published",
+      "candidate"
+    ],
+    "identical_output_ids": true,
+    "first_differing_index": null
+  },
+  {
+    "batch": "two-gpu",
+    "quant": "3.05",
+    "prompt": "CODE",
+    "run": 2,
+    "arms": [
+      "published",
+      "candidate"
+    ],
+    "identical_output_ids": true,
+    "first_differing_index": null
+  },
+  {
+    "batch": "two-gpu",
+    "quant": "3.05",
+    "prompt": "PROSE",
+    "run": 1,
+    "arms": [
+      "published",
+      "candidate"
+    ],
+    "identical_output_ids": false,
+    "first_differing_index": 10
+  },
+  {
+    "batch": "two-gpu",
+    "quant": "3.05",
+    "prompt": "PROSE",
+    "run": 2,
+    "arms": [
+      "published",
+      "candidate"
+    ],
+    "identical_output_ids": false,
+    "first_differing_index": 94
+  },
+  {
+    "batch": "two-gpu",
+    "quant": "3.05",
+    "prompt": "PREFILL32K",
+    "run": 1,
+    "arms": [
+      "published",
+      "candidate"
+    ],
+    "identical_output_ids": true,
+    "first_differing_index": null
+  },
+  {
+    "batch": "two-gpu",
+    "quant": "3.05",
+    "prompt": "PREFILL32K",
+    "run": 2,
+    "arms": [
+      "published",
+      "candidate"
+    ],
+    "identical_output_ids": true,
+    "first_differing_index": null
+  },
+  {
+    "batch": "two-gpu",
+    "quant": "4.05",
+    "prompt": "CODE",
+    "run": 1,
+    "arms": [
+      "published",
+      "candidate"
+    ],
+    "identical_output_ids": true,
+    "first_differing_index": null
+  },
+  {
+    "batch": "two-gpu",
+    "quant": "4.05",
+    "prompt": "CODE",
+    "run": 2,
+    "arms": [
+      "published",
+      "candidate"
+    ],
+    "identical_output_ids": false,
+    "first_differing_index": 357
+  },
+  {
+    "batch": "two-gpu",
+    "quant": "4.05",
+    "prompt": "PROSE",
+    "run": 1,
+    "arms": [
+      "published",
+      "candidate"
+    ],
+    "identical_output_ids": false,
+    "first_differing_index": 69
+  },
+  {
+    "batch": "two-gpu",
+    "quant": "4.05",
+    "prompt": "PROSE",
+    "run": 2,
+    "arms": [
+      "published",
+      "candidate"
+    ],
+    "identical_output_ids": false,
+    "first_differing_index": 6
+  },
+  {
+    "batch": "two-gpu",
+    "quant": "4.05",
+    "prompt": "PREFILL32K",
+    "run": 1,
+    "arms": [
+      "published",
+      "candidate"
+    ],
+    "identical_output_ids": true,
+    "first_differing_index": null
+  },
+  {
+    "batch": "two-gpu",
+    "quant": "4.05",
+    "prompt": "PREFILL32K",
+    "run": 2,
+    "arms": [
+      "published",
+      "candidate"
+    ],
+    "identical_output_ids": true,
+    "first_differing_index": null
+  },
+  {
+    "batch": "one-gpu",
+    "quant": "4.05",
+    "prompt": "CODE",
+    "run": 1,
+    "arms": [
+      "native-gpu-only",
+      "cpu-ram-repack"
+    ],
+    "identical_output_ids": false,
+    "first_differing_index": 357
+  },
+  {
+    "batch": "one-gpu",
+    "quant": "4.05",
+    "prompt": "CODE",
+    "run": 2,
+    "arms": [
+      "native-gpu-only",
+      "cpu-ram-repack"
+    ],
+    "identical_output_ids": false,
+    "first_differing_index": 357
+  },
+  {
+    "batch": "one-gpu",
+    "quant": "4.05",
+    "prompt": "PROSE",
+    "run": 1,
+    "arms": [
+      "native-gpu-only",
+      "cpu-ram-repack"
+    ],
+    "identical_output_ids": false,
+    "first_differing_index": 6
+  },
+  {
+    "batch": "one-gpu",
+    "quant": "4.05",
+    "prompt": "PROSE",
+    "run": 2,
+    "arms": [
+      "native-gpu-only",
+      "cpu-ram-repack"
+    ],
+    "identical_output_ids": false,
+    "first_differing_index": 39
+  },
+  {
+    "batch": "one-gpu",
+    "quant": "4.05",
+    "prompt": "PREFILL32K",
+    "run": 1,
+    "arms": [
+      "native-gpu-only",
+      "cpu-ram-repack"
+    ],
+    "identical_output_ids": true,
+    "first_differing_index": null
+  },
+  {
+    "batch": "one-gpu",
+    "quant": "4.05",
+    "prompt": "PREFILL32K",
+    "run": 2,
+    "arms": [
+      "native-gpu-only",
+      "cpu-ram-repack"
+    ],
+    "identical_output_ids": true,
+    "first_differing_index": null
+  }
+]

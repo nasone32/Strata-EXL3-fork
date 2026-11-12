@@ -742,26 +742,41 @@ function apiMessages() {
 // their results (as the model read them), then the rest - so the next question can build on what the tools found.
 function assistantMessages(m) {
   const ran = (m.tools || []).filter((t) => t.round != null && t.result != null && t.state !== "skipped");
+  const reasoning = m.reasoning || "", text = m.text || "";   // an older saved chat may miss either
   // #1392: a turn with no answer text (only reasoning, a stop before the first content token, or an error) still goes
   // back as an assistant turn, so the history keeps alternating and a reasoning model sees that it already answered.
   // The server leaves such a turn out of the prompt itself (serve/frontend.py, #843); reasoning_content rides along.
+  // The reasoning is sent beside a completed answer too: the server re-renders the turn with its own <think>
+  // markers, and the engine reuses the tokens it already holds instead of reading the whole conversation again.
   if (!ran.length) {
-    const msg = {role: "assistant", content: m.text || ""};
-    if (!m.text && m.reasoning) msg.reasoning_content = m.reasoning;
+    const msg = {role: "assistant", content: text};
+    if (reasoning) msg.reasoning_content = reasoning;
     return [msg];
   }
   const out = [];
-  let pos = 0;
+  let pos = 0, rpos = 0;                 // the answer's text / thinking position the next round starts at
+  const ratOf = (t) => Math.min(t.rat ?? reasoning.length, reasoning.length);   // an old chat's mark can overshoot
   for (const r of [...new Set(ran.map((t) => t.round))]) {
     const calls = ran.filter((t) => t.round === r);
-    const at = Math.min(Math.max(pos, calls[0].at || 0), m.text.length);
-    out.push({role: "assistant", content: m.text.slice(pos, at).trim(),
-              tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))});
+    const at = Math.min(Math.max(pos, calls[0].at || 0), text.length);
+    // the segment as the model wrote it: a template that trims (the default one's does) trims its own copy, and
+    // one that does not must get the model's own whitespace back; .trim() is only ever the emptiness check
+    const msg = {role: "assistant", content: text.slice(pos, at),
+                 tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))};
+    const rat = Math.max(rpos, Math.min(...calls.map(ratOf)));   // this round's thinking, up to its first call
+    if (rat > rpos) msg.reasoning_content = reasoning.slice(rpos, rat);
+    out.push(msg);
     for (const t of calls) out.push({role: "tool", tool_call_id: t.id, content: t.result});
     pos = at;
+    const last = calls[calls.length - 1];
+    // past this round's calls: the next round's thinking starts after the "\n\n" the stream inserts between
+    // rounds (rnext, recorded where it was inserted; an older saved chat gets its one separator skipped)
+    const end = ratOf(last);
+    rpos = Math.min(last.rnext ?? (reasoning.startsWith("\n\n", end) ? end + 2 : end), reasoning.length);
   }
-  const rest = m.text.slice(pos).trim();
-  if (rest) out.push({role: "assistant", content: rest});
+  const rest = text.slice(pos);
+  if (rest.trim()) out.push({role: "assistant", content: rest,
+                             ...(reasoning.length > rpos ? {reasoning_content: reasoning.slice(rpos)} : {})});
   return out;
 }
 
@@ -834,7 +849,10 @@ async function send() {
         if (d.reasoning_content) {
           if (!firstAt) firstAt = performance.now();
           if (!thinkStart) thinkStart = performance.now();
-          if (lastTool && m.reasoning && lastTool.rat === m.reasoning.length) m.reasoning += "\n\n";
+          if (lastTool && m.reasoning && lastTool.rat === m.reasoning.length) {
+            m.reasoning += "\n\n";
+            lastTool.rnext = m.reasoning.length;   // where the next round's thinking starts (assistantMessages)
+          }
           m.reasoning += d.reasoning_content;
         }
         if (d.content) {

@@ -95,6 +95,17 @@ public:
     void empty();
     void copy(float* parts, int routes, const uint32_t* skip, uint32_t ring, void* stream);
     void release(); // watchdog: host stores only; graph refuses subsequent windows
+    /// TEST ONLY (engine fault seams): advance `expected` past every queued ready signal,
+    /// making the LIVE frame permanently unsignaled. Call it BETWEEN the launch's signal
+    /// enqueue and the wait/copy enqueue - the host write then precedes the wait kernel's
+    /// enqueue, so the queued wait's target provably has no signal (an after-enqueue bump
+    /// would race the kernel's initial read). Scope: the WORKER-ERROR release tests use
+    /// this to prove abort/release drains a genuinely stuck frame; it does NOT model a
+    /// mid-forward async hardware fault that no thread observes (that case stays fatal by
+    /// design - see the engine's win_test_peer_fault comment). Host stores only; a
+    /// released/absent frame is a no-op. Subsequent enqueues are refused, exactly like a
+    /// failed tier.
+    void test_desynchronize();
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -117,8 +128,10 @@ public:
     Exl3Peer(const Exl3Peer&) = delete;
     Exl3Peer& operator=(const Exl3Peer&) = delete;
 
+    // min_free_bytes optionally preserves a device reserve DURING allocation, not only after
+    // a trial open. STRATA_EXL3_PEER_ARENA=1 packs weight planes into one aligned allocation.
     bool open(int device, int n_embd, const std::vector<Entry>& subset,
-              int max_tokens, int max_k, std::string& err);
+              int max_tokens, int max_k, std::string& err, size_t min_free_bytes = 0);
     void close();
 
     /// false while closed OR failed (a failed tier advertises nothing until close()).
@@ -127,6 +140,39 @@ public:
     bool has(int64_t layer, int32_t expert) const;
     int64_t resident() const;
     size_t bytes() const;   ///< uploaded subset bytes (nine planes per entry, geometry-derived)
+
+    /// Test-only inspector: the trellis-layout tag a RESIDENT slot's device descriptors carry.
+    /// open()'s fill must propagate each entry's tag into the slot: a slot left at the default
+    /// Native described packed planes wrongly, and the first adapt refill (whole-descriptor
+    /// copy, tag included) then left the tier mixed-tagged so every launch was refused - the
+    /// 2026-11-06 full-model band-8 regression, pinned negative-controlled in
+    /// mimo_band8_parity §5b.  Native when the expert is not resident.  No engine path reads this.
+    Exl3TrellisLayout slot_layout(int64_t layer, int32_t expert) const;
+    /// grouped (multirow) dispatches since open: calls, routed rows, groups (diagnostics/tests;
+    /// a call that falls back to indexed - no repeated expert, an unsupported codebook, or a
+    /// half-integer-K (frac) expert while STRATA_EXL3_PEER_MULTIROW_FRAC is off - counts nothing
+    /// here.  The engine default rejects frac tiles; the env admits the tested K <= 4.5 mul1
+    /// range (launcher trial after mixed end-to-end results, 2026-11-03,
+    /// notes/MIMO-PEER-FRAC-GROUPED-2026-11-03.md).
+    int64_t grouped_launches() const;
+    int64_t grouped_routes() const;
+    int64_t grouped_groups() const;
+
+    /// STRATA_EXL3_PEER_NATIVE_WIDTH4 (default off), read ONCE at open: a REQUESTED
+    /// STRATA_EXL3_PEER_MULTIROW=4 survived the startup gate because the native grouped
+    /// core was armed (fused-multirow support + STRATA_EXL3_RDNA_NATIVE=1 +
+    /// STRATA_EXL3_NATIVE_GROUPED=1) and the native fp16-slice budget fits where the float
+    /// twin's 4-row LDS rule would have downgraded the whole arm to indexed.  The gate OFF
+    /// (or the native stack absent) keeps the startup behavior byte-for-byte the old one.
+    /// Every launch then re-runs the host-only exl3_native_grouped_plan over the ACTUAL
+    /// route descriptors (refills included): admitted groups run at width 4 - counted by
+    /// native_width4_calls()/_rows() - and any refusal (native envs flipped off after open,
+    /// an unsupported rate or an infeasible shape among the current experts) re-chunks the
+    /// same route order at width 2, with the established indexed fallback below that.
+    /// Per call, never sticky, never a throw.  Diagnostics/tests only.
+    bool native_width4() const;
+    int64_t native_width4_calls() const;
+    int64_t native_width4_rows() const;
 
     bool launch(int64_t layer, const float* x, const int32_t* ids, int tokens, int k,
                 const int32_t* kind, std::string& err, Exl3PeerOutput* device_output = nullptr);
@@ -149,8 +195,8 @@ public:
     // `max_rows` caps the rows this tier takes per layer; routes beyond the cap stay local (the
     // caller learns the effective cap from prefill_rows_cap()).  Refuses when the peer card lacks
     // the bytes (the desktop reserve stays intact); the prompt path then stays on the primary.
-    // `k` must be 10 and `n_expert` the model's expert count (the route plan and the fixed-k
-    // transport kernels assume them).
+    // `k` is the model's top-k (1..64 - a runtime width of the plan/scatter kernels; the Qwen
+    // family runs 10, MiMo v2's peer tier 8) and `n_expert` the model's expert count.
     bool enable_prefill(int64_t max_tokens, int k, int64_t n_expert, int64_t max_rows, std::string& err);
     bool prefill_enabled() const;
     int64_t prefill_rows_cap() const;
@@ -173,6 +219,8 @@ public:
     struct Replacement { int32_t out = -1; Entry in; };
     bool enable_adaptation(int max_swaps, size_t byte_cap, std::string& err);
     bool can_replace(const Replacement& replacement) const;
+    // Writable host targets; drained windows only, on the owned refill stream.
+    bool copy_to_host(const Entry& destination, std::string& err);
     size_t replacement_bytes(const Replacement& replacement) const;
     // Between windows, with no compute launch pending. Sources are packed into pinned
     // staging before returning. Outgoing entries become non-resident immediately;

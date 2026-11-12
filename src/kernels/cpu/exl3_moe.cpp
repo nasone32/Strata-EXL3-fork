@@ -3187,6 +3187,58 @@ namespace strata::kernels::cpu {
 //   Exl3CpuMoe: layer registry, repack cache, and the public entry points
 // -------------------------------------------------------------------------------------------
 
+// The reference loader's _copy_repacked: tile (kt, nt) moves to (nt/group, kt, nt%group),
+// and with planar each tile's dwords transpose -- dword w to 8 * (w % bits) + w / bits
+// (integer rates only, where the group is nonzero). Group 0 is a plain copy.
+// File-local (was Impl::repack_trellis): the fixture packer below reuses the identical
+// helper, so a test's packed bytes can never drift from what the repack cache produces.
+static void repack_trellis(uint16_t* dst, const Exl3CpuMatrix& m, int group, bool planar)
+{
+    const int tk = m.k / 16;
+    const int tn = m.n / 16;
+    const int ps = tile_u16(m.bits, m.hb != 0);
+    const size_t words = static_cast<size_t>(tk) * tn * ps;
+    if (group <= 0)
+    {
+        std::memcpy(dst, m.trellis, words * 2);
+        return;
+    }
+    if (!planar)
+    {
+        for (int kt = 0; kt < tk; ++kt)
+            for (int nt = 0; nt < tn; ++nt)
+                std::memcpy(dst + ((static_cast<size_t>(nt) / group * tk * group +
+                                    static_cast<size_t>(kt) * group + nt % group) * ps),
+                            m.trellis + (static_cast<size_t>(kt) * tn + nt) * ps,
+                            static_cast<size_t>(ps) * 2);
+    }
+    else
+    {
+        const int wd = ps / 2;   // dwords per tile (integer rates on this path)
+        const uint32_t* src32 = reinterpret_cast<const uint32_t*>(m.trellis);
+        uint32_t* dst32 = reinterpret_cast<uint32_t*>(dst);
+        for (int kt = 0; kt < tk; ++kt)
+            for (int nt = 0; nt < tn; ++nt)
+            {
+                const uint32_t* s = src32 + (static_cast<size_t>(kt) * tn + nt) * wd;
+                uint32_t* d = dst32 + (static_cast<size_t>(nt) / 2 * tk * 2 +
+                                       static_cast<size_t>(kt) * 2 + (nt % 2)) * wd;
+                for (int w = 0; w < wd; ++w)
+                    d[8 * (w % m.bits) + w / m.bits] = s[w];
+            }
+    }
+}
+
+// src/kernels/cpu/exl3_moe_fixture.hpp declares this; TEST/Fixture code only.  It packs one
+// projection's trellis into the canonical band-8 order through the same repack helper the
+// cache path uses.  There is deliberately no inverse: production services never reinterpret
+// a canonical matrix, so nothing here may unpack one hidden behind a "service" either.
+void exl3cpu_fixture_pack_band8(uint16_t* dst, const uint16_t* trellis, int k, int n, int bits, int hb)
+{
+    repack_trellis(dst, Exl3CpuMatrix{ trellis, nullptr, nullptr, k, n, bits, hb,
+                                       Exl3CpuTrellisLayout::Native }, 8, false);
+}
+
 struct Exl3CpuMoe::Impl
 {
     struct LayerInfo
@@ -3225,6 +3277,8 @@ struct Exl3CpuMoe::Impl
     std::atomic<double> stat_ms{0};
     std::atomic<double> stat_prep_ms{0};   // host-serial prepare (classify/resolve/publish)
     std::atomic<double> stat_join_ms{0};   // the residual CPU wait AFTER the caller's GPU work
+    std::atomic<int> stat_bg_nw{0};        // last bg job's participant count (ctx.nw_used: the
+                                           // pool's workers WITHOUT the calling thread)
     std::atomic<double> stat_gb{0};
     std::atomic<int64_t> stat_jobs{0};
 
@@ -3247,46 +3301,6 @@ struct Exl3CpuMoe::Impl
         return static_cast<size_t>(m.k / 16) * (m.n / 16) * (size_t) tile_u16(m.bits, m.hb != 0);
     }
 
-    // The reference loader's _copy_repacked: tile (kt, nt) moves to (nt/group, kt, nt%group),
-    // and with planar each tile's dwords transpose -- dword w to 8 * (w % bits) + w / bits
-    // (integer rates only, where the group is nonzero). Group 0 is a plain copy.
-    static void repack_trellis(uint16_t* dst, const Exl3CpuMatrix& m, int group, bool planar)
-    {
-        const int tk = m.k / 16;
-        const int tn = m.n / 16;
-        const int ps = tile_u16(m.bits, m.hb != 0);
-        const size_t words = static_cast<size_t>(tk) * tn * ps;
-        if (group <= 0)
-        {
-            std::memcpy(dst, m.trellis, words * 2);
-            return;
-        }
-        if (!planar)
-        {
-            for (int kt = 0; kt < tk; ++kt)
-                for (int nt = 0; nt < tn; ++nt)
-                    std::memcpy(dst + ((static_cast<size_t>(nt) / group * tk * group +
-                                        static_cast<size_t>(kt) * group + nt % group) * ps),
-                                m.trellis + (static_cast<size_t>(kt) * tn + nt) * ps,
-                                static_cast<size_t>(ps) * 2);
-        }
-        else
-        {
-            const int wd = ps / 2;   // dwords per tile (integer rates on this path)
-            const uint32_t* src32 = reinterpret_cast<const uint32_t*>(m.trellis);
-            uint32_t* dst32 = reinterpret_cast<uint32_t*>(dst);
-            for (int kt = 0; kt < tk; ++kt)
-                for (int nt = 0; nt < tn; ++nt)
-                {
-                    const uint32_t* s = src32 + (static_cast<size_t>(kt) * tn + nt) * wd;
-                    uint32_t* d = dst32 + (static_cast<size_t>(nt) / 2 * tk * 2 +
-                                           static_cast<size_t>(kt) * 2 + (nt % 2)) * wd;
-                    for (int w = 0; w < wd; ++w)
-                        d[8 * (w % m.bits) + w / m.bits] = s[w];
-                }
-        }
-    }
-
     // Resolve one expert's three matrices: repacked trellis from the cache when the rate's
     // group is nonzero and the budget allows, native bytes otherwise. Caller holds mu.
     void resolve(LayerInfo& L, int layer, int e, MoeCpuMatrix& g, MoeCpuMatrix& u, MoeCpuMatrix& d,
@@ -3294,6 +3308,30 @@ struct Exl3CpuMoe::Impl
     {
         const Exl3CpuMatrix* src[3] = { &L.gates[(size_t) e], &L.ups[(size_t) e], &L.downs[(size_t) e] };
         MoeCpuMatrix* dst[3] = { &g, &u, &d };
+
+        // Canonical caller-packed band-8 (Exl3CpuTrellisLayout::Band8).  add_layer() has
+        // already validated the ISA tier, the rate and the three projections' agreement, so
+        // resolution is a plain field copy with swz = 1: the band kernels stream the CALLER's
+        // bytes directly.  This path ignores `swizzle` and `cache_budget` (STRATA_EXL3_CPU_
+        // SWIZZLE / STRATA_EXL3_CPU_CACHE_MIB) - those gate OPTIONAL conversions of native
+        // bytes, not the physical format the caller declared.  No LRU lookup, no repack, no
+        // allocation, nothing to pin: the caller owns the bytes for the service's lifetime.
+        if (src[0]->layout == Exl3CpuTrellisLayout::Band8)
+        {
+            for (int p = 0; p < 3; ++p)
+            {
+                dst[p]->trellis = src[p]->trellis;
+                dst[p]->suh = src[p]->suh;
+                dst[p]->svh = src[p]->svh;
+                dst[p]->k = src[p]->k;
+                dst[p]->n = src[p]->n;
+                dst[p]->bits = src[p]->bits;
+                dst[p]->hb = src[p]->hb;
+                dst[p]->swz = 1;
+            }
+            return;
+        }
+
         int grp[3] = { 0, 0, 0 };
         bool pln[3] = { false, false, false };
         for (int p = 0; p < 3; ++p)
@@ -3441,11 +3479,62 @@ void Exl3CpuMoe::add_layer(int layer, const Exl3CpuMatrix* gates, const Exl3CpuM
             if (m->k > 8192)
                 throw std::runtime_error("exl3 cpu: k too large for i32 accumulation");
         }
+    // Canonical band-8 registration (Exl3CpuTrellisLayout::Band8), decided HERE from metadata
+    // only - no trellis byte is read at registration or before the first job.  A layer may mix
+    // canonical and native EXPERTS, but the three projections of one expert must agree: a
+    // mixed-projection expert is refused outright rather than partially reinterpreted.  Rates
+    // are restricted to the four the band kernels are verified on (K2/K2.5/K3/K4; K8's dword
+    // kernel ignores SWZ and reads native only).  An unsupported CPU throws here too - packed
+    // bytes are never silently decoded as native (or unpacked hidden) on a lower tier.
+    for (int e = 0; e < num_experts; ++e)
+    {
+        const Exl3CpuMatrix* trio[3] = { &L.gates[(size_t) e], &L.ups[(size_t) e], &L.downs[(size_t) e] };
+        int band8 = 0;
+        for (const Exl3CpuMatrix* m : trio)
+        {
+            const int layout = static_cast<int>(m->layout);
+            if (layout < static_cast<int>(Exl3CpuTrellisLayout::Native) ||
+                layout > static_cast<int>(Exl3CpuTrellisLayout::Band8))
+                throw std::runtime_error("exl3 cpu: unknown trellis layout " + std::to_string(layout));
+            band8 += m->layout == Exl3CpuTrellisLayout::Band8 ? 1 : 0;
+        }
+        if (band8 == 0) continue;
+        if (band8 != 3)
+            throw std::runtime_error("exl3 cpu: band-8 layout must cover gate, up AND down of expert " +
+                                     std::to_string(e) + " (mixed-layout expert refused, not partially reinterpreted)");
+        if (g_isa < Isa::Bw)
+            throw std::runtime_error("exl3 cpu: band-8 trellis needs the AVX-512BW band kernels; this CPU/tier cannot read it");
+        for (const Exl3CpuMatrix* m : trio)
+        {
+            if (m->bits == 8)
+                throw std::runtime_error("exl3 cpu: K8 trellis has no band layout (the dword kernel reads native only)");
+            const int half_bits = 2 * m->bits + m->hb;   // K2/K2.5/K3/K4 = 4/5/6/8
+            if (half_bits != 4 && half_bits != 5 && half_bits != 6 && half_bits != 8)
+                throw std::runtime_error("exl3 cpu: band-8 layout is enabled for K2/K2.5/K3/K4 only (got K" +
+                                         std::to_string(0.5 * half_bits) + ")");
+        }
+    }
     L.hidden = L.ups[0].k;
     L.interm = L.ups[0].n;
-    if (L.gates[0].k != L.hidden || L.gates[0].n != L.interm ||
-        L.downs[0].k != L.interm || L.downs[0].n != L.hidden)
-        throw std::runtime_error("exl3 cpu: expert shape mismatch (gate/up/down must chain H->I->H)");
+    // EVERY expert must chain H->I->H with expert 0's dimensions, not just expert 0 (the
+    // legacy check): prepare() uses the layer-wide hidden/interm for arena sizing and the
+    // phase setup, so a deeper expert with different dimensions would read/write out of
+    // bounds at job time.  Metadata only; native and canonical experts alike.
+    for (int e = 0; e < num_experts; ++e)
+    {
+        const Exl3CpuMatrix* trio[3] = { &L.gates[(size_t) e], &L.ups[(size_t) e], &L.downs[(size_t) e] };
+        const char* proj[3] = { "gate", "up", "down" };
+        for (int p = 0; p < 3; ++p)
+        {
+            const bool want_down = p == 2;   // gate/up: H->I, down: I->H
+            if (trio[p]->k != (want_down ? L.interm : L.hidden) ||
+                trio[p]->n != (want_down ? L.hidden : L.interm))
+                throw std::runtime_error("exl3 cpu: expert " + std::to_string(e) + " " + proj[p] +
+                                         " is " + std::to_string(trio[p]->k) + "x" + std::to_string(trio[p]->n) +
+                                         ", expected the layer's " + std::to_string(L.hidden) + "x" +
+                                         std::to_string(L.interm) + " chain (gate/up H->I, down I->H)");
+        }
+    }
     const std::lock_guard<std::mutex> lock(impl_->mu);
     impl_->layers[layer] = std::move(L);
 }
@@ -3454,6 +3543,14 @@ bool Exl3CpuMoe::ready() const
 {
     const std::lock_guard<std::mutex> lock(impl_->mu);
     return !impl_->layers.empty();
+}
+
+bool Exl3CpuMoe::band8_supported()
+{
+    // The same tier add_layer refuses a Band8 matrix below (g_isa < Isa::Bw), resolved the
+    // same way (STRATA_EXL3_CPU_MAX_ISA caps it), so a preflight answer cannot drift from
+    // the registration check.
+    return detect_isa() >= Isa::Bw;
 }
 
 void Exl3CpuMoe::set_threads(int threads)
@@ -3745,6 +3842,7 @@ void Exl3CpuMoe::run_rows_bg(int layer, const float* x, int64_t x_stride, const 
     job.run.decode = job.ctx.decode_kind != 0;
     job.run.num_phases = job.ctx.num_phases;
     job.run.nw = job.ctx.nw_used;
+    impl_->stat_bg_nw.store(job.ctx.nw_used, std::memory_order_relaxed);
     impl_->pool.run_bg(&bg_driver, &job.run);
     impl_->stat_prep_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prep0).count();
 }
@@ -3768,9 +3866,12 @@ Exl3CpuMoe::Stats Exl3CpuMoe::stats() const
     s.repack_evictions = impl_->stat_evictions.load();
     s.native_reads = impl_->stat_native.load();
     s.ms = impl_->stat_ms.load();
+    s.prepare_ms = impl_->stat_prep_ms.load();
+    s.join_ms = impl_->stat_join_ms.load();
     s.trellis_gb = impl_->stat_gb.load();
     s.threads = impl_->pool.num_workers;
     s.isa = static_cast<int>(g_isa);
+    s.bg_workers = impl_->stat_bg_nw.load();
     s.cache_bytes = (int64_t) impl_->cache_bytes;
     return s;
 }
@@ -3794,6 +3895,7 @@ void Exl3CpuMoe::add_layer(int, const Exl3CpuMatrix*, const Exl3CpuMatrix*, cons
     throw std::runtime_error("exl3 cpu: not built on this architecture");
 }
 bool Exl3CpuMoe::ready() const { return false; }
+bool Exl3CpuMoe::band8_supported() { return false; }
 void Exl3CpuMoe::set_threads(int) {}
 void Exl3CpuMoe::run_rows(int, const float*, int64_t, const int*, const int*, const int*, int, float*, int64_t)
 {

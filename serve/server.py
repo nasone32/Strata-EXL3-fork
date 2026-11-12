@@ -726,7 +726,8 @@ def btrace(*a):
         print("[batch-trace]", threading.get_ident() % 10000, *a, file=sys.stderr, flush=True)
 
 
-EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
+EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids (Flash-Next's ids;
+                             # main() rebinds this to the model family's own - FAMILY_EOS_IDS, MiMo: {151645})
 
 
 # The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
@@ -1052,6 +1053,8 @@ class StrataEngine:
         close() ends and waits for the old process first (EngineStuck when it cannot be ended).  A start that still
         exits before READY - a dead engine's VRAM can take a while to come back, notably on ROCm - is retried
         (PR #637)."""
+        # Honor the configured retry opt-out for lazy starts too, not just Popen.
+        tries = max(1, min(tries, START_RETRIES + 1))
         info = dict(self.info)
         self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
         try:
@@ -4693,8 +4696,12 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
             break
-        messages.append({"role": "assistant", "content": "".join(text).strip(),
-                         **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
+        # the reasoning and the text as the model wrote them: a template that renders reasoning_content and
+        # content untrimmed (MiMo's does) must re-render the turn into the tokens the engine already holds, and
+        # a stripped copy would move the next round's prompt off its prefix.  A template that trims itself
+        # (Qwen's: reasoning_content|trim, render_content|trim) renders exactly what it did before.
+        messages.append({"role": "assistant", "content": "".join(text),
+                         **({"reasoning_content": "".join(reasoning)} if reasoning else {}),
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
         messages += [{"role": "tool", "content": r} for r in results]
         try:
@@ -6612,12 +6619,50 @@ def check_request_sampling(req) -> None:
 
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
-FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b"}
+FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b",
+                      "mimo_v2": "mimo-v2.6-flash"}
+
+# what else a family numbers differently, from the same "arch": the stop-token ids of the engine's default
+# --eos-ids (EOS_IDS below) and the advice when the MTP draft head does not fit (DRAFT_HEAD_HINT above).
+# MiMo v2 (notes/MIMO-V2-PORT.md) is a Qwen2-style vocabulary: <|im_end|> is 151645 and <|endoftext|> 151643
+# (Flash-Next: 248046 / 248044), and its MTP heads share the model's own vocabulary, so the qwen
+# --draft-vocab advice does not apply.  Families the tables do not name keep the module defaults.
+FAMILY_EOS_IDS = {"mimo_v2": {151645}}
+FAMILY_DRAFT_HINT = {"mimo_v2": "the draft heads share the model's own vocabulary (there is no --draft-vocab on "
+                                "this family): start again with a smaller --context in setup"}
+# the shipped defaults, taken once: the tables fall back to these, never to a value apply_model_family
+# (below) has already rebound EOS_IDS / DRAFT_HEAD_HINT to
+DEFAULT_EOS_IDS, DEFAULT_DRAFT_HINT = set(EOS_IDS), DRAFT_HEAD_HINT
+
+
+def family_of(cfg: dict) -> str:
+    """The config's family, an empty (mock) config being Flash-Next's: the one key every table below reads."""
+    return cfg.get("arch") or "qwen4exp"
+
+
+def family_eos_ids(cfg: dict) -> set:
+    """The family's stop ids; qwen4exp / qwen35moe / a config without an "arch" keep the shipped default."""
+    return FAMILY_EOS_IDS.get(family_of(cfg), DEFAULT_EOS_IDS)
+
+
+def family_draft_hint(cfg: dict) -> str:
+    """The family's draft-head advice; every family but mimo_v2 keeps the shipped default."""
+    return FAMILY_DRAFT_HINT.get(family_of(cfg), DEFAULT_DRAFT_HINT)
+
+
+def apply_model_family(cfg: dict) -> None:
+    """The one place a family's own values (above) reach the serving path's module constants: this process
+    serves one model, and EOS_IDS / DRAFT_HEAD_HINT are read at call time, so rebinding them here covers the
+    engine's whole life (start failures included) without touching their readers.  Families the tables do not
+    name get the same objects back, byte-identical; tests patch the constants directly and never run this."""
+    global EOS_IDS, DRAFT_HEAD_HINT
+    EOS_IDS, DRAFT_HEAD_HINT = family_eos_ids(cfg), family_draft_hint(cfg)
 
 
 def default_model_name(cfg: dict) -> str:
-    """The config's "model_name", else its family's name ("arch": qwen4exp, qwen35moe), else Flash-Next's."""
-    return cfg.get("model_name") or FAMILY_MODEL_NAMES.get(cfg.get("arch") or "qwen4exp", "qwen3.8-flash-next")
+    """The config's "model_name", else its family's name ("arch": qwen4exp, qwen35moe, mimo_v2), else
+    Flash-Next's."""
+    return cfg.get("model_name") or FAMILY_MODEL_NAMES.get(family_of(cfg), "qwen3.8-flash-next")
 
 
 def main() -> int:
@@ -6680,6 +6725,7 @@ def main() -> int:
         ap.error(listen_problem(a.host, a.port, e))
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
+    apply_model_family(cfg)                # the family's stop ids / draft advice, before anything reads them
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
@@ -6692,7 +6738,12 @@ def main() -> int:
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        # the pack's own pre-tokenizer split and Unicode normalization (a family whose tokenizer.json
+        # declares another regex than qwen35's ships it: MiMo v2 does); absent, the Qwen default, as before
+        tcfg = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8")) \
+            if (tpath / "tokenizer.json").exists() else {}
+        tok = ST.Tokenizer(tokens, merges, types, pre_pattern=tcfg.get("pre_pattern"),
+                           normalizer=tcfg.get("normalizer"))
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:

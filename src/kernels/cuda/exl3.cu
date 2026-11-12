@@ -8,9 +8,10 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <atomic>
+#include <mutex>
 #if defined(STRATA_WMMA_GFX11)
 #include "strata/kernels/gfx_arch.hpp"
-#include <mutex>
 #include <unordered_map>
 #endif
 
@@ -100,13 +101,24 @@ __device__ __forceinline__ uint32_t lop3(uint32_t a, uint32_t b, uint32_t c, uin
     return r;
 }
 
-// The window for stored position `pos`: the 16 bits ending at bit (pos+1)*bits, read with ExLlamaV3's
-// funnel shift over the packed uint32 words (unpack_trellis / dq).  NOT a linear LSB read - the encoder
-// packs per 16-value span, MSB-first, then byte-swaps.
-__device__ __forceinline__ uint16_t read_window(const uint16_t* __restrict__ tw, int pos, int bits) {
+// The bit the window of stored position `pos` ENDS at inside the tile ring: uniform (pos+1)*K for an
+// integer bitrate; for the half-integer K = KA + 0.5 (exllamav3 frac.cuh) the steps alternate
+// KA / KA+1 bits per position within each group of 16 (MASK 0xAAAA, odd positions wider), so a group
+// spans 16*KA+8 bits and pos, m = pos%16 into its group, ends at (pos/16)*(16*KA+8)+KA*(m+1)+(m+1)/2.
+__device__ __forceinline__ int window_end(int pos, int bits, int frac) {
+    if (frac == 0) return (pos + 1) * bits;
+    const int m = pos & 15;
+    return (pos >> 4) * (16 * bits + 8) + bits * (m + 1) + ((m + 1) >> 1);
+}
+
+// The window for stored position `pos`: the 16 bits ending at window_end(pos), read with ExLlamaV3's
+// funnel shift over the packed uint32 words (unpack_trellis / unpack_trellis_frac / dq).  NOT a linear
+// LSB read - the encoder packs per 16-value span, MSB-first, then byte-swaps.
+__device__ __forceinline__ uint16_t read_window(const uint16_t* __restrict__ tw, int pos, int bits,
+                                                int frac) {
     const uint32_t* p32 = (const uint32_t*) tw;
-    const int nw = bits * 256 / 32;
-    const int b0 = pos * bits + bits - 16 + 256 * bits;
+    const int nw = (16 * bits + 8 * frac) / 2;          // ring bits / 32
+    const int b0 = window_end(pos, bits, frac) - 16 + nw * 32;   // + ring keeps b0 positive
     const int b2 = b0 + 16;
     const int i0r = b0 >> 5, i1r = (b2 - 1) >> 5;
     const int s1 = (i1r + 1) * 32 - b2;
@@ -137,13 +149,18 @@ __device__ __forceinline__ uint16_t decode_window(int cb, uint16_t w) {    uint3
     return __half_as_ushort(__float2half_rn(dh2f((uint16_t)(x & 0xFFFF)) + dh2f((uint16_t)(x >> 16))));
 }
 
+#include "exl3_rdna_native.cuh"
+
 // One block per (nj, ki) tile grid; 256 threads, thread t decodes stored position t and writes it to
 // its row-major destination inside the tile (tensor_core_perm: group g = t/8, slot = t%8).
+template <bool Band8 = false>
 __global__ void decode_kernel(const uint16_t* __restrict__ trellis, int ki, int nj, int words, int bits,
-                              int cb, uint16_t* __restrict__ what, int n) {
+                              int frac, int cb, uint16_t* __restrict__ what, int n) {
     int i = blockIdx.y, j = blockIdx.x, t = threadIdx.x; (void)ki;
-    const uint16_t* tw = trellis + (long)(i * nj + j) * words;
-    unsigned v = read_window(tw, t, bits);
+    const uint16_t* tw;
+    if constexpr (Band8) tw = trellis + (((size_t) (j / 8) * ki + i) * 8 + j % 8) * words;
+    else tw = trellis + (long)(i * nj + j) * words;
+    unsigned v = read_window(tw, t, bits, frac);
     int g = t >> 3, s = t & 7;
     int r0 = (g % 4) * 2, r1 = r0 + 1, r2 = r0 + 8, r3 = r0 + 9, c0 = g / 4, c1 = c0 + 8;
     int r = (s & 3) == 0 ? r0 : (s & 3) == 1 ? r1 : (s & 3) == 2 ? r2 : r3;
@@ -201,14 +218,16 @@ __global__ void f32_to_f16_kernel(const float* __restrict__ in, uint16_t* __rest
 
 }  // namespace
 
-void exl3_reconstruct_weight(const uint16_t* trellis, int ki, int nj, int bits, int cb,
-                             const uint16_t* suh, const uint16_t* svh, uint16_t* out, void* stream) {
+template <bool Band8 = false>
+static void reconstruct_weight_impl(const uint16_t* trellis, int ki, int nj, int bits, int cb,
+                             const uint16_t* suh, const uint16_t* svh, uint16_t* out, void* stream,
+                             int frac) {
     if (ki <= 0 || nj <= 0 || (ki * 16) % HAD || (nj * 16) % HAD) {
         std::fprintf(stderr, "exl3_reconstruct_weight: dims must be multiples of %d\n", HAD);
         std::abort();
     }
     cudaStream_t st = (cudaStream_t)stream;
-    int k = ki * 16, n = nj * 16, words = 256 * bits / 16;
+    int k = ki * 16, n = nj * 16, words = 16 * bits + 8 * frac;
     long nelem = (long)k * n;
     uint16_t* d_what = nullptr;
     float* d_w = nullptr;
@@ -224,7 +243,7 @@ void exl3_reconstruct_weight(const uint16_t* trellis, int ki, int nj, int bits, 
             std::abort();
         }
     };
-    decode_kernel<<<dim3(nj, ki), 256, 0, st>>>(trellis, ki, nj, words, bits, cb, d_what, n);
+    decode_kernel<Band8><<<dim3(nj, ki), 256, 0, st>>>(trellis, ki, nj, words, bits, frac, cb, d_what, n);
     check_launch("decode_kernel");
     widen_kernel<<<(int)((nelem + 255) / 256), 256, 0, st>>>(d_what, d_w, nelem);
     check_launch("widen_kernel");
@@ -240,6 +259,55 @@ void exl3_reconstruct_weight(const uint16_t* trellis, int ki, int nj, int bits, 
     check_launch("f32_to_f16_kernel");
     (void)cudaFree(d_what);
     (void)cudaFree(d_w);
+}
+
+void exl3_reconstruct_weight(const uint16_t* trellis, int ki, int nj, int bits, int cb,
+                             const uint16_t* suh, const uint16_t* svh, uint16_t* out, void* stream, int frac) {
+    reconstruct_weight_impl<>(trellis, ki, nj, bits, cb, suh, svh, out, stream, frac);
+}
+
+namespace {
+// Band8 admission, shared by the experimental entries and the normal entries' .layout routing:
+// the TAG must say Band8 (an untagged packed view is refused - the metadata is the contract),
+// the physical format requires nj % 8 (the permutation is bijective only then) and 4-byte tile
+// alignment, and only the VERIFIED rates run it: cb=mul1 K2/K2.5/K3/K4 at H128-multiple dims.
+// Everything else keeps the established native paths, which still accept their old ranges.
+bool band8_matrix_valid(const Exl3Mat& m) {
+    return m.layout == Exl3TrellisLayout::Band8 &&
+        m.trellis && m.suh && m.svh && ((uintptr_t) m.trellis % 4 == 0) &&
+        m.ki > 0 && m.ki <= INT32_MAX / 16 && m.nj > 0 && m.nj <= INT32_MAX / 16 &&
+        m.ki % 8 == 0 && m.nj % 8 == 0 && m.cb == 2 &&
+        ((m.bits == 2 && (m.frac == 0 || m.frac == 1)) ||
+         ((m.bits == 3 || m.bits == 4) && m.frac == 0));
+}
+// Host-side layout dispatch helper: runs `body` with std::true_type/std::false_type so the
+// kernel template's Band8 instantiation is selected ON THE HOST at the launch site - the
+// per-weight device loop carries no new runtime branch (Band8 folds into the tile address).
+template <typename F>
+void band8_dispatch(bool band8, F&& body) {
+    if (band8) body(std::true_type{});
+    else body(std::false_type{});
+}
+// Layout validation for a HOST trio array (one projection set per element): every mat of every
+// expert must carry the SAME tag.  Returns the common tag; mixed tags throw BEFORE anything is
+// uploaded or launched (packed bytes must never reach a native reader through the back door).
+Exl3TrellisLayout checked_uniform_layout(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down,
+                                         int count, const char* what) {
+    const Exl3TrellisLayout layout = gate[0].layout;
+    for (int e = 0; e < count; ++e)
+        for (const Exl3Mat* m : {&gate[e], &up[e], &down[e]})
+            if (m->layout != layout)
+                throw std::invalid_argument(std::string("exl3: mixed trellis layout tags in ") + what +
+                                            " (every projection must declare the same physical format)");
+    return layout;
+}
+}
+
+bool exl3_experimental_band8_reconstruct(const Exl3Mat& packed, uint16_t* out, void* stream) {
+    if (!out || !band8_matrix_valid(packed)) return false;
+    reconstruct_weight_impl<true>(packed.trellis, packed.ki, packed.nj, packed.bits, packed.cb,
+                                  packed.suh, packed.svh, out, stream, packed.frac);
+    return true;
 }
 
 namespace {
@@ -279,7 +347,7 @@ constexpr int GEMV_T = 4;
 // with ~20 weights per thread (the old 8-way k split over 128 threads) that dominated the kernel: it ran at
 // 40-115 GB/s against the ~700 GB/s the card has.  Packed into one int per row: word0 | word1 << 8 | shift << 16.
 __global__ void __launch_bounds__(256, 6) gemv_kernel(const float* __restrict__ xh, const uint16_t* __restrict__ trellis,
-                                                      int ki, int nj, int words, int bits, int cb,
+                                                      int ki, int nj, int words, int bits, int frac, int cb,
                                                       const int* __restrict__ pinv, float* __restrict__ z) {
     int c = threadIdx.x & 15, sub = threadIdx.x >> 4;
     int ns = gridDim.y * 16;
@@ -288,11 +356,11 @@ __global__ void __launch_bounds__(256, 6) gemv_kernel(const float* __restrict__ 
     int tt[16];
     #pragma unroll
     for (int r = 0; r < 16; ++r) tt[r] = pinv[r * 16 + c];
-    const int nw = bits * 256 / 32;
+    const int nw = (16 * bits + 8 * frac) / 2;
     int wo[16];
     #pragma unroll
     for (int r = 0; r < 16; ++r) {
-        const int b0 = tt[r] * bits + bits - 16 + 256 * bits;
+        const int b0 = window_end(tt[r], bits, frac) - 16 + nw * 32;
         const int b2 = b0 + 16;
         const int i0 = b0 >> 5, i1 = (b2 - 1) >> 5;
         wo[r] = (i0 % nw) | ((i1 % nw) << 8) | (((i1 + 1) * 32 - b2) << 16);
@@ -364,17 +432,27 @@ void build_pinv(int* pinv) {
 
 // The GEMV body, with the three scratch buffers supplied so a caller can reuse them across launches.
 void gemv_launch(const uint16_t* x, const uint16_t* suh, const uint16_t* svh, const uint16_t* trellis,
-                 int ki, int nj, int bits, int cb, uint16_t* y, float* d_xh, float* d_z, const int* d_pinv,
-                 cudaStream_t st) {
-    int k = ki * 16, n = nj * 16, words = 256 * bits / 16;
+                 int ki, int nj, int bits, int cb, uint16_t* y, float* d_xh, float* d_z,
+                 const int* d_pinv, cudaStream_t st, int frac = 0) {
+    int k = ki * 16, n = nj * 16, words = 16 * bits + 8 * frac;
     prescale_had_kernel<<<k / HAD, HAD, 0, st>>>(x, suh, d_xh);
     // A k split so the block count fills the machine: at least ~256 blocks, and never more than one row per
     // sub.  gy = 1 (each sub walks ki/16 rows) is the fast case for the big matrices; the small ones (the
     // shared expert's 40 output tiles) need the split or they run on 5k threads.
     int gy = 1;
     while (gy < 16 && ((nj + GEMV_T - 1) / GEMV_T) * gy < 256 && ki >= (gy + 1) * 16) ++gy;
+    // STRATA_EXL3_GEMV_GY (opt-in experiment knob): force the k split for the M = 1 dense GEMV -
+    // the rule above stops at ~256 blocks, which leaves the big decode shapes (the MiMo q_proj's
+    // 384) latency-bound at a fraction of the card's bandwidth.  1..16; unset = the rule.  The
+    // kernel takes any split (an empty k range just contributes zeros), so this only moves work.
+    static const int gy_env = [] {
+        const char* e = std::getenv("STRATA_EXL3_GEMV_GY");
+        const int v = e != nullptr ? std::atoi(e) : 0;
+        return v >= 1 && v <= 16 ? v : 0;
+    }();
+    if (gy_env != 0 && gy_env > gy) gy = gy_env;
     (void) cudaMemsetAsync(d_z, 0, (size_t)n * 4, st);
-    gemv_kernel<<<dim3((nj + GEMV_T - 1) / GEMV_T, gy), 256, 0, st>>>(d_xh, trellis, ki, nj, words, bits, cb, d_pinv, d_z);
+    gemv_kernel<<<dim3((nj + GEMV_T - 1) / GEMV_T, gy), 256, 0, st>>>(d_xh, trellis, ki, nj, words, bits, frac, cb, d_pinv, d_z);
     had_postscale_kernel<<<n / HAD, HAD, 0, st>>>(d_z, svh, y);
 }
 
@@ -419,14 +497,14 @@ void exl3_gemv_reserve(int max_k, int max_n) {
 }
 
 void exl3_gemv(const uint16_t* x, const uint16_t* suh, const uint16_t* svh, const uint16_t* trellis,
-               int ki, int nj, int bits, int cb, uint16_t* y, void* stream) {
+               int ki, int nj, int bits, int cb, uint16_t* y, void* stream, int frac) {
     if (ki <= 0 || nj <= 0 || (ki * 16) % HAD || (nj * 16) % HAD) {
         std::fprintf(stderr, "exl3_gemv: dims must be multiples of %d\n", HAD);
         std::abort();
     }
     cudaStream_t st = (cudaStream_t)stream;
     exl3_gemv_reserve(ki * 16, nj * 16);
-    gemv_launch(x, suh, svh, trellis, ki, nj, bits, cb, y, g_ws.xh, g_ws.z, g_ws.pinv, st);
+    gemv_launch(x, suh, svh, trellis, ki, nj, bits, cb, y, g_ws.xh, g_ws.z, g_ws.pinv, st, frac);
 }
 
 namespace {
@@ -480,14 +558,14 @@ __global__ void prescale_batched_kernel(const uint16_t* __restrict__ x, long x_s
     if (xh16 != nullptr) xh16[(long)e * k + idx] = __half_as_ushort(__float2half_rn(v));
 }
 
-template <int T, bool Partials = false, bool Masked = false>
+template <int T, bool Partials = false, bool Masked = false, bool Band8 = false>
 __global__ void __launch_bounds__(256, 6) gemv_batched_kernel(const float* __restrict__ xh, const Exl3Mat* __restrict__ mats,
-                                    const int* __restrict__ pinv, float* __restrict__ z) {
+                                     const int* __restrict__ pinv, float* __restrict__ z) {
     int e = blockIdx.z;
     if constexpr (Masked) { if (mats[e].trellis == nullptr) return; }
     int c = threadIdx.x & 15, sub = threadIdx.x >> 4;
-    int ki = mats[e].ki, nj = mats[e].nj, bits = mats[e].bits, cb = mats[e].cb;
-    int words = 256 * bits / 16;
+    int ki = mats[e].ki, nj = mats[e].nj, bits = mats[e].bits, frac = mats[e].frac, cb = mats[e].cb;
+    int words = 16 * bits + 8 * frac;
     int ns = gridDim.y * 16;
     int cid = blockIdx.y * 16 + sub;
     int k0 = (ki * cid) / ns, k1 = (ki * (cid + 1)) / ns;
@@ -497,11 +575,11 @@ __global__ void __launch_bounds__(256, 6) gemv_batched_kernel(const float* __res
     #pragma unroll
     for (int r = 0; r < 16; ++r) tt[r] = pinv[r * 16 + c];
     // the window geometry for this thread's 16 rows: fixed for the whole k loop (see gemv_kernel)
-    const int nw = bits * 256 / 32;
+    const int nw = (16 * bits + 8 * frac) / 2;
     int wo[16];
     #pragma unroll
     for (int r = 0; r < 16; ++r) {
-        const int b0 = tt[r] * bits + bits - 16 + 256 * bits;
+        const int b0 = window_end(tt[r], bits, frac) - 16 + nw * 32;
         const int b2 = b0 + 16;
         const int i0 = b0 >> 5, i1 = (b2 - 1) >> 5;
         wo[r] = (i0 % nw) | ((i1 % nw) << 8) | (((i1 + 1) * 32 - b2) << 16);
@@ -514,7 +592,12 @@ __global__ void __launch_bounds__(256, 6) gemv_batched_kernel(const float* __res
         #pragma unroll
         for (int t = 0; t < T; ++t) {
             int j = blockIdx.x + t * gridDim.x;
-            twp[t] = (j < nj) ? (const uint32_t*) (trellis + (long)(i * nj + j) * words) : nullptr;
+            // Band8: tile (kt,nt) at (((nt/8)*ki+kt)*8+nt%8)*words - ONLY the address changes;
+            // the window read, decode and accumulation are this kernel's own (size_t-safe math).
+            if constexpr (Band8)
+                twp[t] = (j < nj) ? (const uint32_t*) (trellis + (((size_t) (j / 8) * ki + i) * 8 + j % 8) * words) : nullptr;
+            else
+                twp[t] = (j < nj) ? (const uint32_t*) (trellis + (long)(i * nj + j) * words) : nullptr;
         }
         #pragma unroll
         for (int r = 0; r < 16; ++r) {
@@ -662,6 +745,17 @@ __device__ __forceinline__ RdnaRun rdna_span(const int nw, int b_first, int b_la
     return { dlo % nw, dhi % nw, 32 * dhi + 16 - b_last };
 }
 
+// The half-integer run geometry (K = KA + 0.5, MASK 0xAAAA): the run's four windows end at
+// window_end(p0 + j) instead of (p0 + j + 1) * KA, so the span and the extraction shifts are the
+// S() prefix sums - identical integers to the uniform form when frac == 0 (verified
+// position-for-position against read_window on the host for KA 2..4 before landing; KA = 5 can
+// exceed the single funnel's 32 bits, so the host gates the frac twin to bits <= 4).
+__device__ __forceinline__ int rdna_run_first(int t0_run, int q) { return t0_run + 8 * q; }
+__device__ __forceinline__ int rdna_run_shift(int p0, int j, int bits, int frac) {
+    if (frac == 0) return bits * (3 - j);
+    return window_end(p0 + 3, bits, 1) - window_end(p0 + j, bits, 1);
+}
+
 // gemv_batched_kernel's RDNA twin: same grid, same 256-thread (c, sub) geometry, same shared-tile
 // reduction and Partials output, same per-(i, r, t) FMA ORDER for RDNA == 1 - only the loads (one
 // 2-dword funnel per run of 4 rows instead of 2 dwords per row) and the integer decode change.
@@ -684,7 +778,7 @@ __device__ __forceinline__ RdnaRun rdna_span(const int nw, int b_first, int b_la
 // svh-scales the segment exactly as postscale_batched_kernel does, and writes the fp16 row.  The
 // counter self-resets, so the workspace buffer only needs zeroing when it grows.
 template <int T, bool Partials, int RDNA, bool FusedIn = false, bool FusedOut = false,
-          bool FusedSilu = false, bool Masked = false>
+          bool FusedSilu = false, bool Masked = false, bool Band8 = false>
 __global__ void __launch_bounds__(256, 4) gemv_batched_rdna_kernel(const float* __restrict__ xh,
                                    const uint16_t* __restrict__ xh16, const Exl3Mat* __restrict__ mats,
                                    const int* __restrict__ pinv, float* __restrict__ z,
@@ -701,15 +795,15 @@ __global__ void __launch_bounds__(256, 4) gemv_batched_rdna_kernel(const float* 
     int e = blockIdx.z;
     if constexpr (Masked) { if (mats[e].trellis == nullptr) return; }
     int c = threadIdx.x & 15, sub = threadIdx.x >> 4;
-    int ki = mats[e].ki, nj = mats[e].nj, bits = mats[e].bits, cb = mats[e].cb;
-    int words = 256 * bits / 16;
+    int ki = mats[e].ki, nj = mats[e].nj, bits = mats[e].bits, frac = mats[e].frac, cb = mats[e].cb;
+    int words = 16 * bits + 8 * frac;
     int ns = gridDim.y * 16;
     int cid = blockIdx.y * 16 + sub;
     int k0 = (ki * cid) / ns, k1 = (ki * (cid + 1)) / ns;
     const uint16_t* trellis = mats[e].trellis;
     const float* xhe = xh + (long)e * (ki * 16);
     const uint16_t* xhe16 = xh16 + (long)e * (ki * 16);
-    const int nw = bits * 256 / 32;
+    const int nw = words / 2;   // ring dwords: a frac tile carries 16K+8 uint16 words
     float* slice = nullptr;                  // FusedIn: this PARTITION's Hadamard'd k-slice
     int part_k0 = 0, part_k1 = 0;            // the k-tile range the whole blockIdx.y covers
     if constexpr (FusedIn) {
@@ -773,9 +867,16 @@ __global__ void __launch_bounds__(256, 4) gemv_batched_rdna_kernel(const float* 
     const bool wide = bits > 5;
     #pragma unroll
     for (int q = 0; q < 4; ++q) {
-        const int B0 = (t0_run + 8 * q) * bits + bits - 16 + 256 * bits;
+        int B0, Blast;   // ring bits [B0, Blast): the run's four-window span, lifted by one ring
+        if (frac == 0) {
+            B0 = (t0_run + 8 * q) * bits + bits - 16 + 256 * bits;
+            Blast = B0 + 3 * bits;
+        } else {   // the alternating steps: window_end is the whole story (identical at frac == 0)
+            B0 = window_end(rdna_run_first(t0_run, q), bits, 1) - 16 + nw * 32;
+            Blast = window_end(rdna_run_first(t0_run, q) + 3, bits, 1) - 16 + nw * 32;
+        }
         if (!wide)
-            run[q][0] = rdna_span(nw, B0, B0 + 3 * bits);
+            run[q][0] = rdna_span(nw, B0, Blast);
         else {
             run[q][0] = rdna_span(nw, B0, B0 + bits);
             run[q][1] = rdna_span(nw, B0 + 2 * bits, B0 + 3 * bits);
@@ -804,7 +905,10 @@ __global__ void __launch_bounds__(256, 4) gemv_batched_rdna_kernel(const float* 
             #pragma unroll
             for (int t = 0; t < T; ++t) {
                 int j = FusedOut ? blockIdx.x * T + t : blockIdx.x + t * gridDim.x;
-                twp[t] = (j < nj) ? (const uint32_t*) (trellis + (long)(i * nj + j) * words) : nullptr;
+                if constexpr (Band8)   // same band8 tile address as the scalar twin
+                    twp[t] = (j < nj) ? (const uint32_t*) (trellis + (((size_t) (j / 8) * ki + i) * 8 + j % 8) * words) : nullptr;
+                else
+                    twp[t] = (j < nj) ? (const uint32_t*) (trellis + (long)(i * nj + j) * words) : nullptr;
             }
             #pragma unroll
             for (int r = 0; r < 16; ++r) {
@@ -827,7 +931,10 @@ __global__ void __launch_bounds__(256, 4) gemv_batched_rdna_kernel(const float* 
             #pragma unroll
             for (int t = 0; t < T; ++t) {
                 int j = FusedOut ? blockIdx.x * T + t : blockIdx.x + t * gridDim.x;
-                twp[t] = (j < nj) ? (const uint32_t*) (trellis + (long)(i * nj + j) * words) : nullptr;
+                if constexpr (Band8)
+                    twp[t] = (j < nj) ? (const uint32_t*) (trellis + (((size_t) (j / 8) * ki + i) * 8 + j % 8) * words) : nullptr;
+                else
+                    twp[t] = (j < nj) ? (const uint32_t*) (trellis + (long)(i * nj + j) * words) : nullptr;
             }
             uint32_t f[T][4];
             #pragma unroll
@@ -852,8 +959,9 @@ __global__ void __launch_bounds__(256, 4) gemv_batched_rdna_kernel(const float* 
                 for (int t = 0; t < T; ++t) {
                     if (!twp[t]) continue;
                     uint32_t win;
-                    if (!wide)
-                        win = f[t][q] >> (bits * (3 - j));
+                    if (!wide)   // frac: the per-window S() prefix sums replace bits*(3-j)
+                        win = f[t][q] >> (frac ? rdna_run_shift(rdna_run_first(t0_run, q), j, bits, frac)
+                                                : bits * (3 - j));
                     else if (j < 2)       // funnel 0: j=0 sits `bits` above j=1
                         win = j == 0 ? (f[t][q] >> bits) : f[t][q];
                     else {                // funnel 1: recomputed from the same dwords
@@ -875,7 +983,10 @@ __global__ void __launch_bounds__(256, 4) gemv_batched_rdna_kernel(const float* 
             #pragma unroll
             for (int t = 0; t < T; ++t) {
                 int j = FusedOut ? blockIdx.x * T + t : blockIdx.x + t * gridDim.x;
-                twp[t] = (j < nj) ? (const uint32_t*) (trellis + (long)(i * nj + j) * words) : nullptr;
+                if constexpr (Band8)
+                    twp[t] = (j < nj) ? (const uint32_t*) (trellis + (((size_t) (j / 8) * ki + i) * 8 + j % 8) * words) : nullptr;
+                else
+                    twp[t] = (j < nj) ? (const uint32_t*) (trellis + (long)(i * nj + j) * words) : nullptr;
             }
             #pragma unroll
             for (int q = 0; q < 4; ++q) {
@@ -893,9 +1004,17 @@ __global__ void __launch_bounds__(256, 4) gemv_batched_rdna_kernel(const float* 
                     __half2 w01, w89;
                     if (!wide) {
                         const uint32_t f = rdna_funnel(twp[t][run[q][0].whi], twp[t][run[q][0].wlo], run[q][0].sh);
+                        if (frac) {   // the alternating steps: each pair member at its S() offset
+                            const int p0 = rdna_run_first(t0_run, q);
+                            w01 = rdna_mul1_pair(rdna_hash16_lo(f >> rdna_run_shift(p0, 0, bits, frac)),
+                                                 rdna_hash16_lo(f >> rdna_run_shift(p0, 1, bits, frac)));
+                            w89 = rdna_mul1_pair(rdna_hash16_lo(f >> rdna_run_shift(p0, 2, bits, frac)),
+                                                 rdna_hash16_lo(f >> rdna_run_shift(p0, 3, bits, frac)));
+                        } else {
                         // j=0 at shift 3*bits, j=1 at 2*bits, j=2 at bits, j=3 at 0
                         w01 = rdna_mul1_pair(rdna_hash16_lo(f >> (3 * bits)), rdna_hash16_lo(f >> (2 * bits)));
                         w89 = rdna_mul1_pair(rdna_hash16_lo(f >> bits), rdna_hash16_lo(f));
+                        }
                     } else {
                         const uint32_t fa = rdna_funnel(twp[t][run[q][0].whi], twp[t][run[q][0].wlo], run[q][0].sh);
                         const uint32_t fb = rdna_funnel(twp[t][run[q][1].whi], twp[t][run[q][1].wlo], run[q][1].sh);
@@ -1213,7 +1332,7 @@ __global__ void prescale_grouped_kernel(const uint16_t* __restrict__ x, long x_s
 // The grouped twin of gemv_batched_kernel: same 16x16 thread geometry, same chunking (cid over
 // gridDim.y*16), same window-geometry hoist, same Partials output layout - but the trellis word is
 // extracted and decoded once per (i, r, tile) and the weight multiplies every row's activation.
-template <int T, int MAX_ROWS, bool Partials = false>
+template <int T, int MAX_ROWS, bool Partials = false, bool Band8 = false>
 __global__ void __launch_bounds__(256, 6) gemv_grouped_kernel(const float* __restrict__ xh,
                                     const Exl3Mat* __restrict__ gmats,
                                     const int* __restrict__ gfirst, const int* __restrict__ grows,
@@ -1221,8 +1340,8 @@ __global__ void __launch_bounds__(256, 6) gemv_grouped_kernel(const float* __res
     int g = blockIdx.z;
     int c = threadIdx.x & 15, sub = threadIdx.x >> 4;
     int first = gfirst[g], rows = grows[g];
-    int ki = gmats[g].ki, nj = gmats[g].nj, bits = gmats[g].bits, cb = gmats[g].cb;
-    int words = 256 * bits / 16;
+    int ki = gmats[g].ki, nj = gmats[g].nj, bits = gmats[g].bits, frac = gmats[g].frac, cb = gmats[g].cb;
+    int words = 16 * bits + 8 * frac;
     int ns = gridDim.y * 16;
     int cid = blockIdx.y * 16 + sub;
     int k0 = (ki * cid) / ns, k1 = (ki * (cid + 1)) / ns;
@@ -1230,11 +1349,11 @@ __global__ void __launch_bounds__(256, 6) gemv_grouped_kernel(const float* __res
     int tt[16];
     #pragma unroll
     for (int r = 0; r < 16; ++r) tt[r] = pinv[r * 16 + c];
-    const int nw = bits * 256 / 32;
+    const int nw = (16 * bits + 8 * frac) / 2;
     int wo[16];
     #pragma unroll
     for (int r = 0; r < 16; ++r) {
-        const int b0 = tt[r] * bits + bits - 16 + 256 * bits;
+        const int b0 = window_end(tt[r], bits, frac) - 16 + nw * 32;
         const int b2 = b0 + 16;
         const int i0 = b0 >> 5, i1 = (b2 - 1) >> 5;
         wo[r] = (i0 % nw) | ((i1 % nw) << 8) | (((i1 + 1) * 32 - b2) << 16);
@@ -1251,7 +1370,10 @@ __global__ void __launch_bounds__(256, 6) gemv_grouped_kernel(const float* __res
         #pragma unroll
         for (int t = 0; t < T; ++t) {
             int j = blockIdx.x + t * gridDim.x;
-            twp[t] = (j < nj) ? (const uint32_t*) (trellis + (long)(i * nj + j) * words) : nullptr;
+            if constexpr (Band8)   // band8 tile address; the decode/FMA order is unchanged
+                twp[t] = (j < nj) ? (const uint32_t*) (trellis + (((size_t) (j / 8) * ki + i) * 8 + j % 8) * words) : nullptr;
+            else
+                twp[t] = (j < nj) ? (const uint32_t*) (trellis + (long)(i * nj + j) * words) : nullptr;
         }
         #pragma unroll
         for (int r = 0; r < 16; ++r) {
@@ -1312,7 +1434,8 @@ __global__ void __launch_bounds__(256, 6) gemv_grouped_kernel(const float* __res
 // GROUP instead of once per route.  mul1 only (the packed tricks are cb == 2): the dispatcher
 // keeps the scalar prototype for every other codebook, and bits <= 5 uses the single-funnel
 // runs exactly like the indexed kernel.
-template <int T, int MAX_ROWS, bool Partials = false, bool Fused = false, bool FusedSilu = false>
+template <int T, int MAX_ROWS, bool Partials = false, bool Fused = false, bool FusedSilu = false,
+          bool Band8 = false>
 __global__ void __launch_bounds__(256, 4) gemv_grouped_rdna_kernel(const float* __restrict__ xh,
                                     const Exl3Mat* __restrict__ gmats,
                                     const int* __restrict__ gfirst, const int* __restrict__ grows,
@@ -1324,13 +1447,13 @@ __global__ void __launch_bounds__(256, 4) gemv_grouped_rdna_kernel(const float* 
     int g = blockIdx.z;
     int c = threadIdx.x & 15, sub = threadIdx.x >> 4;
     const int first = gfirst[g], rows = grows[g];
-    const int ki = gmats[g].ki, nj = gmats[g].nj, bits = gmats[g].bits;
-    const int words = 256 * bits / 16;
+    const int ki = gmats[g].ki, nj = gmats[g].nj, bits = gmats[g].bits, frac = gmats[g].frac;
+    const int words = 16 * bits + 8 * frac;   // a frac tile carries 16K+8 uint16 words
     const int ns = gridDim.y * 16;
     const int cid = blockIdx.y * 16 + sub;
     const int k0 = (ki * cid) / ns, k1 = (ki * (cid + 1)) / ns;
     const uint16_t* trellis = gmats[g].trellis;
-    const int nw = bits * 256 / 32;
+    const int nw = words / 2;
     const float* xrow = xh + (long) first * (ki * 16);
     int row_stride = ki * 16;
     if constexpr (Fused) {
@@ -1375,9 +1498,16 @@ __global__ void __launch_bounds__(256, 4) gemv_grouped_rdna_kernel(const float* 
     const bool wide = bits > 5;
     #pragma unroll
     for (int q = 0; q < 4; ++q) {
-        const int B0 = (t0_run + 8 * q) * bits + bits - 16 + 256 * bits;
+        int B0, Blast;   // the run's four-window span in ring bits (see the indexed twin)
+        if (frac == 0) {
+            B0 = (t0_run + 8 * q) * bits + bits - 16 + 256 * bits;
+            Blast = B0 + 3 * bits;
+        } else {
+            B0 = window_end(rdna_run_first(t0_run, q), bits, 1) - 16 + nw * 32;
+            Blast = window_end(rdna_run_first(t0_run, q) + 3, bits, 1) - 16 + nw * 32;
+        }
         if (!wide)
-            run[q][0] = rdna_span(nw, B0, B0 + 3 * bits);
+            run[q][0] = rdna_span(nw, B0, Blast);
         else {
             run[q][0] = rdna_span(nw, B0, B0 + bits);
             run[q][1] = rdna_span(nw, B0 + 2 * bits, B0 + 3 * bits);
@@ -1393,7 +1523,10 @@ __global__ void __launch_bounds__(256, 4) gemv_grouped_rdna_kernel(const float* 
         #pragma unroll
         for (int t = 0; t < T; ++t) {
             int j = Fused ? blockIdx.x * T + t : blockIdx.x + t * gridDim.x;
-            twp[t] = (j < nj) ? (const uint32_t*) (trellis + (long)(i * nj + j) * words) : nullptr;
+            if constexpr (Band8)   // band8 tile address; the run decode and per-row FMA order are unchanged
+                twp[t] = (j < nj) ? (const uint32_t*) (trellis + (((size_t) (j / 8) * ki + i) * 8 + j % 8) * words) : nullptr;
+            else
+                twp[t] = (j < nj) ? (const uint32_t*) (trellis + (long)(i * nj + j) * words) : nullptr;
         }
         uint32_t f[T][4];
         #pragma unroll
@@ -1416,8 +1549,9 @@ __global__ void __launch_bounds__(256, 4) gemv_grouped_rdna_kernel(const float* 
             for (int t = 0; t < T; ++t) {
                 if (!twp[t]) continue;
                 uint32_t win;
-                if (!wide)
-                    win = f[t][q] >> (bits * (3 - j));
+                if (!wide)   // frac: the per-window S() prefix sums replace bits*(3-j)
+                    win = f[t][q] >> (frac ? rdna_run_shift(rdna_run_first(t0_run, q), j, bits, frac)
+                                            : bits * (3 - j));
                 else if (j < 2)
                     win = j == 0 ? (f[t][q] >> bits) : f[t][q];
                 else {
@@ -1548,6 +1682,7 @@ template <typename T> struct MoeBuffer {
 
 struct Exl3MoeWorkspace::Impl {
     int device = -1;
+    Exl3TrellisLayout layout = Exl3TrellisLayout::Native;   // device-only tables' declared format
     MoeBuffer<Exl3Mat> gate, up, down;
     MoeBuffer<uint16_t> g, u, h, d;
     MoeBuffer<float> xh, z, weights, partials;
@@ -1558,6 +1693,12 @@ struct Exl3MoeWorkspace::Impl {
     MoeBuffer<float> group_y, group_reconstruct;
     MoeBuffer<uint16_t> wmma_x;   // the gfx11 matrix-core group FFN's gathered h128 slab
     MoeBuffer<Exl3Group> expert_groups;
+    // STRATA_EXL3_RECON_BATCH (C2): the batched weight-reconstruction scratch (see
+    // reserve_recon_batch).  recon_slab is 2 x experts_cap F16 matrices (gate/up interleaved,
+    // one per z of the fused tile kernel; down reuses region 0 after the up GEMM, stream-ordered).
+    MoeBuffer<Exl3Group> recon_groups;
+    MoeBuffer<uint16_t> recon_slab, recon_xpad, recon_gu, recon_h;
+    MoeBuffer<float> recon_y;
     // the PROTOTYPE grouped small-M arm's route-plan buffers (diagnostic-only; see the kernels above)
     MoeBuffer<Exl3Mat> smallm_gate, smallm_up, smallm_down;
     MoeBuffer<int> smallm_first, smallm_rows;
@@ -1575,6 +1716,17 @@ Exl3MoeWorkspace::~Exl3MoeWorkspace() {
     if (previous != -1) (void) cudaSetDevice(previous);
 }
 Exl3MoeWorkspace::Impl& Exl3MoeWorkspace::implementation() { return *impl_; }
+
+// Header contract: pure host state for the device-only descriptor entries - no allocation, no
+// launch, no sync.  An unknown enum value (not Native/Band8) throws; every defined value is
+// accepted because refusing here would strand a backing that legitimately declares it (the
+// per-entry eligibility checks still refuse rates the kernels do not carry).
+void Exl3MoeWorkspace::set_trellis_layout(Exl3TrellisLayout layout) {
+    if (layout != Exl3TrellisLayout::Native && layout != Exl3TrellisLayout::Band8)
+        throw std::invalid_argument("exl3: unknown trellis layout " + std::to_string((uint32_t) layout));
+    impl_->layout = layout;
+}
+Exl3TrellisLayout Exl3MoeWorkspace::trellis_layout() const { return impl_->layout; }
 void Exl3MoeWorkspace::reserve(int routes, int n_in, int n_ff, int n_out, bool indexed) {
     int device = -1;
     if (routes < 1 || n_in < 1 || n_ff < 1 || n_out < 1 ||
@@ -1648,6 +1800,21 @@ void Exl3MoeWorkspace::reserve_expert_batch(int groups, int routes, int n_in, in
     impl_->expert_groups.reserve((size_t) groups);
 }
 
+void Exl3MoeWorkspace::reserve_recon_batch(int experts_cap, int rows_cap, int n_in, int n_ff, int n_out) {
+    if (experts_cap < 1 || experts_cap > 16 || rows_cap < 16 || rows_cap > 4096 ||
+        n_in < 128 || n_ff < 128 || n_out < 128 || (size_t) n_in * n_ff > (size_t) 1 << 30)
+        throw std::invalid_argument("exl3: invalid recon batch reserve geometry");
+    auto& w = *impl_;
+    const size_t one = std::max((size_t) n_in * (size_t) n_ff, (size_t) n_ff * (size_t) n_out);
+    w.recon_groups.reserve((size_t) experts_cap);
+    w.recon_slab.reserve(2 * (size_t) experts_cap * one);          // gate+up interleaved; down reuses 0
+    w.recon_xpad.reserve((size_t) rows_cap * (size_t) n_in);       // padded [B][M][k] F16, B*M <= rows_cap
+    w.recon_y.reserve(2 * (size_t) rows_cap * (size_t) n_ff +      // gate/up GEMM outputs [2][B][M][ff]
+                      (size_t) rows_cap * (size_t) n_out);         // down GEMM output [B][M][n]
+    w.recon_gu.reserve(2 * (size_t) rows_cap * (size_t) n_ff);     // the rounded gate/up F16 planes
+    w.recon_h.reserve((size_t) rows_cap * (size_t) n_ff);          // silu(g)*u slab
+}
+
 // The PROTOTYPE grouped small-M arm's buffers only, so a diagnostic caller can pre-reserve before
 // timed/captured execution like the other arms do. Same grow-only contract as reserve().
 void Exl3MoeWorkspace::reserve_small_m(int routes, int groups, int n_in, int n_ff, int n_out) {
@@ -1663,9 +1830,12 @@ void Exl3MoeWorkspace::reserve_small_m(int routes, int groups, int n_in, int n_f
 size_t Exl3MoeWorkspace::allocated_bytes() const {
     const auto& w=*impl_;
     return (w.gate.capacity+w.up.capacity+w.down.capacity)*sizeof(Exl3Mat) +
-        (w.g.capacity+w.u.capacity+w.h.capacity+w.d.capacity+w.group_x.capacity+w.group_weight.capacity+w.wmma_x.capacity+w.xh16.capacity)*sizeof(uint16_t) +
-        (w.xh.capacity+w.z.capacity+w.weights.capacity+w.partials.capacity+w.group_y.capacity+w.group_reconstruct.capacity)*sizeof(float) +
-        (w.pinv.capacity+w.fuse_counters.capacity)*sizeof(int)+w.expert_groups.capacity*sizeof(Exl3Group) +
+        (w.g.capacity+w.u.capacity+w.h.capacity+w.d.capacity+w.group_x.capacity+w.group_weight.capacity+w.wmma_x.capacity+w.xh16.capacity+
+         w.recon_slab.capacity+w.recon_xpad.capacity+w.recon_gu.capacity+w.recon_h.capacity)*sizeof(uint16_t) +
+        (w.xh.capacity+w.z.capacity+w.weights.capacity+w.partials.capacity+w.group_y.capacity+w.group_reconstruct.capacity+
+         w.recon_y.capacity)*sizeof(float) +
+        (w.pinv.capacity+w.fuse_counters.capacity)*sizeof(int)+w.expert_groups.capacity*sizeof(Exl3Group)+
+         w.recon_groups.capacity*sizeof(Exl3Group) +
         (w.smallm_gate.capacity+w.smallm_up.capacity+w.smallm_down.capacity)*sizeof(Exl3Mat) +
         (w.smallm_first.capacity+w.smallm_rows.capacity)*sizeof(int);
 }
@@ -1720,7 +1890,9 @@ template <bool Masked = false>
 uint16_t* moe_run_experts_dev(Exl3Mat* d_gate, Exl3Mat* d_up, Exl3Mat* d_down, int n_experts,
                               const uint16_t* x, cudaStream_t st, Exl3MoeWorkspace& owner,
                               long x_stride, const int* input_rows, int k, int ff, int n,
-                              uint16_t* direct_out = nullptr) {
+                              uint16_t* direct_out = nullptr, int native_rates = 0,
+                              bool band8 = false) {
+    const bool native = native_rates != 0;
     auto& w = owner.implementation();
     uint16_t* d_g = w.g.p; uint16_t* d_u = w.u.p; uint16_t* d_h = w.h.p;
     uint16_t* d_d = direct_out ? direct_out : w.d.p;
@@ -1740,10 +1912,7 @@ uint16_t* moe_run_experts_dev(Exl3Mat* d_gate, Exl3Mat* d_up, Exl3Mat* d_down, i
     // bit-identical to the scalar kernel; 2 = additionally fp16 weight pairs + v_dot2_f32_f16 over
     // fp16 activations (the reference engine's arithmetic).  0/absent = the established kernel.
 #if defined(STRATA_WMMA_GFX11)
-    static const int rdna = [] {
-        const char* value = std::getenv("STRATA_EXL3_RDNA");
-        return value ? std::max(0, std::min(2, std::atoi(value))) : 0;
-    }();
+    const int rdna = rdna_level();
 #else
     static constexpr int rdna = 0;
 #endif
@@ -1760,6 +1929,7 @@ uint16_t* moe_run_experts_dev(Exl3Mat* d_gate, Exl3Mat* d_up, Exl3Mat* d_down, i
 #else
     static constexpr int fuse = 0;
 #endif
+    const int actual_fuse = native ? 0 : fuse;
     // lazy opt-in scratch (see reserve): xh16 only when RDNA=2 without fusion reads it, the
     // arrival counters only when the fused epilogue (FUSE >= 2) actually runs.  Growth happens on
     // the first (warm, non-captured - the slot-table contract) call only; captured replays find
@@ -1782,7 +1952,33 @@ uint16_t* moe_run_experts_dev(Exl3Mat* d_gate, Exl3Mat* d_up, Exl3Mat* d_down, i
         d_counters = w.fuse_counters.p;
     }
     auto project = [&](Exl3Mat* mats, int outputs, int parts, uint16_t* out, int ki16,
-                       bool is_down = false) {
+                        bool is_down = false) {
+#if defined(STRATA_WMMA_GFX11)
+        if (native) {
+            // ExLlama's occupancy-aware split (one full residency wave), not sixteen tiny
+            // partitions regardless of route count. Trellis stays in our resident arena.
+            const int items = (outputs / 128) * n_experts;
+            const int ps = std::max(1, std::min(parts, std::min(ki16 / 8, (288 + items - 1) / items)));
+            const int widest = ((ki16 / 8 + ps - 1) / ps) * 128;
+            // The native core's Band8 form is the same register-prefetch decode with the band8
+            // tile address (rdna_native::gemv's template); selected on the host at this launch.
+            if (native_rates & 1)
+                band8_dispatch(band8, [&](auto b8) {
+                    constexpr bool B8 = decltype(b8)::value;
+                    rdna_native::gemv<false, B8><<<dim3(outputs / 128, ps, n_experts), 256, (size_t) widest * 4, st>>>(
+                        d_xh, mats, w.partials.p, ps);
+                });
+            if (native_rates & 2)
+                band8_dispatch(band8, [&](auto b8) {
+                    constexpr bool B8 = decltype(b8)::value;
+                    rdna_native::gemv<true, B8><<<dim3(outputs / 128, ps, n_experts), 256, (size_t) widest * 4, st>>>(
+                        d_xh, mats, w.partials.p, ps);
+                });
+            postscale_batched_kernel<Masked><<<dim3(outputs / HAD, n_experts), HAD, 0, st>>>(
+                w.partials.p, mats, out, outputs, ps);
+            return;
+        }
+#endif
         const dim3 grid((outputs / 16 + GEMV_T - 1) / GEMV_T, parts, n_experts);
         size_t smem = 0;
         if (fuse) {
@@ -1805,14 +2001,26 @@ uint16_t* moe_run_experts_dev(Exl3Mat* d_gate, Exl3Mat* d_up, Exl3Mat* d_down, i
                 else if (is_down) xin = d_h;
                 if (rdna == 1) {
                     if (fuse == 3 && is_down)
-                        gemv_batched_rdna_kernel<GEMV_T, true, 1, true, true, true, Masked><<<grid, 256, smem, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p, xin, xin_stride, is_down ? nullptr : input_rows, out, d_counters, silu_mul);
+                        band8_dispatch(band8, [&](auto b8) {
+                            constexpr bool B8 = decltype(b8)::value;
+                            gemv_batched_rdna_kernel<GEMV_T, true, 1, true, true, true, Masked, B8><<<grid, 256, smem, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p, xin, xin_stride, is_down ? nullptr : input_rows, out, d_counters, silu_mul);
+                        });
                     else
-                        gemv_batched_rdna_kernel<GEMV_T, true, 1, true, true, false, Masked><<<grid, 256, smem, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p, xin, xin_stride, is_down ? nullptr : input_rows, out, d_counters);
+                        band8_dispatch(band8, [&](auto b8) {
+                            constexpr bool B8 = decltype(b8)::value;
+                            gemv_batched_rdna_kernel<GEMV_T, true, 1, true, true, false, Masked, B8><<<grid, 256, smem, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p, xin, xin_stride, is_down ? nullptr : input_rows, out, d_counters);
+                        });
                 } else {
                     if (fuse == 3 && is_down)
-                        gemv_batched_rdna_kernel<GEMV_T, true, 2, true, true, true, Masked><<<grid, 256, smem, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p, xin, xin_stride, is_down ? nullptr : input_rows, out, d_counters, silu_mul);
+                        band8_dispatch(band8, [&](auto b8) {
+                            constexpr bool B8 = decltype(b8)::value;
+                            gemv_batched_rdna_kernel<GEMV_T, true, 2, true, true, true, Masked, B8><<<grid, 256, smem, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p, xin, xin_stride, is_down ? nullptr : input_rows, out, d_counters, silu_mul);
+                        });
                     else
-                        gemv_batched_rdna_kernel<GEMV_T, true, 2, true, true, false, Masked><<<grid, 256, smem, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p, xin, xin_stride, is_down ? nullptr : input_rows, out, d_counters);
+                        band8_dispatch(band8, [&](auto b8) {
+                            constexpr bool B8 = decltype(b8)::value;
+                            gemv_batched_rdna_kernel<GEMV_T, true, 2, true, true, false, Masked, B8><<<grid, 256, smem, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p, xin, xin_stride, is_down ? nullptr : input_rows, out, d_counters);
+                        });
                 }
                 return;   // the epilogue already wrote `out`
             }
@@ -1820,32 +2028,56 @@ uint16_t* moe_run_experts_dev(Exl3Mat* d_gate, Exl3Mat* d_up, Exl3Mat* d_down, i
                 const uint16_t* xin = is_down ? d_h : x;
                 const long xin_stride = is_down ? (long) ff : x_stride;
                 if (rdna == 1)
-                    gemv_batched_rdna_kernel<GEMV_T, true, 1, true, false, false, Masked><<<grid, 256, smem, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p, xin, xin_stride, is_down ? nullptr : input_rows);
+                    band8_dispatch(band8, [&](auto b8) {
+                        constexpr bool B8 = decltype(b8)::value;
+                        gemv_batched_rdna_kernel<GEMV_T, true, 1, true, false, false, Masked, B8><<<grid, 256, smem, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p, xin, xin_stride, is_down ? nullptr : input_rows);
+                    });
                 else
-                    gemv_batched_rdna_kernel<GEMV_T, true, 2, true, false, false, Masked><<<grid, 256, smem, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p, xin, xin_stride, is_down ? nullptr : input_rows);
+                    band8_dispatch(band8, [&](auto b8) {
+                        constexpr bool B8 = decltype(b8)::value;
+                        gemv_batched_rdna_kernel<GEMV_T, true, 2, true, false, false, Masked, B8><<<grid, 256, smem, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p, xin, xin_stride, is_down ? nullptr : input_rows);
+                    });
             } else if (rdna == 1)
-                gemv_batched_rdna_kernel<GEMV_T, true, 1, false, false, false, Masked><<<grid, 256, 0, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p);
+                band8_dispatch(band8, [&](auto b8) {
+                    constexpr bool B8 = decltype(b8)::value;
+                    gemv_batched_rdna_kernel<GEMV_T, true, 1, false, false, false, Masked, B8><<<grid, 256, 0, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p);
+                });
             else if (rdna == 2)
-                gemv_batched_rdna_kernel<GEMV_T, true, 2, false, false, false, Masked><<<grid, 256, 0, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p);
+                band8_dispatch(band8, [&](auto b8) {
+                    constexpr bool B8 = decltype(b8)::value;
+                    gemv_batched_rdna_kernel<GEMV_T, true, 2, false, false, false, Masked, B8><<<grid, 256, 0, st>>>(d_xh, d_xh16, mats, d_pinv, w.partials.p);
+                });
             else
 #endif
-            gemv_batched_kernel<GEMV_T, true, Masked><<<grid, 256, 0, st>>>(d_xh, mats, d_pinv, w.partials.p);
+            band8_dispatch(band8, [&](auto b8) {
+                constexpr bool B8 = decltype(b8)::value;
+                gemv_batched_kernel<GEMV_T, true, Masked, B8><<<grid, 256, 0, st>>>(d_xh, mats, d_pinv, w.partials.p);
+            });
             postscale_batched_kernel<Masked><<<dim3(outputs / HAD, n_experts), HAD, 0, st>>>(w.partials.p, mats, out, outputs, parts);
         } else {
 #if defined(STRATA_WMMA_GFX11)
             if (rdna == 1)
-                gemv_batched_rdna_kernel<GEMV_T, false, 1><<<grid, 256, 0, st>>>(d_xh, d_xh16, mats, d_pinv, d_z);
+                band8_dispatch(band8, [&](auto b8) {
+                    constexpr bool B8 = decltype(b8)::value;
+                    gemv_batched_rdna_kernel<GEMV_T, false, 1, false, false, false, false, B8><<<grid, 256, 0, st>>>(d_xh, d_xh16, mats, d_pinv, d_z);
+                });
             else if (rdna == 2)
-                gemv_batched_rdna_kernel<GEMV_T, false, 2><<<grid, 256, 0, st>>>(d_xh, d_xh16, mats, d_pinv, d_z);
+                band8_dispatch(band8, [&](auto b8) {
+                    constexpr bool B8 = decltype(b8)::value;
+                    gemv_batched_rdna_kernel<GEMV_T, false, 2, false, false, false, false, B8><<<grid, 256, 0, st>>>(d_xh, d_xh16, mats, d_pinv, d_z);
+                });
             else
 #endif
-            gemv_batched_kernel<GEMV_T><<<grid, 256, 0, st>>>(d_xh, mats, d_pinv, d_z);
+            band8_dispatch(band8, [&](auto b8) {
+                constexpr bool B8 = decltype(b8)::value;
+                gemv_batched_kernel<GEMV_T, false, false, B8><<<grid, 256, 0, st>>>(d_xh, mats, d_pinv, d_z);
+            });
             postscale_batched_kernel<<<dim3(outputs / HAD, n_experts), HAD, 0, st>>>(d_z, mats, out, outputs);
         }
     };
     auto prescale = [&](const uint16_t* xin, long stride, Exl3Mat* mats, int kk, long nz,
                         const int* rows) {
-        if (fuse) return;   // the GEMV prologue Hadamards its own slice
+        if (actual_fuse) return;   // the GEMV prologue Hadamards its own slice
         // the DOWN projection reads the route-major FFN slab: no token gather there (the
         // established code passes no input_rows on that call - keep that byte-for-byte)
         prescale_batched_kernel<Masked><<<dim3(kk / HAD, n_experts), HAD, 0, st>>>(xin, stride, mats, d_xh, kk, d_z, nz, rows, d_xh16);
@@ -1854,7 +2086,7 @@ uint16_t* moe_run_experts_dev(Exl3Mat* d_gate, Exl3Mat* d_up, Exl3Mat* d_down, i
     project(d_gate, ff, gy_g, d_g, k / 16);
     prescale(x, x_stride, d_up, k, (long) n_experts * ff, input_rows);
     project(d_up, ff, gy_g, d_u, k / 16);
-    if (fuse != 3) {
+    if (actual_fuse != 3) {
         long tot = (long)n_experts * ff;
         silu_batched_kernel<Masked><<<(unsigned)((tot + 255) / 256), 256, 0, st>>>(d_g, d_u, d_h, tot, d_gate, ff);
     }
@@ -1875,12 +2107,40 @@ uint16_t* moe_run_experts(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat*
         for (const Exl3Mat* m : {&gate[e], &up[e], &down[e]})
             if (!m->trellis || !m->suh || !m->svh || m->ki <= 0 || m->ki > INT32_MAX / 16 ||
                 m->nj <= 0 || m->nj > INT32_MAX / 16 || m->ki % 8 || m->nj % 8 ||
-                m->bits < 1 || m->bits > 8 || m->cb < 0 || m->cb > 2)
+                m->bits < 1 || m->bits > 8 || (m->bits == 8 && m->frac != 0) || m->cb < 0 || m->cb > 2)
                 throw std::invalid_argument("exl3: invalid FFN matrix geometry");
         if (gate[e].ki != gate[0].ki || gate[e].nj != gate[0].nj || up[e].ki != gate[0].ki ||
             up[e].nj != gate[0].nj || down[e].ki != gate[0].nj || down[e].nj != down[0].nj)
             throw std::invalid_argument("exl3: mixed FFN dimensions");
     }
+    // Physical layout: every projection of every expert must declare the SAME tag (mixed tags
+    // throw before anything is uploaded or launched).  A Band8 tag additionally requires the
+    // verified band8 rates - cb=mul1 K2/K2.5/K3/K4 - which band8_matrix_valid refuses loudly
+    // instead of letting packed bytes reach a native-layout reader.  All-Native calls keep the
+    // established dispatch byte-for-byte.
+    const Exl3TrellisLayout layout = checked_uniform_layout(gate, up, down, n_experts, "FFN");
+    const bool band8 = layout == Exl3TrellisLayout::Band8;
+    if (band8)
+        for (int e = 0; e < n_experts; ++e)
+            for (const Exl3Mat* m : {&gate[e], &up[e], &down[e]})
+                if (!band8_matrix_valid(*m))
+                    throw std::invalid_argument(
+                        "exl3: Band8 FFN weights need cb=mul1 K2/K2.5/K3/K4 at 128-multiple dims");
+#if defined(STRATA_WMMA_GFX11)
+    // The RDNA decode twins (STRATA_EXL3_RDNA, opt-in) decode RUNS of consecutive windows through
+    // one funnel: the run geometry now carries the alternating KA/KA+1-bit steps of a half-integer
+    // bitrate (window_end-anchored spans, S()-prefix-sum shifts), so frac tiles up to K 4.5 run
+    // the twins. KA >= 5 frac windows can exceed the single funnel's 32 bits (the integer form
+    // switches to two pair funnels at bits 6; the frac twin has no such form) - reject those
+    // loudly instead of decoding garbage; the established scalar kernel handles every frac.
+    if (rdna_level() >= 1)
+        for (int e = 0; e < n_experts; ++e)
+            for (const Exl3Mat* m : {&gate[e], &up[e], &down[e]})
+                if (m->frac != 0 && (m->bits > 4 || m->cb != 2))
+                    throw std::invalid_argument(
+                        "exl3: STRATA_EXL3_RDNA decodes half-integer bitrates up to K 4.5 (mul1); "
+                        "unset it for wider frac tiles");
+#endif
     const int k = gate[0].ki * 16;
     const int ff = gate[0].nj * 16;
     const int n = down[0].nj * 16;
@@ -1899,8 +2159,29 @@ uint16_t* moe_run_experts(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat*
         (void) cudaGetLastError();
         throw std::runtime_error("exl3: descriptor upload failed");
     }
+    bool native = false;
+    int native_rates = 0;
+#if defined(STRATA_WMMA_GFX11)
+    static const bool native_on = [] {
+        const char* e = std::getenv("STRATA_EXL3_RDNA_NATIVE"); return e && e[0] == '1';
+    }();
+    native = native_on && input_rows != nullptr;
+    for (int e = 0; native && e < n_experts; ++e)
+        for (const Exl3Mat* m : {&gate[e], &up[e], &down[e]}) {
+            native = native && m->bits == 2 && m->cb == 2;
+            native_rates |= m->frac ? 2 : 1;
+        }
+    if (native) {
+        static const bool announced = [] {
+            std::fprintf(stderr, "exl3: native RDNA3 K2/K2.5 indexed GEMV (register prefetch, dot2, adaptive splits)\n");
+            return true;
+        }();
+        (void) announced;
+    }
+#endif
     return moe_run_experts_dev(d_gate, d_up, d_down, n_experts, x, st, owner,
-                              x_stride, input_rows, k, ff, n, direct_out);
+                              x_stride, input_rows, k, ff, n, direct_out, native ? native_rates : 0,
+                              band8);
 }
 
 }  // namespace
@@ -1959,9 +2240,11 @@ void exl3_moe_rows_slot_table(const Exl3Mat* d_gate_table, const Exl3Mat* d_up_t
     gather_slot_mats_kernel<<<gb, 64, 0, st>>>(d_up_table, d_slot_of_route, table_slots, w.up.p, routes);
     gather_slot_mats_kernel<<<gb, 64, 0, st>>>(d_down_table, d_slot_of_route, table_slots, w.down.p, routes);
     // x is the dense window token buffer [tokens, n_in]: the gather stride is the row pitch n_in
-    // (the host callers pass the same value as x_stride).
+    // (the host callers pass the same value as x_stride).  The slot tables are DEVICE-resident,
+    // so the physical layout is the workspace's declared mode, not a per-call descriptor read.
     uint16_t* rows = moe_run_experts_dev(w.gate.p, w.up.p, w.down.p, routes, x, st, workspace, (long) n_in,
-                                         input_rows, n_in, n_ff, n_out);
+                                         input_rows, n_in, n_ff, n_out, nullptr, 0,
+                                         w.layout == Exl3TrellisLayout::Band8);
     if (cudaMemcpyAsync(out, rows, (size_t) routes * n_out * sizeof(uint16_t), cudaMemcpyDeviceToDevice, st) != cudaSuccess)
         throw std::runtime_error("exl3: slot-table FFN output copy failed");
 }
@@ -1992,14 +2275,63 @@ void exl3_moe_rows_indexed_device_plan(const Exl3Mat* gate, const Exl3Mat* up, c
 const uint16_t* exl3_moe_rows_masked(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down,
                           int routes, int n_in, int n_ff, int n_out, const uint16_t* x,
                           const int* input_rows, void* stream,
-                          Exl3MoeWorkspace& workspace) {
+                          Exl3MoeWorkspace& workspace, int native_rates) {
+#if !defined(STRATA_WMMA_GFX11)
+    native_rates = 0;
+#endif
     // No reserve, readback or synchronization here: all storage belongs to the graph owner.
+    // The descriptors are DEVICE-resident, so the physical layout comes from the workspace's
+    // declared mode (set once by the table owner; the set_trellis_layout contract) - it is not
+    // read back per call.
     return moe_run_experts_dev<true>(const_cast<Exl3Mat*>(gate), const_cast<Exl3Mat*>(up),
         const_cast<Exl3Mat*>(down), routes, x, (cudaStream_t) stream, workspace,
-        n_in, input_rows, n_in, n_ff, n_out);
+        n_in, input_rows, n_in, n_ff, n_out, nullptr, native_rates,
+        workspace.implementation().layout == Exl3TrellisLayout::Band8);
 }
 
 namespace {
+
+// ---- native grouped admission + k-partition planning (HOST-ONLY; one shared source for
+// admission in moe_rows_grouped_impl and dispatch in moe_run_experts_grouped_dev so the
+// two can never diverge).  Everything here is pure scalar logic over descriptor FIELDS -
+// no pointer is dereferenced, nothing launches - so a malformed plan decision costs
+// nothing and cannot touch memory.  64-bit arithmetic throughout: outputs/128 * groups
+// and ki*16*width*2 stay in range for any descriptor the generic validation admits, and
+// the safeguard costs nothing.
+// The LDS budget keeps the repo's fused-arm 40 KiB ceiling (the scalar twin's own gate)
+// minus the fused prologue's 1 KiB static butterfly; gfx1100 gives a CU 64 KiB of LDS,
+// so the budget sits strictly inside the hardware limit without an opt-in attribute.
+constexpr int64_t kNativeGroupedLdsBudget = 40 * 1024;
+constexpr int64_t kNativeGroupedStaticFused = 1024;
+
+int64_t native_grouped_widest(int64_t ki, int64_t ps) {   // fp16 elements, widest partition
+    int64_t widest = 0;
+    for (int64_t i = 0; i < ps; ++i)
+        widest = std::max(widest, (ki * (i + 1)) / ps - (ki * i) / ps);
+    return widest * 16;
+}
+
+// STRATA_EXL3_GEMV_SPLIT, read per call (the plan's caps must follow the env the caller
+// sees; the ESTABLISHED arm keeps its own process-lifetime static read untouched).
+int64_t native_gemv_split_cap() {
+    const char* value = std::getenv("STRATA_EXL3_GEMV_SPLIT");
+    return value ? std::max<int64_t>(1, std::min<int64_t>(16, std::atoi(value)))
+                 : std::numeric_limits<int64_t>::max();
+}
+
+// Smallest parts count at or above the indexed-native occupancy heuristic whose widest
+// fp16 slice fits the budget; 0 when even parts_cap cannot (the caller must then keep the
+// established arm - an infeasible shape is REFUSED, never launched).
+int64_t native_grouped_parts(int64_t outputs, int64_t parts_cap, int64_t ki, int64_t width,
+                             int64_t groups, int64_t static_smem) {
+    if (parts_cap < 1 || ki < 1 || width < 1 || groups < 1 || outputs < 128) return 0;
+    const int64_t items = (outputs / 128) * groups;
+    int64_t heuristic = std::min<int64_t>({parts_cap, ki / 8, (288 + items - 1) / items});
+    const int64_t budget = kNativeGroupedLdsBudget - static_smem;
+    for (int64_t ps = std::max<int64_t>(1, heuristic); ps <= parts_cap; ++ps)
+        if (native_grouped_widest(ki, ps) * width * 2 <= budget) return ps;
+    return 0;
+}
 
 // Device tail of the prototype grouped FFN.  Constraint: same launch cadence and the same
 // ROUTE-major scratch layout as moe_run_experts_dev's indexed arm (prescale -> gemv -> postscale
@@ -2007,11 +2339,16 @@ namespace {
 // per-GROUP descriptors resident on the device; d_gfirst/d_grows are the per-group route table.
 // `max_rows` is the window's LARGEST group (host-validated) and picks the GEMV instantiation,
 // so only windows that really hold m-row groups pay the wider accumulators.
+// ps_g/ps_u/ps_d are the ALREADY-VALIDATED partition counts from exl3_native_grouped_plan
+// (0 together with the matching rate = this projection keeps the established kernels).
+template <bool Band8 = false>
 uint16_t* moe_run_experts_grouped_dev(const Exl3Mat* d_gate, const Exl3Mat* d_up, const Exl3Mat* d_down,
                                       const int* d_gfirst, const int* d_grows, int groups, int routes,
                                       int max_rows, const uint16_t* x, cudaStream_t st, Exl3MoeWorkspace& owner,
                                       long x_stride, const int* input_rows, int k, int ff, int n, int cb,
-                                      bool fused, uint16_t* direct_out = nullptr) {
+                                      bool fused, uint16_t* direct_out = nullptr,
+                                      int rate_g = 0, int rate_u = 0, int rate_d = 0,
+                                      int ps_g = 0, int ps_u = 0, int ps_d = 0) {
     auto& w = owner.implementation();
     uint16_t* d_g = w.g.p; uint16_t* d_u = w.u.p; uint16_t* d_h = w.h.p;
     uint16_t* d_d = direct_out ? direct_out : w.d.p;
@@ -2025,6 +2362,117 @@ uint16_t* moe_run_experts_grouped_dev(const Exl3Mat* d_gate, const Exl3Mat* d_up
         return value ? std::max(1, std::min(16, std::atoi(value))) : std::numeric_limits<int>::max();
     }();
     gy_g = std::min(gy_g, cap); gy_d = std::min(gy_d, cap);
+#if defined(STRATA_WMMA_GFX11)
+    // STRATA_EXL3_NATIVE_GROUPED=1 (default off; moe_rows_grouped_impl admits only K2/K2.5
+    // mul1 groups of <= 4 rows plus the integer K3/K4 mul1 tiles under the gfx11 native
+    // stack): the grouped GEMV runs
+    // rdna_native::gemv_grouped - the indexed native kernel's packed mul1 decode + fdot2 +
+    // register-prefetch core on the GROUP descriptors, so the trellis words load and the
+    // weight pairs decode once per group and each live row consumes them with native dot2
+    // arithmetic.  NOT byte-identical to the scalar/RDNA grouped twin (different FMA order
+    // by design); parity against the CPU oracle is measured in exl3_moe_multi_parity.  The
+    // fp16 activation slices (2 bytes/elem) keep the 40 KB LDS ceiling at the real geometry
+    // with parts = 1; parts otherwise follows the indexed native occupancy split and stays
+    // within gy so the Partials buffer keeps the indexed reserve bound.  Mixed-rate windows
+    // launch the <false> and <true> frac instantiations together; each returns before any
+    // shared state for the groups that are not its rate.
+    if (rate_g | rate_u | rate_d) {
+        static const bool announced = [] {
+            std::fprintf(stderr, "exl3: native RDNA3 grouped GEMV (packed mul1 decode + fdot2, one decode per group)\n");
+            return true;
+        }();
+        (void) announced;
+        const int width = max_rows <= 2 ? max_rows : 4;
+        // ps_* arrived validated from exl3_native_grouped_plan: a nonzero rate always has a
+        // nonzero ps that fits the LDS budget (admission refused otherwise), so the launches
+        // below are feasible by construction - the smem value recomputed here is the same
+        // native_grouped_widest the plan validated.
+        if (fused) {
+            auto project = [&](const Exl3Mat* mats, int outputs, int ps, int rate, int ki,
+                               const uint16_t* xin, long xin_stride, const int* xrows,
+                               uint16_t* out16, const uint16_t* silu_mul) {
+                const size_t smem = (size_t) native_grouped_widest(ki, ps) * width * 2;
+                const dim3 grid(outputs / 128, ps, groups);
+                auto launch = [&](auto r_tag, auto f_tag, auto s_tag, auto kb_tag) {
+                    constexpr int R = decltype(r_tag)::value;
+                    constexpr bool F = decltype(f_tag)::value;
+                    constexpr bool S = decltype(s_tag)::value;
+                    constexpr int KB = decltype(kb_tag)::value;
+                    rdna_native::gemv_grouped<F, R, true, S, KB, Band8><<<grid, 256, smem, st>>>(
+                        nullptr, mats, d_gfirst, d_grows, w.partials.p, xin, xin_stride, xrows, silu_mul);
+                };
+                auto by_silu = [&](auto r_tag, auto f_tag, auto kb_tag) {
+                    if (silu_mul) launch(r_tag, f_tag, std::true_type{}, kb_tag);
+                    else launch(r_tag, f_tag, std::false_type{}, kb_tag);
+                };
+                auto by_rate = [&](auto r_tag) {
+                    if (rate & 1) by_silu(r_tag, std::false_type{}, std::integral_constant<int, 2>{});
+                    if (rate & 2) by_silu(r_tag, std::true_type{}, std::integral_constant<int, 2>{});
+                    if (rate & 4) by_silu(r_tag, std::false_type{}, std::integral_constant<int, 3>{});
+                    if (rate & 8) by_silu(r_tag, std::false_type{}, std::integral_constant<int, 4>{});
+                };
+                if (width == 1) by_rate(std::integral_constant<int, 1>{});
+                else if (width == 2) by_rate(std::integral_constant<int, 2>{});
+                else by_rate(std::integral_constant<int, 4>{});
+                postscale_grouped_kernel<<<dim3(outputs / HAD, groups), HAD, 0, st>>>(
+                    w.partials.p, mats, d_gfirst, d_grows, out16, outputs, ps);
+            };
+            project(d_gate, ff, ps_g, rate_g, k / 16, x, x_stride, input_rows, d_g, nullptr);
+            project(d_up, ff, ps_u, rate_u, k / 16, x, x_stride, input_rows, d_u, nullptr);
+            project(d_down, n, ps_d, rate_d, ff / 16, d_g, ff, nullptr, d_d, d_u);
+            return d_d;
+        }
+        auto project = [&](const Exl3Mat* mats, int outputs, int ps, int rate, int ki,
+                           uint16_t* out16) {
+            const size_t smem = (size_t) native_grouped_widest(ki, ps) * width * 2;
+            const dim3 grid(outputs / 128, ps, groups);
+            auto launch = [&](auto r_tag, auto f_tag, auto kb_tag) {
+                constexpr int R = decltype(r_tag)::value;
+                constexpr bool F = decltype(f_tag)::value;
+                constexpr int KB = decltype(kb_tag)::value;
+                rdna_native::gemv_grouped<F, R, false, false, KB, Band8><<<grid, 256, smem, st>>>(
+                    d_xh, mats, d_gfirst, d_grows, w.partials.p);
+            };
+            if (rate & 1) {
+                if (width == 1) launch(std::integral_constant<int, 1>{}, std::false_type{}, std::integral_constant<int, 2>{});
+                else if (width == 2) launch(std::integral_constant<int, 2>{}, std::false_type{}, std::integral_constant<int, 2>{});
+                else launch(std::integral_constant<int, 4>{}, std::false_type{}, std::integral_constant<int, 2>{});
+            }
+            if (rate & 2) {
+                if (width == 1) launch(std::integral_constant<int, 1>{}, std::true_type{}, std::integral_constant<int, 2>{});
+                else if (width == 2) launch(std::integral_constant<int, 2>{}, std::true_type{}, std::integral_constant<int, 2>{});
+                else launch(std::integral_constant<int, 4>{}, std::true_type{}, std::integral_constant<int, 2>{});
+            }
+            if (rate & 4) {
+                if (width == 1) launch(std::integral_constant<int, 1>{}, std::false_type{}, std::integral_constant<int, 3>{});
+                else if (width == 2) launch(std::integral_constant<int, 2>{}, std::false_type{}, std::integral_constant<int, 3>{});
+                else launch(std::integral_constant<int, 4>{}, std::false_type{}, std::integral_constant<int, 3>{});
+            }
+            if (rate & 8) {
+                if (width == 1) launch(std::integral_constant<int, 1>{}, std::false_type{}, std::integral_constant<int, 4>{});
+                else if (width == 2) launch(std::integral_constant<int, 2>{}, std::false_type{}, std::integral_constant<int, 4>{});
+                else launch(std::integral_constant<int, 4>{}, std::false_type{}, std::integral_constant<int, 4>{});
+            }
+            postscale_grouped_kernel<<<dim3(outputs / HAD, groups), HAD, 0, st>>>(
+                w.partials.p, mats, d_gfirst, d_grows, out16, outputs, ps);
+        };
+        prescale_grouped_kernel<<<dim3(k / HAD, groups), HAD, 0, st>>>(
+            x, x_stride, d_gate, d_gfirst, d_grows, d_xh, k, d_z, (long) routes * ff, input_rows);
+        project(d_gate, ff, ps_g, rate_g, k / 16, d_g);
+        prescale_grouped_kernel<<<dim3(k / HAD, groups), HAD, 0, st>>>(
+            x, x_stride, d_up, d_gfirst, d_grows, d_xh, k, d_z, (long) routes * ff, input_rows);
+        project(d_up, ff, ps_u, rate_u, k / 16, d_u);
+        { long tot = (long) routes * ff;
+          silu_batched_kernel<<<(unsigned)((tot + 255) / 256), 256, 0, st>>>(d_g, d_u, d_h, tot); }
+        prescale_grouped_kernel<<<dim3(ff / HAD, groups), HAD, 0, st>>>(
+            d_h, ff, d_down, d_gfirst, d_grows, d_xh, ff, d_z, (long) routes * n, nullptr);
+        project(d_down, n, ps_d, rate_d, ff / 16, d_d);
+        return d_d;
+    }
+#endif
+    // The scalar/RDMA grouped twins carry the same Band8 tile-address template (selected here,
+    // on the host), so a Band8 window keeps these arms - with or without the native flags - and
+    // stays byte-identical to the native-layout arm of the SAME kernel.
     if (fused) {
         // Tile width changes CTA ownership, not a row's FMA/reduction order.
         // The smaller opt-in trades extra prologues/arrivals for fewer registers.
@@ -2042,14 +2490,17 @@ uint16_t* moe_run_experts_grouped_dev(const Exl3Mat* d_gate, const Exl3Mat* d_up
             auto launch = [&](auto tag, auto tile_tag) {
                 constexpr int R = decltype(tag)::value;
                 constexpr int T = decltype(tile_tag)::value;
-                if (down)
-                    gemv_grouped_rdna_kernel<T, R, true, true, true><<<grid, 256, smem, st>>>(
-                        d_xh, mats, d_gfirst, d_grows, w.partials.p, d_g, ff, nullptr,
-                        d_d, w.fuse_counters.p, d_u);
-                else
-                    gemv_grouped_rdna_kernel<T, R, true, true><<<grid, 256, smem, st>>>(
-                        d_xh, mats, d_gfirst, d_grows, w.partials.p, x, x_stride, input_rows,
-                        mats == d_gate ? d_g : d_u, w.fuse_counters.p);
+                band8_dispatch(Band8, [&](auto b8) {
+                    constexpr bool B8 = decltype(b8)::value;
+                    if (down)
+                        gemv_grouped_rdna_kernel<T, R, true, true, true, B8><<<grid, 256, smem, st>>>(
+                            d_xh, mats, d_gfirst, d_grows, w.partials.p, d_g, ff, nullptr,
+                            d_d, w.fuse_counters.p, d_u);
+                    else
+                        gemv_grouped_rdna_kernel<T, R, true, true, false, B8><<<grid, 256, smem, st>>>(
+                            d_xh, mats, d_gfirst, d_grows, w.partials.p, x, x_stride, input_rows,
+                            mats == d_gate ? d_g : d_u, w.fuse_counters.p);
+                });
             };
             auto by_width = [&](auto tile_tag) {
                 if (width == 1) launch(std::integral_constant<int, 1>{}, tile_tag);
@@ -2073,33 +2524,45 @@ uint16_t* moe_run_experts_grouped_dev(const Exl3Mat* d_gate, const Exl3Mat* d_up
         const dim3 grid((outputs / 16 + GEMV_T - 1) / GEMV_T, parts, groups);
         if (rdna) {
             switch (max_rows) {
-                case 1: gemv_grouped_rdna_kernel<GEMV_T, 1, true><<<grid, 256, 0, st>>>(
-                            d_xh, gmats, d_gfirst, d_grows, w.partials.p); break;
-                case 2: gemv_grouped_rdna_kernel<GEMV_T, 2, true><<<grid, 256, 0, st>>>(
-                            d_xh, gmats, d_gfirst, d_grows, w.partials.p); break;
-                case 3: gemv_grouped_rdna_kernel<GEMV_T, 3, true><<<grid, 256, 0, st>>>(
-                            d_xh, gmats, d_gfirst, d_grows, w.partials.p); break;
-                case 4: gemv_grouped_rdna_kernel<GEMV_T, 4, true><<<grid, 256, 0, st>>>(
-                            d_xh, gmats, d_gfirst, d_grows, w.partials.p); break;
-                case 5: gemv_grouped_rdna_kernel<GEMV_T, 5, true><<<grid, 256, 0, st>>>(
-                            d_xh, gmats, d_gfirst, d_grows, w.partials.p); break;
-                default: gemv_grouped_rdna_kernel<GEMV_T, SMALL_M_MAX_ROWS, true><<<grid, 256, 0, st>>>(
-                            d_xh, gmats, d_gfirst, d_grows, w.partials.p); break;
+                case 1: band8_dispatch(Band8, [&](auto b8) { constexpr bool B8 = decltype(b8)::value;
+                            gemv_grouped_rdna_kernel<GEMV_T, 1, true, false, false, B8><<<grid, 256, 0, st>>>(
+                            d_xh, gmats, d_gfirst, d_grows, w.partials.p); }); break;
+                case 2: band8_dispatch(Band8, [&](auto b8) { constexpr bool B8 = decltype(b8)::value;
+                            gemv_grouped_rdna_kernel<GEMV_T, 2, true, false, false, B8><<<grid, 256, 0, st>>>(
+                            d_xh, gmats, d_gfirst, d_grows, w.partials.p); }); break;
+                case 3: band8_dispatch(Band8, [&](auto b8) { constexpr bool B8 = decltype(b8)::value;
+                            gemv_grouped_rdna_kernel<GEMV_T, 3, true, false, false, B8><<<grid, 256, 0, st>>>(
+                            d_xh, gmats, d_gfirst, d_grows, w.partials.p); }); break;
+                case 4: band8_dispatch(Band8, [&](auto b8) { constexpr bool B8 = decltype(b8)::value;
+                            gemv_grouped_rdna_kernel<GEMV_T, 4, true, false, false, B8><<<grid, 256, 0, st>>>(
+                            d_xh, gmats, d_gfirst, d_grows, w.partials.p); }); break;
+                case 5: band8_dispatch(Band8, [&](auto b8) { constexpr bool B8 = decltype(b8)::value;
+                            gemv_grouped_rdna_kernel<GEMV_T, 5, true, false, false, B8><<<grid, 256, 0, st>>>(
+                            d_xh, gmats, d_gfirst, d_grows, w.partials.p); }); break;
+                default: band8_dispatch(Band8, [&](auto b8) { constexpr bool B8 = decltype(b8)::value;
+                            gemv_grouped_rdna_kernel<GEMV_T, SMALL_M_MAX_ROWS, true, false, false, B8><<<grid, 256, 0, st>>>(
+                            d_xh, gmats, d_gfirst, d_grows, w.partials.p); }); break;
             }
         } else {
             switch (max_rows) {
-                case 1: gemv_grouped_kernel<GEMV_T, 1, true><<<grid, 256, 0, st>>>(
-                            d_xh, gmats, d_gfirst, d_grows, d_pinv, w.partials.p); break;
-                case 2: gemv_grouped_kernel<GEMV_T, 2, true><<<grid, 256, 0, st>>>(
-                            d_xh, gmats, d_gfirst, d_grows, d_pinv, w.partials.p); break;
-                case 3: gemv_grouped_kernel<GEMV_T, 3, true><<<grid, 256, 0, st>>>(
-                            d_xh, gmats, d_gfirst, d_grows, d_pinv, w.partials.p); break;
-                case 4: gemv_grouped_kernel<GEMV_T, 4, true><<<grid, 256, 0, st>>>(
-                            d_xh, gmats, d_gfirst, d_grows, d_pinv, w.partials.p); break;
-                case 5: gemv_grouped_kernel<GEMV_T, 5, true><<<grid, 256, 0, st>>>(
-                            d_xh, gmats, d_gfirst, d_grows, d_pinv, w.partials.p); break;
-                default: gemv_grouped_kernel<GEMV_T, SMALL_M_MAX_ROWS, true><<<grid, 256, 0, st>>>(
-                            d_xh, gmats, d_gfirst, d_grows, d_pinv, w.partials.p); break;
+                case 1: band8_dispatch(Band8, [&](auto b8) { constexpr bool B8 = decltype(b8)::value;
+                            gemv_grouped_kernel<GEMV_T, 1, true, B8><<<grid, 256, 0, st>>>(
+                            d_xh, gmats, d_gfirst, d_grows, d_pinv, w.partials.p); }); break;
+                case 2: band8_dispatch(Band8, [&](auto b8) { constexpr bool B8 = decltype(b8)::value;
+                            gemv_grouped_kernel<GEMV_T, 2, true, B8><<<grid, 256, 0, st>>>(
+                            d_xh, gmats, d_gfirst, d_grows, d_pinv, w.partials.p); }); break;
+                case 3: band8_dispatch(Band8, [&](auto b8) { constexpr bool B8 = decltype(b8)::value;
+                            gemv_grouped_kernel<GEMV_T, 3, true, B8><<<grid, 256, 0, st>>>(
+                            d_xh, gmats, d_gfirst, d_grows, d_pinv, w.partials.p); }); break;
+                case 4: band8_dispatch(Band8, [&](auto b8) { constexpr bool B8 = decltype(b8)::value;
+                            gemv_grouped_kernel<GEMV_T, 4, true, B8><<<grid, 256, 0, st>>>(
+                            d_xh, gmats, d_gfirst, d_grows, d_pinv, w.partials.p); }); break;
+                case 5: band8_dispatch(Band8, [&](auto b8) { constexpr bool B8 = decltype(b8)::value;
+                            gemv_grouped_kernel<GEMV_T, 5, true, B8><<<grid, 256, 0, st>>>(
+                            d_xh, gmats, d_gfirst, d_grows, d_pinv, w.partials.p); }); break;
+                default: band8_dispatch(Band8, [&](auto b8) { constexpr bool B8 = decltype(b8)::value;
+                            gemv_grouped_kernel<GEMV_T, SMALL_M_MAX_ROWS, true, B8><<<grid, 256, 0, st>>>(
+                            d_xh, gmats, d_gfirst, d_grows, d_pinv, w.partials.p); }); break;
             }
         }
         postscale_grouped_kernel<<<dim3(outputs / HAD, groups), HAD, 0, st>>>(
@@ -2136,6 +2599,163 @@ bool exl3_fused_multirow_supported() {
     return rdna_level() == 1 && f && std::atoi(f) == 3;
 }
 
+bool exl3_native_grouped_plan(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down,
+                              int groups, int max_rows, bool armed, bool fused,
+                              int rates[3], int parts[3]) {
+    int local_rates[3] = {0, 0, 0}, local_parts[3] = {0, 0, 0};
+    // The output contract (exl3.hpp): false leaves rates/parts ALL ZERO - never the
+    // partial accumulation from groups or projections that were fine before the refusal
+    // point (a valid group 0 followed by an invalid group 1, or an LDS refusal after the
+    // rates were computed).  Only a true plan commits its values.
+    auto commit = [&](bool value) {
+        for (int b = 0; b < 3; ++b) {
+            rates[b] = value ? local_rates[b] : 0;
+            parts[b] = value ? local_parts[b] : 0;
+        }
+        return value;
+    };
+    if (!armed || groups < 1 || max_rows < 1 || max_rows > 4 || !gate || !up || !down)
+        return commit(false);
+    // Admission is pure descriptor-scalar logic: the native core decodes exactly the mul1
+    // tiles K2/K2.5 (the original arm) plus the integer K3/K4 tiles (2026-11-05, the
+    // Qwen3.8-Flash-Next 3bpw/4bpw expert rates; run-funnel geometry proven against
+    // read_window on the host) - anything else (wider integer K, the K>=3 half-integer
+    // tiles like K3.5/K4.5, other codebooks, and any frac outside {0,1}, negative or
+    // widened, which the generic geometry validation does NOT reject) keeps the
+    // established arms.  No pointer is dereferenced here, so an inadmissible descriptor
+    // costs nothing and touches nothing.
+    for (int g = 0; g < groups; ++g) {
+        const Exl3Mat* trio[3] = {&gate[g], &up[g], &down[g]};
+        for (int b = 0; b < 3; ++b) {
+            const Exl3Mat& m = *trio[b];
+            if (m.cb != 2 || (m.frac != 0 && m.frac != 1) ||
+                (m.frac ? m.bits != 2 : (m.bits < 2 || m.bits > 4)))
+                return commit(false);
+            // rate bits: 1 = K2 integer, 2 = K2.5, 4 = K3, 8 = K4 (per projection; a
+            // window may mix them per GROUP and per projection - the dispatch launches
+            // each armed rate's instantiation and every instantiation returns before any
+            // shared state for the groups that are not its rate)
+            local_rates[b] |= m.frac ? 2 : (m.bits == 2 ? 1 : m.bits == 3 ? 4 : 8);
+        }
+    }
+    // Shared-memory feasibility, per projection, BEFORE anything launches: the fp16
+    // activation slices (width x widest partition x 2 bytes, plus the fused prologue's
+    // 1 KiB static butterfly) must fit the 40 KiB budget at some parts count within the
+    // GEMV-split-capped gy.  An infeasible shape (e.g. a wide k with STRATA_EXL3_GEMV_SPLIT=1
+    // and 4-row groups) is REFUSED here - the established arm runs instead (or, for the
+    // fused form, rejects exactly as it did before this gate existed); an ill-fitting
+    // native launch is never enqueued.
+    const int64_t k = (int64_t) gate[0].ki * 16, ff = (int64_t) gate[0].nj * 16,
+                  n = (int64_t) down[0].nj * 16;
+    const int64_t width = max_rows <= 2 ? max_rows : 4;
+    const int64_t cap = native_gemv_split_cap();
+    const int64_t static_smem = fused ? kNativeGroupedStaticFused : 0;
+    const int64_t gy_g = std::max<int64_t>(1, std::min((k / 16 + 15) / 16, cap));
+    const int64_t gy_d = std::max<int64_t>(1, std::min((ff / 16 + 15) / 16, cap));
+    local_parts[0] = (int) native_grouped_parts(ff, gy_g, k / 16, width, groups, static_smem);
+    local_parts[1] = local_parts[0];           // gate and up share the geometry
+    local_parts[2] = (int) native_grouped_parts(n, gy_d, ff / 16, width, groups, static_smem);
+    if (!local_parts[0] || !local_parts[2]) return commit(false);
+    return commit(true);
+}
+
+bool exl3_experimental_band8_indexed_dot(const Exl3Mat* packed, const Exl3Mat* device_packed,
+    int routes, const float* xh, size_t xh_elements, float* partials, size_t partial_elements,
+    int parts, void* stream) {
+#if !defined(STRATA_WMMA_GFX11)
+    (void)packed; (void)device_packed; (void)routes; (void)xh; (void)xh_elements;
+    (void)partials; (void)partial_elements; (void)parts; (void)stream;
+    return false;
+#else
+    int dev = -1; hipDeviceProp_t prop{};
+    if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess ||
+        !gfx_arch_is_gfx11_wmma(prop.gcnArchName) || !packed || !device_packed || !xh || !partials ||
+        routes < 1 || routes > 65535 || parts < 1 || parts > 16) return false;
+    int rates = 0;
+    for (int r = 0; r < routes; ++r) {
+        if (!band8_matrix_valid(packed[r]) || packed[r].bits != 2 ||
+            packed[r].ki != packed[0].ki || packed[r].nj != packed[0].nj) return false;
+        rates |= packed[r].frac ? 2 : 1;
+    }
+    const size_t k = (size_t) packed[0].ki * 16, n = (size_t) packed[0].nj * 16;
+    const size_t smem = ((k / 128 + parts - 1) / parts) * 128 * sizeof(float);
+    if (xh_elements < (size_t) routes * k || partial_elements < (size_t) routes * parts * n ||
+        parts > (int) (k / 128) || smem > kNativeGroupedLdsBudget) return false;
+    const dim3 grid(n / 128, parts, routes); const auto st = (cudaStream_t) stream;
+    if (rates & 1) rdna_native::gemv<false, true><<<grid, 256, smem, st>>>(xh, device_packed, partials, parts);
+    if (rates & 2) rdna_native::gemv<true, true><<<grid, 256, smem, st>>>(xh, device_packed, partials, parts);
+    return true;
+#endif
+}
+
+bool exl3_experimental_band8_rows(Exl3Band8Matrices packed,
+    const int* first, const int* rows, int groups, int routes,
+    const uint16_t* x, const int* input_rows, uint16_t* out, void* stream,
+    Exl3MoeWorkspace& workspace, bool fused, int forced_parts) {
+#if !defined(STRATA_WMMA_GFX11)
+    (void)packed; (void)first; (void)rows; (void)groups; (void)routes; (void)x;
+    (void)input_rows; (void)out; (void)stream; (void)workspace; (void)fused; (void)forced_parts;
+    return false;
+#else
+    int current = -1;
+    hipDeviceProp_t prop{};
+    if (hipGetDevice(&current) != hipSuccess || hipGetDeviceProperties(&prop, current) != hipSuccess ||
+        !gfx_arch_is_gfx11_wmma(prop.gcnArchName)) return false;
+    if (groups < 1 || groups > routes || routes > 65535 || !x || !input_rows ||
+        !out || !first || !rows || !packed.gate || !packed.up || !packed.down ||
+        forced_parts < 0 || forced_parts > 16) return false;
+    const auto *gate = packed.gate, *up = packed.up, *down = packed.down;
+    int prefix = 0, widest = 1;
+    for (int g = 0; g < groups; ++g) {
+        if (first[g] != prefix || rows[g] < 1 || rows[g] > 4 || rows[g] > routes - prefix) return false;
+        prefix += rows[g]; widest = std::max(widest, rows[g]);
+        for (const Exl3Mat* m : {&gate[g], &up[g], &down[g]})
+            if (!band8_matrix_valid(*m)) return false;
+        if (gate[g].ki != gate[0].ki || gate[g].nj != gate[0].nj ||
+            up[g].ki != gate[0].ki || up[g].nj != gate[0].nj ||
+            down[g].ki != gate[0].nj || down[g].nj != down[0].nj) return false;
+    }
+    if (prefix != routes) return false;
+    int rates[3], parts[3];
+    if (!exl3_native_grouped_plan(gate, up, down, groups, widest, true, fused, rates, parts)) return false;
+    const int k = gate[0].ki * 16, ff = gate[0].nj * 16, n = down[0].nj * 16;
+    const int width = widest <= 2 ? widest : 4;
+    if (forced_parts) {
+        const int ki[3] = {gate[0].ki, up[0].ki, down[0].ki};
+        for (int b = 0; b < 3; ++b) {
+            if (forced_parts > ki[b] ||
+                native_grouped_widest(ki[b], forced_parts) * width * 2 +
+                    (fused ? kNativeGroupedStaticFused : 0) > kNativeGroupedLdsBudget) return false;
+            parts[b] = forced_parts;
+        }
+    }
+    auto& w = workspace.implementation();
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess || device != w.device) return false;
+    const size_t r = routes;
+    if (w.g.capacity < r * ff || w.u.capacity < r * ff || w.h.capacity < r * ff ||
+        w.d.capacity < r * n || w.xh.capacity < r * std::max(k, ff) ||
+        w.z.capacity < r * std::max(ff, n) ||
+        w.partials.capacity < r * std::max((size_t) parts[0] * ff, (size_t) parts[2] * n) ||
+        w.smallm_gate.capacity < (size_t) groups || w.smallm_up.capacity < (size_t) groups ||
+        w.smallm_down.capacity < (size_t) groups || w.smallm_first.capacity < (size_t) groups ||
+        w.smallm_rows.capacity < (size_t) groups) return false;
+    const auto st = (cudaStream_t) stream;
+    auto upload = [&](void* dst, const void* src, size_t bytes) {
+        if (cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, st) != cudaSuccess)
+            throw std::runtime_error("exl3 BAND8 descriptor upload failed");
+    };
+    upload(w.smallm_gate.p, gate, groups * sizeof(Exl3Mat));
+    upload(w.smallm_up.p, up, groups * sizeof(Exl3Mat));
+    upload(w.smallm_down.p, down, groups * sizeof(Exl3Mat));
+    upload(w.smallm_first.p, first, groups * sizeof(int));
+    upload(w.smallm_rows.p, rows, groups * sizeof(int));
+    return moe_run_experts_grouped_dev<true>(w.smallm_gate.p, w.smallm_up.p, w.smallm_down.p,
+        w.smallm_first.p, w.smallm_rows.p, groups, routes, widest, x, st, workspace,
+        k, input_rows, k, ff, n, 2, fused, out, rates[0], rates[1], rates[2], parts[0], parts[1], parts[2]) != nullptr;
+#endif
+}
+
 static uint16_t* moe_rows_grouped_impl(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down,
                            const int* group_first, const int* group_rows, int groups,
                            int routes, const uint16_t* x, const int* input_rows, uint16_t* out,
@@ -2169,21 +2789,74 @@ static uint16_t* moe_rows_grouped_impl(const Exl3Mat* gate, const Exl3Mat* up, c
         for (const Exl3Mat* m : {&gate[g], &up[g], &down[g]})
             if (!m->trellis || !m->suh || !m->svh || m->ki <= 0 || m->ki > INT32_MAX / 16 ||
                 m->nj <= 0 || m->nj > INT32_MAX / 16 || m->ki % 8 || m->nj % 8 ||
-                m->bits < 1 || m->bits > 8 || m->cb < 0 || m->cb > 2)
+                m->bits < 1 || m->bits > 8 || (m->bits == 8 && m->frac != 0) || m->cb < 0 || m->cb > 2)
                 throw std::invalid_argument("exl3: invalid grouped FFN matrix geometry");
         if (gate[g].ki != gate[0].ki || gate[g].nj != gate[0].nj || up[g].ki != gate[0].ki ||
             up[g].nj != gate[0].nj || down[g].ki != gate[0].nj || down[g].nj != down[0].nj)
             throw std::invalid_argument("exl3: mixed grouped FFN dimensions");
     }
+    // Physical layout: one tag per window (mixed tags throw before anything launches); a Band8
+    // tag requires the verified band8 rates (cb=mul1 K2/K2.5/K3/K4) - refused loudly here, the
+    // same gate the indexed entry uses.  All-Native windows keep the established dispatch.
+    const Exl3TrellisLayout layout = checked_uniform_layout(gate, up, down, groups, "grouped FFN");
+    if (layout == Exl3TrellisLayout::Band8)
+        for (int g = 0; g < groups; ++g)
+            for (const Exl3Mat* m : {&gate[g], &up[g], &down[g]})
+                if (!band8_matrix_valid(*m))
+                    throw std::invalid_argument(
+                        "exl3: Band8 grouped FFN weights need cb=mul1 K2/K2.5/K3/K4 at 128-multiple dims");
+#if defined(STRATA_WMMA_GFX11)
+    // The grouped RDNA twin (moe_run_experts_grouped_dev picks it at RDNA >= 1, mul1) shares the
+    // indexed twin's run funnels, half-integer geometry included: same K 4.5 ceiling as
+    // moe_run_experts.
+    if (rdna_level() >= 1)
+        for (int g = 0; g < groups; ++g)
+            for (const Exl3Mat* m : {&gate[g], &up[g], &down[g]})
+                if (m->frac != 0 && (m->bits > 4 || m->cb != 2))
+                    throw std::invalid_argument(
+                        "exl3: STRATA_EXL3_RDNA decodes half-integer bitrates up to K 4.5 (mul1); "
+                        "unset it for wider frac tiles");
+#endif
+    // STRATA_EXL3_NATIVE_GROUPED=1 (default off): admit this window's groups into the native
+    // grouped GEMV (rdna_native::gemv_grouped - the indexed native kernel's packed mul1
+    // decode + fdot2 core on the group descriptors).  The whole decision - gfx11 build, the
+    // native stack on (STRATA_EXL3_RDNA_NATIVE=1), per-projection rates over the HOST
+    // descriptor scalars (exactly mul1 K2/K2.5 and integer K3/K4: cb==2, frac in {0,1} with
+    // frac==1 only at bits==2, bits in 2..4 with frac==0), group widths
+    // <= 4, and the shared-memory feasibility of a parts plan - lives in
+    // exl3_native_grouped_plan, the ONE source the dispatch below consumes; an infeasible or
+    // inadmissible window keeps the established arms VERBATIM (their own validation,
+    // including their existing rejections, is untouched).  The envs are read per call - not
+    // cached like rdna_level() - so parity/bench harnesses can A/B the arms in one process;
+    // an enqueued launch keeps the flag value it was dispatched with (graph replay included).
+    int rate_g = 0, rate_u = 0, rate_d = 0, ps_g = 0, ps_u = 0, ps_d = 0;
+#if defined(STRATA_WMMA_GFX11)
+    {
+        const char* nat = std::getenv("STRATA_EXL3_RDNA_NATIVE");
+        const char* grp = std::getenv("STRATA_EXL3_NATIVE_GROUPED");
+        const bool armed = grp && grp[0] != '\0' && grp[0] != '0' && nat && nat[0] == '1';
+        int rates[3] = {0, 0, 0}, parts[3] = {0, 0, 0};
+        if (exl3_native_grouped_plan(gate, up, down, groups, max_rows, armed, fused, rates, parts)) {
+            rate_g = rates[0]; rate_u = rates[1]; rate_d = rates[2];
+            ps_g = parts[0]; ps_u = parts[1]; ps_d = parts[2];
+        }
+    }
+#endif
     const int k = gate[0].ki * 16, ff = gate[0].nj * 16, n = down[0].nj * 16;
     if (fused) {
         const char* f = std::getenv("STRATA_EXL3_FUSE");
+        // The LDS bound prices the scalar/RDNA fused twin's FLOAT slices (4 bytes/elem).  The
+        // native grouped kernel stores FP16 pair slices (2 bytes/elem) and enforces its own
+        // 40 KB bound per launch, so under the armed native flag that check is not the
+        // binding constraint - the other fused contract conditions still hold for it.
         if (rdna_level() != 1 || !f || std::atoi(f) != 3 || max_rows > 4 ||
-            (size_t) std::max(k, ff) * (max_rows <= 2 ? max_rows : 4) * sizeof(float) > 40 * 1024)
+            (!(rate_g | rate_u | rate_d) &&
+             (size_t) std::max(k, ff) * (max_rows <= 2 ? max_rows : 4) * sizeof(float) > 40 * 1024))
             throw std::invalid_argument("exl3: fused grouped FFN requires gfx11 RDNA=1/FUSE=3, <=4 rows and bounded LDS");
-        for (int g = 0; g < groups; ++g)
-            if (gate[g].cb != 2 || up[g].cb != 2 || down[g].cb != 2)
-                throw std::invalid_argument("exl3: fused grouped FFN requires mul1 codebooks");
+        if (!(rate_g | rate_u | rate_d))
+            for (int g = 0; g < groups; ++g)
+                if (gate[g].cb != 2 || up[g].cb != 2 || down[g].cb != 2)
+                    throw std::invalid_argument("exl3: fused grouped FFN requires mul1 codebooks");
         workspace.reserve_runtime_scratch(routes, k, ff, n);
     }
     workspace.reserve_small_m(routes, groups, k, ff, n);
@@ -2201,13 +2874,26 @@ static uint16_t* moe_rows_grouped_impl(const Exl3Mat* gate, const Exl3Mat* up, c
         (void) cudaGetLastError();
         throw std::runtime_error("exl3: grouped FFN plan upload failed");
     }
-    uint16_t* rows = moe_run_experts_grouped_dev(plan ? plan->gate : w.smallm_gate.p,
-                                                 plan ? plan->up : w.smallm_up.p,
-                                                 plan ? plan->down : w.smallm_down.p,
-                                                 plan ? plan->first : w.smallm_first.p,
-                                                 plan ? plan->rows : w.smallm_rows.p, groups, routes,
-                                                 max_rows, x, st, workspace, (long) k, input_rows, k, ff, n,
-                                                  gate[0].cb, fused, direct_output ? out : nullptr);
+    // The device tail's Band8 template is selected HERE (host side): a Band8 window runs the
+    // same launch cadence with the band8 tile address - the native-grouped plan, the fused twin
+    // and the scalar/RDNA twins all carry the format; no native flag is forced either way.
+    uint16_t* rows = layout == Exl3TrellisLayout::Band8
+        ? moe_run_experts_grouped_dev<true>(plan ? plan->gate : w.smallm_gate.p,
+                                            plan ? plan->up : w.smallm_up.p,
+                                            plan ? plan->down : w.smallm_down.p,
+                                            plan ? plan->first : w.smallm_first.p,
+                                            plan ? plan->rows : w.smallm_rows.p, groups, routes,
+                                            max_rows, x, st, workspace, (long) k, input_rows, k, ff, n,
+                                            gate[0].cb, fused, direct_output ? out : nullptr,
+                                            rate_g, rate_u, rate_d, ps_g, ps_u, ps_d)
+        : moe_run_experts_grouped_dev<>(plan ? plan->gate : w.smallm_gate.p,
+                                        plan ? plan->up : w.smallm_up.p,
+                                        plan ? plan->down : w.smallm_down.p,
+                                        plan ? plan->first : w.smallm_first.p,
+                                        plan ? plan->rows : w.smallm_rows.p, groups, routes,
+                                        max_rows, x, st, workspace, (long) k, input_rows, k, ff, n,
+                                        gate[0].cb, fused, direct_output ? out : nullptr,
+                                        rate_g, rate_u, rate_d, ps_g, ps_u, ps_d);
     if (out && !direct_output && cudaMemcpyAsync(out, rows, (size_t) routes * n * sizeof(uint16_t),
                         cudaMemcpyDeviceToDevice, st) != cudaSuccess)
         throw std::runtime_error("exl3: grouped FFN output copy failed");
@@ -2232,15 +2918,23 @@ const uint16_t* exl3_moe_rows_grouped_device_plan(const Exl3Mat* gate, const Exl
 }
 
 namespace {
+// Band8: the standalone group-GEMM weight decode reads the packed tile address; the window read,
+// tensor_core_perm scatter and the Hadamard/scale chain (group_had_rows/group_had_cols_pack) are
+// layout-blind, so the materialized weight stays bit-equal to the native-layout reconstruction.
+template <bool Band8 = false>
 __global__ void decode_group_weight(Exl3Mat m, float* out) {
     const int i = blockIdx.y, j = blockIdx.x, t = threadIdx.x;
-    const uint16_t* tw = m.trellis + (size_t) (i * m.nj + j) * 16 * m.bits;
+    const uint16_t* tw;
+    if constexpr (Band8)
+        tw = m.trellis + (((size_t) (j / 8) * m.ki + (size_t) i) * 8 + (size_t) (j % 8)) * (16 * m.bits + 8 * m.frac);
+    else
+        tw = m.trellis + (size_t) (i * m.nj + j) * (16 * m.bits + 8 * m.frac);
     const int group = t >> 3, slot = t & 7;
     const int r0 = (group % 4) * 2, c0 = group / 4;
     const int r = r0 + ((slot & 3) >= 2 ? 8 : 0) + (slot & 1);
     const int c = c0 + (slot >= 4 ? 8 : 0);
     out[(size_t) (i * 16 + r) * (m.nj * 16) + j * 16 + c] =
-        dh2f(decode_window(m.cb, (uint16_t) read_window(tw, t, m.bits)));
+        dh2f(decode_window(m.cb, (uint16_t) read_window(tw, t, m.bits, m.frac)));
 }
 // Transform 32 columns together: contiguous loads/stores instead of a one-thread block's
 // 128 strided values. No allocation or global synchronisation between expert groups.
@@ -2283,6 +2977,98 @@ __global__ void round_group_output(const float* in, float* out, int64_t count) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) out[i] = __half2float(__float2half_rn(in[i]));
 }
+// STRATA_EXL3_GEMM_FP16_OUT's down tails: the GEMM already wrote F16 halves, so the epilogue only
+// WIDENS (round_group_output / recon_round_scatter_kernel's scatter half minus the rounding).
+__global__ void widen_group_output(const uint16_t* in, float* out, int64_t count) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) out[i] = dh2f(in[i]);
+}
+__global__ void recon_widen_scatter_kernel(const uint16_t* __restrict__ y, float* __restrict__ out,
+                                           const int* __restrict__ destinations,
+                                           const Exl3Group* __restrict__ groups,
+                                           int m_rows, int n, int count) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t per = (int64_t) m_rows * n;
+    if (i >= (int64_t) count * per) return;
+    const Exl3Group& g = groups[(int) (i / per)];
+    const int rem = (int) (i % per);
+    const int m = rem / n;
+    if (m >= g.rows) return;
+    out[(int64_t) destinations[g.first + m] * n + (rem % n)] = dh2f(y[i]);
+}
+}
+
+// ---- STRATA_EXL3_GEMM_FP16_OUT (opt-in, default off): the reconstructed-expert GEMM epilogue ----
+//
+// Scope: ONLY exl3_moe_group_gemm and exl3_moe_recon_batch - the two reconstructed-expert paths,
+// whose EVERY float GEMM output already crosses an F16 boundary before its next consumer (gate/up
+// are rounded into the g/u (recon_gu) halves before SiLU; down is rounded to half before the
+// widen/scatter tail).  Directing cublas at a CUDA_R_16F C (accumulation stays CUBLAS_COMPUTE_32F)
+// keeps that exact rounding boundary but moves it inside the BLAS epilogue and deletes the
+// separate f32->f16 kernels.  Dense GEMMs, lm_head and every other F32 consumer are untouched.
+//
+// Numerics: the F16 boundary is the SAME one the F32-C path rounds through, so overflow to inf and
+// subnormal/zero behavior carry no new mathematical semantics; the only arithmetic delta is the
+// BLAS library's kernel selection/reduction order for an F16-C GEMM.  Bit identity with the F32-C
+// path is therefore NOT guaranteed (the gfx1100 outdtype probe measured 96-98% round-match);
+// exl3_gemm_fp16_out_parity holds both epilogues to the CPU oracle's existing tolerance.
+//
+// The flag follows exl3_wmma_stg_pad's safe pattern: getter and setter funnel through the same
+// apply-env-once helper, so whichever is called first applies STRATA_EXL3_GEMM_FP16_OUT exactly
+// once and the setter is authoritative in BOTH directions from then on.  No global setter trap.
+namespace {
+std::atomic<bool> g_gemm_fp16_out{ false };
+// The entry-eligibility counters' collection gate (header contract): default OFF; enabled by
+// STRATA_EXL3_GEMM_FP16_OUT_TRACE=1 through the same apply-env-once, or explicitly by
+// exl3_gemm_fp16_out_counters_set_enabled (the serve bench hook and the parity test).
+std::atomic<bool> g_fp16_out_trace{ false };
+std::once_flag g_gemm_fp16_out_env_once;
+void exl3_gemm_fp16_out_apply_env_once()
+{
+    std::call_once(g_gemm_fp16_out_env_once, [] {
+        const char* v = std::getenv("STRATA_EXL3_GEMM_FP16_OUT");
+        if (v && *v && *v != '0') g_gemm_fp16_out.store(true);
+        const char* t = std::getenv("STRATA_EXL3_GEMM_FP16_OUT_TRACE");
+        if (t && *t && *t != '0') g_fp16_out_trace.store(true);
+    });
+}
+// The entry-eligibility counters (header contract): lifetime DISPATCHED-call totals for the
+// two paths the flag can touch. A default-off relaxed-load BRANCH guards each increment (one
+// predictable branch per entry when off - not zero cost, but no atomics and no work). Refused
+// recon batches dispatch nothing and count nothing.
+std::atomic<long long> g_fp16_out_gg_calls{ 0 }, g_fp16_out_gg_rows{ 0 };
+std::atomic<long long> g_fp16_out_rb_calls{ 0 }, g_fp16_out_rb_experts{ 0 }, g_fp16_out_rb_rows{ 0 };
+std::atomic<long long> g_fp16_out_epilogue{ 0 };
+}
+
+bool exl3_gemm_fp16_out_enabled()
+{
+    exl3_gemm_fp16_out_apply_env_once();
+    return g_gemm_fp16_out.load();
+}
+
+void exl3_gemm_fp16_out_set(bool on)
+{
+    exl3_gemm_fp16_out_apply_env_once();
+    g_gemm_fp16_out.store(on);
+}
+
+void exl3_gemm_fp16_out_counters_set_enabled(bool on)
+{
+    exl3_gemm_fp16_out_apply_env_once();
+    g_fp16_out_trace.store(on);
+}
+
+Exl3Fp16OutCounters exl3_gemm_fp16_out_counters()
+{
+    Exl3Fp16OutCounters c;
+    c.group_gemm_calls = g_fp16_out_gg_calls.load(std::memory_order_relaxed);
+    c.group_gemm_rows = g_fp16_out_gg_rows.load(std::memory_order_relaxed);
+    c.recon_calls = g_fp16_out_rb_calls.load(std::memory_order_relaxed);
+    c.recon_experts = g_fp16_out_rb_experts.load(std::memory_order_relaxed);
+    c.recon_rows = g_fp16_out_rb_rows.load(std::memory_order_relaxed);
+    c.fp16_epilogue_calls = g_fp16_out_epilogue.load(std::memory_order_relaxed);
+    return c;
 }
 
 void exl3_moe_group_gemm(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& down, int rows,
@@ -2290,9 +3076,21 @@ void exl3_moe_group_gemm(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& 
                          Exl3MoeWorkspace& workspace) {
     for (const Exl3Mat* matrix : {&gate, &up, &down})
         if (!matrix->trellis || !matrix->suh || !matrix->svh || matrix->bits < 1 || matrix->bits > 8 ||
-            matrix->cb < 0 || matrix->cb > 2 || matrix->ki <= 0 || matrix->ki > INT32_MAX / 16 ||
+            (matrix->bits == 8 && matrix->frac != 0) || matrix->cb < 0 || matrix->cb > 2 ||
+            matrix->ki <= 0 || matrix->ki > INT32_MAX / 16 ||
             matrix->nj <= 0 || matrix->nj > INT32_MAX / 16 || matrix->ki % 8 || matrix->nj % 8)
             throw std::invalid_argument("exl3: invalid grouped GEMM matrix");
+    // Layout: one tag for the trio (mixed throws); Band8 additionally requires the verified
+    // band8 rates.  The decode kernel's Band8 form changes ONLY the tile address, so the
+    // reconstructed F16 weight - and therefore the BLAS epilogue - is bit-equal to the native
+    // reconstruction of the same weights, under either F32-C or the FP16-OUT flag.
+    const Exl3TrellisLayout layout = checked_uniform_layout(&gate, &up, &down, 1, "grouped GEMM");
+    const bool band8 = layout == Exl3TrellisLayout::Band8;
+    if (band8)
+        for (const Exl3Mat* matrix : {&gate, &up, &down})
+            if (!band8_matrix_valid(*matrix))
+                throw std::invalid_argument(
+                    "exl3: Band8 grouped GEMM weights need cb=mul1 K2/K2.5/K3/K4 at 128-multiple dims");
     if (rows <= 0 || rows > 65535 || !x || !input_rows || !out || gate.ki != up.ki || gate.nj != up.nj ||
         down.ki != gate.nj || gate.ki <= 0 || gate.nj <= 0 || down.nj <= 0)
         throw std::invalid_argument("exl3: invalid grouped GEMM geometry");
@@ -2309,9 +3107,22 @@ void exl3_moe_group_gemm(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& 
     if (cublasSetStream(w.blas, st) != CUBLAS_STATUS_SUCCESS)
         throw std::runtime_error("exl3: cannot set grouped GEMM stream");
     gather_group_rows<<<(unsigned) (((int64_t) rows * k + 255) / 256), 256, 0, st>>>(x, input_rows, w.group_x.p, rows, k);
-    auto project = [&](const Exl3Mat& m, const uint16_t* input) {
+    // STRATA_EXL3_GEMM_FP16_OUT (default off): C in F16 halves, accumulation still F32.  gate/up
+    // write the SAME g/u half buffers the F32-C path fills through f32_to_f16_out_kernel (same
+    // ldc/element order), so SiLU and everything after it are unchanged; the two round kernels are
+    // simply not launched.  `c16` is ignored when the flag is off.
+    const bool fp16_out = exl3_gemm_fp16_out_enabled();
+    if (g_fp16_out_trace.load(std::memory_order_relaxed)) {
+        g_fp16_out_gg_calls.fetch_add(1, std::memory_order_relaxed);
+        g_fp16_out_gg_rows.fetch_add(rows, std::memory_order_relaxed);
+        if (fp16_out) g_fp16_out_epilogue.fetch_add(1, std::memory_order_relaxed);
+    }
+    auto project = [&](const Exl3Mat& m, const uint16_t* input, uint16_t* c16) {
         const int in = m.ki * 16, outputs = m.nj * 16;
-        decode_group_weight<<<dim3(m.nj, m.ki), 256, 0, st>>>(m, w.group_reconstruct.p);
+        band8_dispatch(band8, [&](auto b8) {
+            constexpr bool B8 = decltype(b8)::value;
+            decode_group_weight<B8><<<dim3(m.nj, m.ki), 256, 0, st>>>(m, w.group_reconstruct.p);
+        });
         group_had_rows<<<dim3(outputs / 32, in / HAD), dim3(32, 4), 0, st>>>(w.group_reconstruct.p, outputs);
         group_had_cols_pack<<<dim3(in, outputs / HAD), HAD, 0, st>>>(
             w.group_reconstruct.p, outputs, m.suh, m.svh, w.group_weight.p);
@@ -2319,18 +3130,355 @@ void exl3_moe_group_gemm(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& 
         // Row-major W[in,out] is column-major W[out,in]; X[rows,in] is X[in,rows].
         if (cublasGemmEx(w.blas, CUBLAS_OP_N, CUBLAS_OP_N, outputs, rows, in, &alpha,
                          w.group_weight.p, CUDA_R_16F, outputs, input, CUDA_R_16F, in, &beta,
-                         w.group_y.p, CUDA_R_32F, outputs, CUBLAS_COMPUTE_32F,
+                         fp16_out ? (void*) c16 : (void*) w.group_y.p,
+                         fp16_out ? CUDA_R_16F : CUDA_R_32F, outputs, CUBLAS_COMPUTE_32F,
                          CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
             throw std::runtime_error("exl3: grouped tensor-core GEMM failed");
     };
-    project(gate, w.group_x.p);
+    project(gate, w.group_x.p, w.g.p);
     const int64_t hidden = (int64_t) rows * ff;
-    f32_to_f16_out_kernel<<<(unsigned) ((hidden + 255) / 256), 256, 0, st>>>(w.group_y.p, w.g.p, (int) hidden);
-    project(up, w.group_x.p);
-    f32_to_f16_out_kernel<<<(unsigned) ((hidden + 255) / 256), 256, 0, st>>>(w.group_y.p, w.u.p, (int) hidden);
+    if (!fp16_out)
+        f32_to_f16_out_kernel<<<(unsigned) ((hidden + 255) / 256), 256, 0, st>>>(w.group_y.p, w.g.p, (int) hidden);
+    project(up, w.group_x.p, w.u.p);
+    if (!fp16_out)
+        f32_to_f16_out_kernel<<<(unsigned) ((hidden + 255) / 256), 256, 0, st>>>(w.group_y.p, w.u.p, (int) hidden);
     silu_batched_kernel<<<(unsigned) ((hidden + 255) / 256), 256, 0, st>>>(w.g.p, w.u.p, w.h.p, hidden);
-    project(down, w.h.p);
-    round_group_output<<<(unsigned) (((int64_t) rows * n + 255) / 256), 256, 0, st>>>(w.group_y.p, out, (int64_t) rows * n);
+    // down C when on: group_y reinterpreted as halves - a DEDICATED region of this call's own GEMM-C
+    // scratch, already reserved above at rows*max(ff,n) FLOATS (>= rows*n halves for every
+    // geometry, so no new reserve and allocated_bytes() is unchanged).  Lifetime/aliasing: in this
+    // mode gate/up bypass group_y entirely, the down GEMM is its sole writer and the widen tail its
+    // sole reader, both queued in order on `st`; the B operand is w.h, a distinct buffer, so no
+    // live input is aliased and nothing under queued work is overwritten.  (g/u are equally dead
+    // once SiLU is queued, but their rows*ff capacity is only safe for n <= ff - group_y is
+    // geometry-proof and needs no condition.)
+    project(down, w.h.p, (uint16_t*) w.group_y.p);
+    if (fp16_out)
+        widen_group_output<<<(unsigned) (((int64_t) rows * n + 255) / 256), 256, 0, st>>>(
+            (const uint16_t*) w.group_y.p, out, (int64_t) rows * n);
+    else
+        round_group_output<<<(unsigned) (((int64_t) rows * n + 255) / 256), 256, 0, st>>>(
+            w.group_y.p, out, (int64_t) rows * n);
+}
+
+// ---- STRATA_EXL3_RECON_BATCH: the batched weight reconstruction (audit item C2) ----
+//
+// MiMo v2's routed experts are fractional/low-K (K2 and K2.5), so every fast group kernel
+// (WMMA fragments, the RDNA run funnels, expert_batch) rejects them and BOTH prefill arms ride
+// exl3_moe_group_gemm: ~17 launches and ~432 MiB of reconstruct traffic per expert group.  This
+// path batches 2..cap consecutive groups of one shape: a fused kernel reconstructs each expert's
+// F16 weights straight into a slab (ONE launch per projection set, ~22 MiB of traffic per expert
+// instead of ~432), and one strided-batched GEMM per projection replaces the per-expert calls.
+namespace {
+
+// The batched twin of the chain decode_group_weight -> group_had_rows -> group_had_cols_pack,
+// fused into ONE kernel.  A block owns a 128x128 weight tile (the Hadamard is 128-point on BOTH
+// axes, so an HAD x HAD tile is the smallest self-contained unit) in 64 KiB of shared f32: the
+// 64 trellis tiles decode straight into shared through the same read_window/decode_window and the
+// same tensor_core_perm scatter (any bits/frac/cb - the window math reads them from the
+// descriptor), then the row butterfly, then the column butterfly and the suh/svh pack write F16
+// into the slab.  Per element the float operations and their ORDER are exactly the group chain's
+// (row butterfly steps 1..64 with a=lo,b=hi read-then-write-both, *inv after the row pass, then
+// ((v*inv)*suh[r])*svh[c] rounded once), so the slab is bit-equal to the weight
+// exl3_moe_group_gemm materializes.  blockIdx.z walks the slab: without `down`, z = 2*expert+proj
+// (gate/up interleaved - the strided GEMMs need the uniform 2*stride hop); with `down`, z =
+// expert into slab region 0, enqueued after the up GEMM so the gate/up weights are dead
+// (stream-ordered reuse, no extra VRAM for the down matrices).
+// Band8=true (EXPERIMENTAL, stage-2 band8 prefill): the same kernel reading a CPU-repacked
+// band8 trellis - the tile address below is the ONLY change; the window reads, both
+// butterflies, the scale pack and the slab write are unchanged, so the slab stays bit-equal
+// to the native-layout reconstruction of the same weights.
+template <bool Band8 = false>
+__global__ void recon_tile_kernel(const Exl3Group* __restrict__ groups, uint16_t* __restrict__ slab,
+                                  long stride, int width, int count, int down) {
+    __shared__ float tile[HAD][HAD];
+    const int z = blockIdx.z;
+    const int e = down ? z : (z >> 1);
+    const Exl3Mat& m = down ? groups[e].down : (z & 1) ? groups[e].up : groups[e].gate;
+    const int words = 16 * m.bits + 8 * m.frac;   // Exl3Mat::words(), host-only in the header
+    const int t = threadIdx.x;
+    // decode: 64 trellis tiles (8x8 tiles of 16x16) into the shared super-tile, 2 sub-tiles
+    // per iteration across the 512 threads (256 stored positions per sub-tile, as decode_group_weight)
+    for (int base = 0; base < 64; base += 2) {
+        const int sub = base + (t >> 8);
+        const int pos = t & 255;
+        const int i = (int) blockIdx.y * 8 + (sub >> 3), j = (int) blockIdx.x * 8 + (sub & 7);
+        const uint16_t* tw;
+        if constexpr (Band8)   // band8 tile address: ((j/8)*ki + i)*8 + j%8, in words per tile
+            tw = m.trellis + (((size_t) (j / 8) * m.ki + (size_t) i) * 8 + (size_t) (j % 8)) * words;
+        else
+            tw = m.trellis + (size_t) (i * m.nj + j) * words;
+        const int g = pos >> 3, s = pos & 7;
+        const int r0 = (g % 4) * 2, c0 = g >> 2;
+        const int r = r0 + ((s & 3) >= 2 ? 8 : 0) + (s & 1);
+        const int c = c0 + (s >= 4 ? 8 : 0);
+        tile[(sub >> 3) * 16 + r][(sub & 7) * 16 + c] =
+            dh2f(decode_window(m.cb, (uint16_t) read_window(tw, pos, m.bits, m.frac)));
+    }
+    __syncthreads();
+    // the input-axis Hadamard: one column at a time, group_had_rows' arithmetic verbatim
+    for (int step = 1; step < HAD; step <<= 1) {
+        for (int idx = t; idx < HAD * HAD; idx += 512) {
+            const int r = idx >> 7, c = idx & (HAD - 1);
+            if (!(r & step)) {
+                const float a = tile[r][c], b = tile[r | step][c];
+                tile[r][c] = a + b; tile[r | step][c] = a - b;
+            }
+        }
+        __syncthreads();
+    }
+    for (int idx = t; idx < HAD * HAD; idx += 512)
+        tile[idx >> 7][idx & (HAD - 1)] *= 0.08838834764831845f;
+    __syncthreads();
+    // the output-axis Hadamard + the suh/svh pack: group_had_cols_pack's arithmetic verbatim
+    for (int step = 1; step < HAD; step <<= 1) {
+        for (int idx = t; idx < HAD * HAD; idx += 512) {
+            const int r = idx >> 7, c = idx & (HAD - 1);
+            if (!(c & step)) {
+                const float a = tile[r][c], b = tile[r][c | step];
+                tile[r][c] = a + b; tile[r][c | step] = a - b;
+            }
+        }
+        __syncthreads();
+    }
+    uint16_t* dst = slab + (size_t) z * stride;
+    const int r0 = (int) blockIdx.y * HAD, c0 = (int) blockIdx.x * HAD;
+    for (int idx = t; idx < HAD * HAD; idx += 512) {
+        const int r = idx >> 7, c = idx & (HAD - 1);
+        dst[(size_t) (r0 + r) * width + c0 + c] = __half_as_ushort(__float2half_rn(
+            ((tile[r][c] * 0.08838834764831845f) * dh2f(m.suh[r0 + r])) * dh2f(m.svh[c0 + c])));
+    }
+}
+
+// The batch's activations: xpad[e][m][k], each group's rows gathered from its tokens and the
+// rows past the group's end zeroed (the padded GEMM rows read zeros; their outputs are never
+// scattered).  The uniform [M][k] hop is what cublasGemmStridedBatchedEx needs.
+__global__ void recon_gather_pad_kernel(const uint16_t* __restrict__ x, const int* __restrict__ input_rows,
+                                        uint16_t* __restrict__ xpad, const Exl3Group* __restrict__ groups,
+                                        int m_rows, int k, int count) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t per = (int64_t) m_rows * k;
+    if (i >= (int64_t) count * per) return;
+    const Exl3Group& g = groups[(int) (i / per)];
+    const int rem = (int) (i % per);
+    const int m = rem / k;
+    xpad[i] = m < g.rows ? x[(int64_t) input_rows[g.first + m] * k + (rem % k)] : (uint16_t) 0;
+}
+
+// The down projection's tail: the F32 batched-GEMM output rounded through F16 (round_group_
+// output's arithmetic) and scattered to each route's destination row; padded rows never land.
+__global__ void recon_round_scatter_kernel(const float* __restrict__ y, float* __restrict__ out,
+                                           const int* __restrict__ destinations,
+                                           const Exl3Group* __restrict__ groups,
+                                           int m_rows, int n, int count) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t per = (int64_t) m_rows * n;
+    if (i >= (int64_t) count * per) return;
+    const Exl3Group& g = groups[(int) (i / per)];
+    const int rem = (int) (i % per);
+    const int m = rem / n;
+    if (m >= g.rows) return;
+    out[(int64_t) destinations[g.first + m] * n + (rem % n)] =
+        __half2float(__float2half_rn(y[i]));
+}
+
+}  // namespace
+
+namespace {
+
+// The shared body of exl3_moe_recon_batch and its EXPERIMENTAL band8 twin (stage-2 prefill).
+// Band8=true differs ONLY in recon_tile_kernel's tile addressing (CPU-repacked band8 views) and
+// in the pre-launch eligibility (band8_matrix_valid per matrix - which includes the Band8 TAG
+// check: cb=mul1 K2/K2.5/K3/K4, ki/nj %8, 4-byte alignment - on top of the native shape
+// relations).  The Hadamard/scale float sequence, the F32-accumulation GEMMs and the workspace
+// contract are the established ones.  Strict=true is the EXPERIMENTAL entry: the FP16-GEMM-out
+// epilogue stays pinned at its OFF (F32-C) baseline and the eligibility counters stay out; the
+// NORMAL entry (Strict=false - the route a tagged .layout reaches through exl3_moe_recon_batch)
+// honors STRATA_EXL3_GEMM_FP16_OUT exactly like the native path: the F16 rounding boundary is
+// the same one both layouts cross, so Native vs Band8 under the same flag (and same BLAS
+// library/output dtype/weights) stays bitwise identical.
+template <bool Band8, bool Strict>
+bool recon_batch_impl(const Exl3Group* groups, int count, const uint16_t* x,
+                      const int* input_rows, const int* destinations, float* out, void* stream,
+                      Exl3MoeWorkspace& workspace) {
+    if (!groups || count < 2 || count > 16 || !x || !input_rows || !destinations || !out) return false;
+    int prefix = 0, m_rows = 0;
+    for (int i = 0; i < count; ++i) {
+        const Exl3Group& g = groups[i];
+        if (g.first != prefix || g.rows < 1 || g.rows > 4096) return false;
+        // one shape per batch (the strided GEMM's strides/lds are shared); bits/frac/cb may
+        // differ per expert - the tile kernel reads them from the descriptor (a MiMo layer
+        // mixes K2 and K2.5 experts, and a batch must not break at the boundary)
+        for (int p = 0; p < 3; ++p) {
+            const Exl3Mat& m = p == 0 ? g.gate : p == 1 ? g.up : g.down;
+            const Exl3Mat& ref = p == 0 ? groups[0].gate : p == 1 ? groups[0].up : groups[0].down;
+            if constexpr (Band8) {
+                if (!band8_matrix_valid(m) || m.ki != ref.ki || m.nj != ref.nj) return false;
+            } else {
+                if (!m.trellis || !m.suh || !m.svh || m.ki != ref.ki || m.nj != ref.nj ||
+                    m.bits < 1 || m.bits > 8 || (m.bits == 8 && m.frac != 0) || m.cb < 0 || m.cb > 2 ||
+                    m.ki <= 0 || m.ki > INT32_MAX / 16 || m.nj <= 0 || m.nj > INT32_MAX / 16 ||
+                    m.ki % 8 || m.nj % 8) return false;
+            }
+        }
+        if (g.up.ki != g.gate.ki || g.up.nj != g.gate.nj || g.down.ki != g.gate.nj ||
+            g.down.nj != g.gate.ki) return false;
+        prefix += g.rows;
+        m_rows = std::max(m_rows, g.rows);
+    }
+    if ((int64_t) count * m_rows > 4096) return false;
+    const int k = groups[0].gate.ki * 16, ff = groups[0].gate.nj * 16, n = groups[0].down.nj * 16;
+    auto& w = workspace.implementation();
+    const size_t one = std::max((size_t) k * ff, (size_t) ff * n);
+    const size_t padded = (size_t) count * (size_t) m_rows;
+    if (w.recon_groups.capacity < (size_t) count || w.recon_slab.capacity < 2 * (size_t) count * one ||
+        w.recon_xpad.capacity < padded * (size_t) k || w.recon_gu.capacity < 2 * padded * (size_t) ff ||
+        w.recon_y.capacity < 2 * padded * (size_t) ff + padded * (size_t) n ||
+        w.recon_h.capacity < padded * (size_t) ff)
+        throw std::runtime_error("exl3: recon batch workspace would grow under queued work");
+    const auto st = (cudaStream_t) stream;
+    if (!w.blas && cublasCreate(&w.blas) != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error("exl3: cannot create recon batch GEMM handle");
+    if (cublasSetStream(w.blas, st) != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error("exl3: cannot set recon batch GEMM stream");
+    if (cudaMemcpyAsync(w.recon_groups.p, groups, (size_t) count * sizeof(Exl3Group),
+                        cudaMemcpyHostToDevice, st) != cudaSuccess)
+        throw std::runtime_error("exl3: recon batch descriptor upload failed");
+    const auto blocks = [](int64_t elements) -> unsigned {
+        return (unsigned) ((elements + 255) / 256);
+    };
+    const bool dbg = std::getenv("STRATA_RECON_DEBUG") != nullptr;
+    auto step = [&](const char* what) {   // STRATA_RECON_DEBUG: per-launch error trace
+        if (!dbg) return;
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess)
+            std::fprintf(stderr, "exl3: recon batch %s: %s\n", what, cudaGetErrorString(e));
+    };
+    recon_gather_pad_kernel<<<blocks((int64_t) padded * k), 256, 0, st>>>(
+        x, input_rows, w.recon_xpad.p, w.recon_groups.p, m_rows, k, count);
+    step("gather");
+    auto reconstruct = [&](int down) {
+        const Exl3Mat& m = down ? groups[0].down : groups[0].gate;
+        recon_tile_kernel<Band8><<<dim3((unsigned) (m.nj / 8), (unsigned) (m.ki / 8),
+                                       down ? (unsigned) count : (unsigned) (2 * count)), 512, 0, st>>>(
+            w.recon_groups.p, w.recon_slab.p, (long) (k * ff), down ? n : ff, count, down);
+        step(down ? "recon-down" : "recon-gateup");
+    };
+    const float alpha = 1.0f, beta = 0.0f;
+    // STRATA_EXL3_GEMM_FP16_OUT (opt-in, default off): C in F16 halves, accumulation still F32.  The
+    // c pointer/c_type pair selects the epilogue; when off the arguments are exactly the
+    // established F32-C call.  The experimental entry (Strict) pins the OFF baseline (F32 C); the
+    // normal route - including a Band8-tagged batch - honors the flag like the native path.
+    const bool fp16_out = Strict ? false : exl3_gemm_fp16_out_enabled();
+    auto gemm = [&](int m_dim, int k_dim, const uint16_t* a, long lda, long stride_a,
+                    const uint16_t* b, long ldb, long stride_b, void* c, long ldc, long stride_c,
+                    decltype(CUDA_R_32F) c_type) {   // cudaDataType/hipDataType per backend
+        // Row-major W[in,out] is column-major W[out,in]; the padded X[m,k] is X[k,m] - the same
+        // orientation contract as exl3_moe_group_gemm's per-group call, F32 accumulation.
+        if (cublasGemmStridedBatchedEx(w.blas, CUBLAS_OP_N, CUBLAS_OP_N, m_dim, m_rows, k_dim, &alpha,
+                                       a, CUDA_R_16F, lda, stride_a, b, CUDA_R_16F, ldb, stride_b,
+                                       &beta, c, c_type, ldc, stride_c, count,
+                                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+            throw std::runtime_error("exl3: recon batch GEMM failed");
+        step("gemm");
+    };
+    const long plane = (long) m_rows * ff;
+    reconstruct(0);   // gate (even slab z) + up (odd slab z) in ONE launch
+    // gate: A walks the even slab halves; C is plane 0 of the [2][B][M][ff] F32/F16 pairs - the
+    // recon_gu plane the F32-C path fills through f32_to_f16_out_kernel (same layout, ld/stride
+    // identical in halves), so SiLU and everything after it are unchanged.
+    gemm(ff, k, w.recon_slab.p, ff, (long) (2 * one),
+         w.recon_xpad.p, k, (long) m_rows * k,
+         fp16_out ? (void*) w.recon_gu.p : (void*) w.recon_y.p, ff, plane,
+         fp16_out ? CUDA_R_16F : CUDA_R_32F);
+    // up: A offset by one matrix (odd halves); C is plane 1
+    gemm(ff, k, w.recon_slab.p + one, ff, (long) (2 * one),
+         w.recon_xpad.p, k, (long) m_rows * k,
+         fp16_out ? (void*) (w.recon_gu.p + (size_t) count * plane) : (void*) (w.recon_y.p + (size_t) count * plane),
+         ff, plane, fp16_out ? CUDA_R_16F : CUDA_R_32F);
+    const int64_t gu_elements = (int64_t) 2 * padded * ff;
+    if (!fp16_out)
+        f32_to_f16_out_kernel<<<blocks(gu_elements), 256, 0, st>>>(
+            w.recon_y.p, w.recon_gu.p, (int) gu_elements);
+    step("round");
+    silu_batched_kernel<<<blocks((int64_t) padded * ff), 256, 0, st>>>(
+        w.recon_gu.p, w.recon_gu.p + (size_t) count * plane, w.recon_h.p, (int64_t) padded * ff);
+    step("silu");
+    // down: the gate/up weights are dead once the up GEMM is queued - region 0 is free
+    reconstruct(1);
+    // C when on: recon_y's own down region at the SAME float offset the F32-C path uses, written
+    // as halves - a DEDICATED reserved region (the entry's capacity check already guarantees
+    // 2*padded*ff + padded*n FLOATS, and the down span needs only padded*n halves = half those
+    // bytes at that offset, so no reserve, byte accounting or capacity check changes).  Lifetime:
+    // the gate/up planes of recon_y are UNUSED in this mode (their C is recon_gu), the down GEMM
+    // is the region's sole writer and the widen/scatter tail its sole reader, both queued in
+    // order on `st`; the B operand is recon_h, a distinct buffer - no live input is aliased and
+    // nothing under queued work is overwritten.
+    void* down_c = fp16_out ? (void*) (uint16_t*) (w.recon_y.p + (size_t) 2 * count * plane)
+                            : (void*) (w.recon_y.p + (size_t) 2 * count * plane);
+    gemm(n, ff, w.recon_slab.p, n, (long) one,
+         w.recon_h.p, ff, plane, down_c, n, (long) m_rows * n,
+         fp16_out ? CUDA_R_16F : CUDA_R_32F);
+    if (fp16_out)
+        recon_widen_scatter_kernel<<<blocks((int64_t) padded * n), 256, 0, st>>>(
+            (const uint16_t*) (w.recon_y.p + (size_t) 2 * count * plane), out, destinations,
+            w.recon_groups.p, m_rows, n, count);
+    else
+        recon_round_scatter_kernel<<<blocks((int64_t) padded * n), 256, 0, st>>>(
+            w.recon_y.p + (size_t) 2 * count * plane, out, destinations, w.recon_groups.p,
+            m_rows, n, count);
+    step("scatter");
+    // the batch dispatched (the eligibility counters' contract: refused batches above
+    // returned false without enqueueing anything and count nothing; the experimental band8
+    // arm is diagnostic-only and stays out of the established paths' accounting - a
+    // Band8-tagged batch through the NORMAL entry counts like any dispatched call)
+    if (!Strict && g_fp16_out_trace.load(std::memory_order_relaxed)) {
+        g_fp16_out_rb_calls.fetch_add(1, std::memory_order_relaxed);
+        g_fp16_out_rb_experts.fetch_add(count, std::memory_order_relaxed);
+        g_fp16_out_rb_rows.fetch_add(prefix, std::memory_order_relaxed);
+        if (fp16_out) g_fp16_out_epilogue.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+}  // namespace
+
+bool exl3_moe_recon_batch(const Exl3Group* groups, int count, const uint16_t* x,
+                          const int* input_rows, const int* destinations, float* out, void* stream,
+                          Exl3MoeWorkspace& workspace) {
+    // Layout routing: every group's trio must carry the same tag.  All-Native keeps the
+    // established path byte-for-byte; all-Band8 (a packed backing's tagged views) runs the
+    // same flow with recon_tile_kernel's Band8 addressing and HONORS STRATA_EXL3_GEMM_FP16_OUT
+    // exactly like the native arm (see recon_batch_impl).  Mixed tags are refused before any
+    // upload/kernel - false means nothing was enqueued.
+    if (groups && count >= 1) {
+        const Exl3TrellisLayout tag = groups[0].gate.layout;
+        bool mixed = false;
+        for (int i = 0; i < count && !mixed; ++i)
+            for (int p = 0; p < 3; ++p) {
+                const Exl3Mat& m = p == 0 ? groups[i].gate : p == 1 ? groups[i].up : groups[i].down;
+                if (m.layout != tag) mixed = true;
+            }
+        if (mixed) return false;
+        if (tag == Exl3TrellisLayout::Band8)
+            return recon_batch_impl<true, false>(groups, count, x, input_rows, destinations, out,
+                                                 stream, workspace);
+    }
+    return recon_batch_impl<false, false>(groups, count, x, input_rows, destinations, out, stream, workspace);
+}
+
+// EXPERIMENTAL, stage-2 band8 prefill: exl3_moe_recon_batch over CPU-repacked band8 trellis
+// views.  The ENTRY NAME is the layout contract - every group's trellis below is band8-packed
+// (tile (kt,nt) at ((nt/8)*ki+kt)*8+nt%8 words()) AND carries Exl3Mat.layout == Band8 (the tag
+// is what says the bytes are packed; an untagged view is refused), and these views must never
+// reach a native API.  Contract as exl3_moe_recon_batch (2..16 contiguous groups of one shape,
+// trusted DEVICE input_rows/destinations values, pre-reserved reserve_recon_batch workspace,
+// false means nothing was enqueued), plus band8_matrix_valid per matrix (cb=mul1 K2/K2.5/K3/K4,
+// ki/nj %8) and the FP16-GEMM-out epilogue pinned to its OFF (F32-C) baseline (the normal
+// entry's Band8 route honors the flag; this diagnostic arm does not).
+bool exl3_experimental_band8_recon_batch(const Exl3Group* groups, int count, const uint16_t* x,
+                                         const int* input_rows, const int* destinations, float* out,
+                                         void* stream, Exl3MoeWorkspace& workspace) {
+    return recon_batch_impl<true, true>(groups, count, x, input_rows, destinations, out, stream, workspace);
 }
 
 // ---- the gfx11 (RDNA3) matrix-core group FFN ----
@@ -2342,6 +3490,49 @@ void exl3_moe_group_gemm(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& 
 // exl3_moe_group_gemm, so the fork's CSR route table is unnecessary: this expert's routes are the
 // contiguous slab the gather writes.  A tiles are staged in LDS once per k-chunk and reused by all
 // 16 column warps.
+//
+// STRATA_EXL3_WMMA_STG_PAD (opt-in, default off = stride 8 as shipped): pads sh_a's innermost
+// extent 8 -> 9 dwords.  Idea source: vcruz305/exllamav3-amd commit 65ba782,
+// exllamav3/exllamav3_ext/hip/hip_mma.cuh, MIT (measured +10% decode THERE on gfx1151; NOT
+// measured there on gfx1100).  Static bank ANALYSIS, not hardware-counter proof: RDNA LDS has
+// 32 banks x 1 dword, so the innermost extent is the per-lane bank stride; 8 divides 32 and the
+// A-fragment loads (m = rt*16+lo, 16 distinct rows x hi) are PREDICTED conflicted (8-way as
+// separate dword reads; fewer as merged 64/128-bit reads - the actual degree depends on the
+// compiler's vector width and was not profiled).  Stride 9 is coprime with 32 and spreads them.
+// Layout-only change: same values, same instruction order (the pad dword is never read),
+// byte-identical outputs - proven per shape by exl3_moe_multi_parity's pad A/B section; the
+// SPEED claim is only what the window bench and the protocol runs measure on this card.
+
+// The pad-selection flag, on EVERY backend (no GPU dependency; only the dispatch sites below are
+// gated to the WMMA build, where selecting the padded instantiation has an effect).  Both the
+// getter and the setter funnel through the same apply-env-once helper, so whichever is called
+// first applies STRATA_EXL3_WMMA_STG_PAD exactly once and the setter is authoritative in BOTH
+// directions from then on - including set(true)/set(false) BEFORE the first getter call, which
+// cannot be overridden by a later env apply.
+namespace {
+std::atomic<bool> g_wmma_stg_pad{ false };
+std::once_flag g_wmma_stg_pad_env_once;
+void exl3_wmma_stg_pad_apply_env_once()
+{
+    std::call_once(g_wmma_stg_pad_env_once, [] {
+        const char* v = std::getenv("STRATA_EXL3_WMMA_STG_PAD");
+        if (v && *v && *v != '0') g_wmma_stg_pad.store(true);
+    });
+}
+}  // namespace
+
+bool exl3_wmma_stg_pad_enabled()
+{
+    exl3_wmma_stg_pad_apply_env_once();
+    return g_wmma_stg_pad.load();
+}
+
+void exl3_wmma_stg_pad_set(bool on)
+{
+    exl3_wmma_stg_pad_apply_env_once();
+    g_wmma_stg_pad.store(on);
+}
+
 #if defined(STRATA_WMMA_GFX11)
 namespace {
 
@@ -2404,12 +3595,50 @@ __device__ __forceinline__ void exl3_decode_mul1_4(const uint32_t* ptr, int offs
     frag.v[1] = exl3_mul1_h2(w2, w3);
 }
 
+// The half-integer twin (K = KA + 0.5, MASK 0xAAAA, mul1): the same two 4-window calls, but the
+// step widths alternate KA / KA+1 per stored position, so every window end comes from window_end()
+// and the extraction shift of window j is the prefix sum S(p+3) - S(p+j) of the actual widths -
+// not a compile-time multiple of bits.  The funnel geometry is exl3_decode_mul1_4's own with the
+// uniform sums replaced by those S() values: b2 = end of window(p+3) lifted by one ring, b0 =
+// start of window(p), and the reversed lo/hi dword packing still reads ring-contiguous because
+// the +ring bias lands the four-window span across the ring seam exactly as the integer form does
+// (verified position-for-position against read_window for KA 2..5 on the host before landing).
 template <int bits>
-__device__ __forceinline__ void exl3_decode_mul1(const uint32_t* ptr, int offset, Exl3Frag& f0, Exl3Frag& f1) {
+__device__ __forceinline__ void exl3_decode_frac4(const uint32_t* ptr, int p, uint16_t* w4) {
+    const int nw = (16 * bits + 8) / 2;   // 32-bit words in the K=KA+0.5 ring
+    const int b2 = window_end(p + 3, bits, 1) + nw * 32;
+    const int b0 = window_end(p, bits, 1) - 16 + nw * 32;
+    const int i0 = b0 / 32, i2 = (b2 - 1) / 32;
+    const int shift = (i2 + 1) * 32 - b2;
+    const uint32_t lo = ptr[i2 % nw], hi = ptr[i0 % nw];
+    const int e3 = b2 - nw * 32;   // window_end(p + 3)
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+        w4[j] = (uint16_t) (exl3_funnel(lo, hi, shift + (e3 - window_end(p + j, bits, 1))) & 0xffffu);
+}
+
+template <int bits>
+__device__ __forceinline__ void exl3_decode_mul1(const uint32_t* ptr, int offset, Exl3Frag& f0,
+                                                 Exl3Frag& f1, int frac) {
+    if (frac != 0) {
+        uint16_t w[8];
+        exl3_decode_frac4<bits>(ptr, offset, w);
+        exl3_decode_frac4<bits>(ptr, offset + 4, w + 4);
+        // the integer form's slot order: call 1's four windows descending in shift are packed
+        // (w0, w1) / (w2, w3) with the LOW half the LOWER position - preserved verbatim
+        f0.v[0] = exl3_mul1_h2(w[0], w[1]);
+        f0.v[1] = exl3_mul1_h2(w[2], w[3]);
+        f1.v[0] = exl3_mul1_h2(w[4], w[5]);
+        f1.v[1] = exl3_mul1_h2(w[6], w[7]);
+        return;
+    }
     if constexpr (bits == 3) {
         exl3_decode_k3_mul1(ptr, offset, f0, f1);
     } else {
-        static_assert(bits == 4 || bits == 5 || bits == 6, "the fragment decode covers K3..K6");
+        // K2 rides the same uniform-step 4-window form (MiMo's integer-K experts; the trellis ring
+        // is 16 dwords, every span/funnel index scales with `bits` and nothing else changes)
+        static_assert(bits == 2 || bits == 4 || bits == 5 || bits == 6,
+                      "the fragment decode covers K2..K6 (K3 via its own form)");
         exl3_decode_mul1_4<bits>(ptr, offset, f0);
         exl3_decode_mul1_4<bits>(ptr, offset + 4, f1);
     }
@@ -2421,12 +3650,20 @@ __device__ __forceinline__ void exl3_decode_mul1(const uint32_t* ptr, int offset
 // k-tiles per step (the fork's K=32 form): both B fragments decode up front, then two chained mma per
 // row tile.  Admissible shapes (ki % 8) make rows_total a multiple of 8, so kct is always even; the
 // odd-tail step below is a guard, not a live path.
-template <int bits, int row_tiles, bool batched = false>
+// Band8=true (EXPERIMENTAL, stage-2 band8 prefill): the SAME kernel reading a CPU-repacked band8
+// trellis - tile (kt,nt) lives at ((nt/8)*ki+kt)*8+nt%8 tiles instead of row-major (kt*nj+nt) - so
+// only the two tile addresses below change; the within-tile decode, the Hadamard/F16 rounding, the
+// WMMA accumulation and the reduction are this template's unchanged instructions.  A 16-wave block
+// then spans TWO band8 groups (8 contiguous subtiles each, one per 128 columns), never one 256-wide
+// run; valid only when nj % 8 (the host's band8_matrix_valid gate).  Band8=false is byte-identical
+// to the shipped kernel: both pointer expressions keep the original spelling.
+template <int bits, int row_tiles, bool batched = false, int stg_slots = 8, bool Band8 = false>
 __global__ void __launch_bounds__(512) routed_wmma_kernel(const uint16_t* __restrict__ input16,
                                                           const uint16_t* __restrict__ trellis,
                                                           float* __restrict__ output,
                                                           int rows, int in_features, int out_features,
-                                                          const Exl3Group* groups = nullptr, int projection = 0) {
+                                                          const Exl3Group* groups = nullptr, int projection = 0,
+                                                          int frac = 0) {
     if constexpr (batched) {
         const Exl3Group group = groups[blockIdx.z];
         const Exl3Mat m = projection == 0 ? group.gate : projection == 1 ? group.up : group.down;
@@ -2442,7 +3679,9 @@ __global__ void __launch_bounds__(512) routed_wmma_kernel(const uint16_t* __rest
     const int lo = lane & 15, hi = lane >> 4;
     const int rows_total = in_features / 16;
     const int n_groups = (out_features + n_group_cols - 1) / n_group_cols;
-    __shared__ __half2 sh_a[k_chunk][16 * row_tiles][8];
+    // stg_slots is 8 (shipped) or 9 (STRATA_EXL3_WMMA_STG_PAD; see the block comment above).  The
+    // pad dword is never written by the store loop (p < 8) and never read by the fragment loads.
+    __shared__ __half2 sh_a[k_chunk][16 * row_tiles][stg_slots];
     using v16f16 = _Float16 __attribute__((ext_vector_type(16)));
     using v8f32 = float __attribute__((ext_vector_type(8)));
     {   // blockIdx.y is the 256-column band (grid dim `bands`); each band grid-strides the row tiles.
@@ -2470,10 +3709,17 @@ __global__ void __launch_bounds__(512) routed_wmma_kernel(const uint16_t* __rest
                     if (active) {
                         #pragma unroll
                         for (int step = 0; step < 2; ++step) {
-                            const uint32_t* packed = reinterpret_cast<const uint32_t*>(
-                                trellis + ((size_t)(kc + k + step) * (out_features / 16) + (size_t) subtile) * (16 * bits));
+                            const uint32_t* packed;
+                            if constexpr (Band8)   // band8 tile address: ((nt/8)*ki + kt)*8 + nt%8,
+                                packed = reinterpret_cast<const uint32_t*>(   // in uint16 words per tile
+                                    trellis + (((size_t) (subtile / 8) * (in_features / 16) * 8 +
+                                                (size_t) (kc + k + step) * 8 + (size_t) (subtile % 8)) *
+                                               (16 * bits + 8 * frac)));
+                            else
+                                packed = reinterpret_cast<const uint32_t*>(
+                                    trellis + ((size_t)(kc + k + step) * (out_features / 16) + (size_t) subtile) * (16 * bits + 8 * frac));
                             Exl3Frag f0, f1;
-                            exl3_decode_mul1<bits>(packed, lane * 8, f0, f1);
+                            exl3_decode_mul1<bits>(packed, lane * 8, f0, f1, frac);
                             d00[step] = __builtin_bit_cast(uint32_t, f0.v[0]);
                             d01[step] = __builtin_bit_cast(uint32_t, f0.v[1]);
                             d10[step] = __builtin_bit_cast(uint32_t, f1.v[0]);
@@ -2520,10 +3766,17 @@ __global__ void __launch_bounds__(512) routed_wmma_kernel(const uint16_t* __rest
                 for (; k < kct; ++k) {   // odd-tail guard; unreachable for ki % 8 == 0 shapes
                     uint32_t d00 = 0, d01 = 0, d10 = 0, d11 = 0;
                     if (active) {
-                        const uint32_t* packed = reinterpret_cast<const uint32_t*>(
-                            trellis + ((size_t)(kc + k) * (out_features / 16) + (size_t) subtile) * (16 * bits));
+                        const uint32_t* packed;
+                        if constexpr (Band8)   // band8 tile address: ((nt/8)*ki + kt)*8 + nt%8
+                            packed = reinterpret_cast<const uint32_t*>(
+                                trellis + (((size_t) (subtile / 8) * (in_features / 16) * 8 +
+                                            (size_t) (kc + k) * 8 + (size_t) (subtile % 8)) *
+                                           (16 * bits + 8 * frac)));
+                        else
+                            packed = reinterpret_cast<const uint32_t*>(
+                                trellis + ((size_t)(kc + k) * (out_features / 16) + (size_t) subtile) * (16 * bits + 8 * frac));
                         Exl3Frag f0, f1;
-                        exl3_decode_mul1<bits>(packed, lane * 8, f0, f1);
+                        exl3_decode_mul1<bits>(packed, lane * 8, f0, f1, frac);
                         d00 = __builtin_bit_cast(uint32_t, f0.v[0]);
                         d01 = __builtin_bit_cast(uint32_t, f0.v[1]);
                         d10 = __builtin_bit_cast(uint32_t, f1.v[0]);
@@ -2682,24 +3935,59 @@ bool exl3_wmma_device() {
 
 }  // namespace
 
-bool exl3_moe_group_wmma(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& down, int rows,
+namespace {
+
+// The shared body of exl3_moe_group_wmma and its EXPERIMENTAL band8 twin (stage-2 prefill).
+// Band8=true runs the SAME launch sequence with routed_wmma_kernel's Band8 tile addressing -
+// the within-tile decode, Hadamard, F16 rounding, WMMA accumulation, reduction and padding are
+// the template's unchanged instructions - over trellis views in the CPU-repacked band8 order
+// (layout contract at exl3_experimental_band8_rows).  Everything specific to the band8 arm sits
+// BEFORE anything enqueues: band8_matrix_valid eligibility (cb=mul1 K2/K2.5/K3/K4, ki/nj %8,
+// 4-byte tile alignment), the experiment's rows 16..512 (the native entry keeps 1..65535), a
+// workspace-device match and NO growth - the caller must have pre-reserved
+// reserve()/reserve_group_scratch(rows, k, ff, n, true), and a short workspace returns false
+// with nothing enqueued, so capture stays allocation-free.  Packed bytes are never handed to a
+// native reader: there is no fallback.  input_rows values are trusted exactly as the native
+// entry trusts them (the callers' contract).
+template <bool Band8 = false, bool Strict = false>
+bool moe_group_wmma_impl(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& down, int rows,
                          const uint16_t* x, const int* input_rows, float* out, void* stream,
                          Exl3MoeWorkspace& workspace) {
     if (!exl3_wmma_device()) return false;
-    for (const Exl3Mat* matrix : {&gate, &up, &down})
-        if (!matrix->trellis || !matrix->suh || !matrix->svh || matrix->bits < 3 || matrix->bits > 6 ||
-            matrix->cb != 2 || matrix->ki <= 0 || matrix->ki > INT32_MAX / 16 ||
-            matrix->nj <= 0 || matrix->nj > INT32_MAX / 16 || matrix->ki % 8 || matrix->nj % 8)
-            return false;   // the mcg/3inst codebooks, K outside 3..6 and non-128-multiple dims stay on the reconstruct path
+    if constexpr (Band8) {
+        for (const Exl3Mat* matrix : {&gate, &up, &down})
+            if (!band8_matrix_valid(*matrix))
+                return false;   // the band8 rates: cb2 K2/K2.5/K3/K4, Band8 tag, 128-multiple dims, no fallback
+        if constexpr (Strict) { if (rows < 16 || rows > 512) return false; }   // the EXPERIMENT's range only
+    } else {
+        for (const Exl3Mat* matrix : {&gate, &up, &down})
+            if (!matrix->trellis || !matrix->suh || !matrix->svh || matrix->bits < 2 || matrix->bits > 6 ||
+                matrix->frac < 0 || matrix->frac > 1 ||   // K = 2..6.5: the fragment decode's uniform and
+                                                          // alternating-step forms (frac is mul1-only, like cb)
+                matrix->cb != 2 || matrix->ki <= 0 || matrix->ki > INT32_MAX / 16 ||
+                matrix->nj <= 0 || matrix->nj > INT32_MAX / 16 || matrix->ki % 8 || matrix->nj % 8)
+                return false;   // the mcg/3inst codebooks, K outside 2..6.5 and non-128-multiple dims stay on the
+                                // reconstruct path (the caller takes exl3_moe_group_gemm, which decodes any frac)
+    }
     if (rows <= 0 || rows > 65535 || !x || !input_rows || !out || gate.ki != up.ki || gate.nj != up.nj ||
         down.ki != gate.nj || gate.ki <= 0 || gate.nj <= 0 || down.nj <= 0)
         return false;
     const int k = gate.ki * 16, ff = gate.nj * 16, n = down.nj * 16;
     const auto st = (cudaStream_t) stream;
-    workspace.reserve(rows, k, ff, n);
+    if constexpr (Band8 && Strict) {
+        auto& wt = workspace.implementation();
+        int device = -1;
+        if (cudaGetDevice(&device) != cudaSuccess || device != wt.device ||
+            !workspace.group_tile_fits(rows, k, ff, n, true))
+            return false;   // the EXPERIMENT's pre-reserved-only contract; never grow under queued work
+    } else {
+        workspace.reserve(rows, k, ff, n);
+    }
     auto& w = workspace.implementation();
-    w.wmma_x.reserve((size_t) rows * std::max(k, ff));
-    w.group_y.reserve((size_t) rows * std::max(ff, n));
+    if constexpr (!(Band8 && Strict)) {
+        w.wmma_x.reserve((size_t) rows * std::max(k, ff));
+        w.group_y.reserve((size_t) rows * std::max(ff, n));
+    }
     uint16_t* slab = w.wmma_x.p;
     float* y = w.group_y.p;
     const int row_tiles = rows >= 24 ? 2 : 1;
@@ -2708,19 +3996,28 @@ bool exl3_moe_group_wmma(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& 
         const int in = m.ki * 16, outputs = m.nj * 16;
         gather_h128_f16_kernel<<<dim3(in / 128, rows), 32, 0, st>>>(input, rows_of, m.suh, slab, in);
         const int bands = (outputs + 255) / 256;
-        const int bits = m.bits;
-        if (bits == 3) {
-            if (row_tiles == 1) routed_wmma_kernel<3, 1><<<dim3(m_blocks, bands), 512, 0, st>>>(slab, m.trellis, y, rows, in, outputs);
-            else routed_wmma_kernel<3, 2><<<dim3(m_blocks, bands), 512, 0, st>>>(slab, m.trellis, y, rows, in, outputs);
-        } else if (bits == 4) {
-            if (row_tiles == 1) routed_wmma_kernel<4, 1><<<dim3(m_blocks, bands), 512, 0, st>>>(slab, m.trellis, y, rows, in, outputs);
-            else routed_wmma_kernel<4, 2><<<dim3(m_blocks, bands), 512, 0, st>>>(slab, m.trellis, y, rows, in, outputs);
-        } else if (bits == 5) {
-            if (row_tiles == 1) routed_wmma_kernel<5, 1><<<dim3(m_blocks, bands), 512, 0, st>>>(slab, m.trellis, y, rows, in, outputs);
-            else routed_wmma_kernel<5, 2><<<dim3(m_blocks, bands), 512, 0, st>>>(slab, m.trellis, y, rows, in, outputs);
-        } else {
-            if (row_tiles == 1) routed_wmma_kernel<6, 1><<<dim3(m_blocks, bands), 512, 0, st>>>(slab, m.trellis, y, rows, in, outputs);
-            else routed_wmma_kernel<6, 2><<<dim3(m_blocks, bands), 512, 0, st>>>(slab, m.trellis, y, rows, in, outputs);
+        const int bits = m.bits, frac = m.frac;
+        const bool stg_pad = exl3_wmma_stg_pad_enabled();
+        auto launch = [&](auto bits_tag) {
+            constexpr int B = decltype(bits_tag)::value;
+            auto slots = [&](auto slots_tag) {
+                constexpr int S = decltype(slots_tag)::value;
+                if (row_tiles == 1)
+                    routed_wmma_kernel<B, 1, false, S, Band8><<<dim3(m_blocks, bands), 512, 0, st>>>(
+                        slab, m.trellis, y, rows, in, outputs, nullptr, 0, frac);
+                else
+                    routed_wmma_kernel<B, 2, false, S, Band8><<<dim3(m_blocks, bands), 512, 0, st>>>(
+                        slab, m.trellis, y, rows, in, outputs, nullptr, 0, frac);
+            };
+            if (stg_pad) slots(std::integral_constant<int, 9>{});
+            else slots(std::integral_constant<int, 8>{});
+        };
+        switch (bits) {
+            case 2: launch(std::integral_constant<int, 2>{}); break;
+            case 3: launch(std::integral_constant<int, 3>{}); break;
+            case 4: launch(std::integral_constant<int, 4>{}); break;
+            case 5: launch(std::integral_constant<int, 5>{}); break;
+            default: launch(std::integral_constant<int, 6>{}); break;
         }
         if (f16_out)
             postscale_rows_f16_kernel<<<dim3(outputs / HAD, rows), HAD, 0, st>>>(y, m.svh, f16_out, outputs);
@@ -2735,11 +4032,50 @@ bool exl3_moe_group_wmma(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& 
     return true;
 }
 
+}  // namespace
+
+bool exl3_moe_group_wmma(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& down, int rows,
+                         const uint16_t* x, const int* input_rows, float* out, void* stream,
+                         Exl3MoeWorkspace& workspace) {
+    // Layout routing: the trio's tags must agree (mixed returns false - nothing enqueued).
+    // All-Native keeps the established eligibility and dispatch byte-for-byte; a Band8 tag
+    // runs the SAME launch sequence with routed_wmma_kernel's Band8 tile addressing, at this
+    // entry's own contract (rows 1..65535, workspace may grow - the 16..512 clamp and the
+    // pre-reserved-only policy belong to the experimental entry below).
+    if (gate.layout != up.layout || up.layout != down.layout) return false;
+    if (gate.layout == Exl3TrellisLayout::Band8)
+        return moe_group_wmma_impl<true, false>(gate, up, down, rows, x, input_rows, out, stream, workspace);
+    return moe_group_wmma_impl<false, false>(gate, up, down, rows, x, input_rows, out, stream, workspace);
+}
+
+// EXPERIMENTAL, stage-2 band8 prefill: the gfx11 WMMA group FFN on CPU-repacked band8 trellis
+// views.  The ENTRY NAME is the layout contract - every trellis below is band8-packed (tile
+// (kt,nt) at ((nt/8)*ki+kt)*8+nt%8 words()) AND carries Exl3Mat.layout == Band8 (untagged
+// views are refused); within-tile words and scales are unchanged, and these views must never
+// reach a native API.  Contract as exl3_moe_group_wmma (same geometry relation; input_rows is
+// the DEVICE row table with TRUSTED, unchecked values; out is DEVICE float [rows,
+// down.nj*16]) with three restrictions: rows 16..512 (the experiment's range; the normal
+// entry keeps 1..65535), band8_matrix_valid rates (cb=mul1 K2/K2.5/K3/K4, ki/nj %8) and
+// a pre-reserved workspace - reserve() + reserve_group_scratch(rows, k, ff, n, true) - BEFORE
+// enqueue/capture.  False means nothing was enqueued (a short workspace, an ineligible
+// descriptor); there is never a native fallback.
+bool exl3_experimental_band8_group_wmma(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& down,
+                                        int rows, const uint16_t* x, const int* input_rows,
+                                        float* out, void* stream, Exl3MoeWorkspace& workspace) {
+    return moe_group_wmma_impl<true, true>(gate, up, down, rows, x, input_rows, out, stream, workspace);
+}
+
 bool exl3_moe_expert_batch(const Exl3Group* groups, int count, const uint16_t* x,
                            const int* input_rows, const int* destinations, float* out, void* stream,
                            Exl3MoeWorkspace& workspace) {
     if (!groups || count < 2 || count > 8 || !x || !input_rows || !destinations || !out ||
         !exl3_wmma_device()) return false;
+    // Layout routing: one tag over every group's whole trio (mixed tags return false before
+    // anything is uploaded or launched).  A Band8 tag requires the verified band8 rates
+    // (cb=mul1 K2/K2.5/K3/K4) - narrower than this entry's native K2..K6.5 range - and runs
+    // routed_wmma_kernel's Band8 fragment reader, everything else unchanged.
+    const Exl3TrellisLayout layout = groups[0].gate.layout;
+    const bool band8 = layout == Exl3TrellisLayout::Band8;
     int rows = 0, max_rows = 0;
     for (int i = 0; i < count; ++i) {
         const auto& g = groups[i];
@@ -2748,8 +4084,12 @@ bool exl3_moe_expert_batch(const Exl3Group* groups, int count, const uint16_t* x
         for (int p = 0; p < 3; ++p) {
             const Exl3Mat& m = p == 0 ? g.gate : p == 1 ? g.up : g.down;
             const Exl3Mat& ref = p == 0 ? groups[0].gate : p == 1 ? groups[0].up : groups[0].down;
-            if (!m.trellis || !m.suh || !m.svh || m.cb != 2 || m.bits < 3 || m.bits > 6 ||
-                m.bits != ref.bits || m.ki != ref.ki || m.nj != ref.nj ||
+            if (m.layout != layout || (band8 && !band8_matrix_valid(m))) return false;
+            // one (bits, frac) per batch: the trellis stride is a kernel argument - a K2/K2.5 mix
+            // splits into two launches upstream (the builders stop a run at the boundary)
+            if (!m.trellis || !m.suh || !m.svh || m.cb != 2 || m.bits < 2 || m.bits > 6 ||
+                m.frac < 0 || m.frac > 1 || m.bits != ref.bits || m.frac != ref.frac ||
+                m.ki != ref.ki || m.nj != ref.nj ||
                 m.ki <= 0 || m.ki > INT32_MAX / 16 || m.nj <= 0 || m.nj > INT32_MAX / 16 ||
                 m.ki % 8 || m.nj % 8) return false;
         }
@@ -2772,15 +4112,29 @@ bool exl3_moe_expert_batch(const Exl3Group* groups, int count, const uint16_t* x
         gather_h128_f16_kernel<true><<<dim3(in / 128, max_rows, count), 32, 0, st>>>(
             input, ids, nullptr, w.wmma_x.p, in, w.expert_groups.p, p);
         const dim3 grid(mb, (outputs + 255) / 256, count);
+        const bool stg_pad = exl3_wmma_stg_pad_enabled();
         auto launch = [&]<int bits>() {
-            if (rt == 1)
-                routed_wmma_kernel<bits, 1, true><<<grid, 512, 0, st>>>(
-                    w.wmma_x.p, nullptr, w.group_y.p, 0, in, outputs, w.expert_groups.p, p);
-            else
-                routed_wmma_kernel<bits, 2, true><<<grid, 512, 0, st>>>(
-                    w.wmma_x.p, nullptr, w.group_y.p, 0, in, outputs, w.expert_groups.p, p);
+            band8_dispatch(band8, [&](auto b8) {
+                constexpr bool B8 = decltype(b8)::value;
+                if (rt == 1) {
+                    if (stg_pad)
+                        routed_wmma_kernel<bits, 1, true, 9, B8><<<grid, 512, 0, st>>>(
+                            w.wmma_x.p, nullptr, w.group_y.p, 0, in, outputs, w.expert_groups.p, p, m.frac);
+                    else
+                        routed_wmma_kernel<bits, 1, true, 8, B8><<<grid, 512, 0, st>>>(
+                            w.wmma_x.p, nullptr, w.group_y.p, 0, in, outputs, w.expert_groups.p, p, m.frac);
+                } else {
+                    if (stg_pad)
+                        routed_wmma_kernel<bits, 2, true, 9, B8><<<grid, 512, 0, st>>>(
+                            w.wmma_x.p, nullptr, w.group_y.p, 0, in, outputs, w.expert_groups.p, p, m.frac);
+                    else
+                        routed_wmma_kernel<bits, 2, true, 8, B8><<<grid, 512, 0, st>>>(
+                            w.wmma_x.p, nullptr, w.group_y.p, 0, in, outputs, w.expert_groups.p, p, m.frac);
+                }
+            });
         };
         switch (m.bits) {
+            case 2: launch.template operator()<2>(); break;
             case 3: launch.template operator()<3>(); break;
             case 4: launch.template operator()<4>(); break;
             case 5: launch.template operator()<5>(); break;
@@ -2808,6 +4162,15 @@ bool exl3_moe_group_wmma(const Exl3Mat&, const Exl3Mat&, const Exl3Mat&, int,
                          const uint16_t*, const int*, float*, void*, Exl3MoeWorkspace&) {
     return false;
 }
+
+bool exl3_experimental_band8_group_wmma(const Exl3Mat&, const Exl3Mat&, const Exl3Mat&, int,
+                                        const uint16_t*, const int*, float*, void*,
+                                        Exl3MoeWorkspace&) {
+    return false;
+}
+
+// exl3_wmma_stg_pad_enabled/_set: the unconditional definitions above the #if serve every
+// backend; on a build without the WMMA kernels the flag merely has no dispatch to influence.
 
 #endif
 
@@ -2939,13 +4302,19 @@ void exl3_shared_reserve(int n_ff) {
 
 void exl3_shared_expert(const float* x, const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down,
                         const uint16_t* w_ginp, float* out, int n_embd, int n_ff, void* stream) {
+    // The shared expert rides the DENSE m==1 GEMV (raw trellis pointers, native layout only;
+    // dense EXL3 projections stay Native per the cache contract).  A Band8 tag has no reader
+    // here - refuse before anything launches rather than decode the packed bytes as native.
+    for (const Exl3Mat* m : {gate, up, down})
+        if (m->layout == Exl3TrellisLayout::Band8)
+            throw std::invalid_argument("exl3: the shared expert's dense GEMV has no Band8 reader");
     cudaStream_t st = (cudaStream_t) stream;
     exl3_shared_reserve(n_ff);
     float* const d_g = g_sh_g; float* const d_u = g_sh_u; float* const d_h = g_sh_h;
-    exl3_gemv_f32(x, gate->suh, gate->svh, gate->trellis, gate->ki, gate->nj, gate->bits, gate->cb, d_g, stream);
-    exl3_gemv_f32(x, up->suh, up->svh, up->trellis, up->ki, up->nj, up->bits, up->cb, d_u, stream);
+    exl3_gemv_f32(x, gate->suh, gate->svh, gate->trellis, gate->ki, gate->nj, gate->bits, gate->cb, d_g, stream, gate->frac);
+    exl3_gemv_f32(x, up->suh, up->svh, up->trellis, up->ki, up->nj, up->bits, up->cb, d_u, stream, up->frac);
     silu_mul_f32_kernel<<<(unsigned)((n_ff + 255) / 256), 256, 0, st>>>(d_g, d_u, d_h, n_ff);
-    exl3_gemv_f32(d_h, down->suh, down->svh, down->trellis, down->ki, down->nj, down->bits, down->cb, out, stream);
+    exl3_gemv_f32(d_h, down->suh, down->svh, down->trellis, down->ki, down->nj, down->bits, down->cb, out, stream, down->frac);
     shared_scalar_gate_kernel<<<1, 256, 0, st>>>(out, x, w_ginp, n_embd);
 }
 
@@ -2977,13 +4346,13 @@ void exl3_sigmoid_scale_rows(float* out, const float* g, int n, int rows, void* 
 
 
 void exl3_gemv_f32(const float* x, const uint16_t* suh, const uint16_t* svh, const uint16_t* trellis,
-                   int ki, int nj, int bits, int cb, float* y, void* stream) {
+                   int ki, int nj, int bits, int cb, float* y, void* stream, int frac) {
 #if defined(STRATA_WMMA_GFX11)
     // STRATA_EXL3_DENSE_RDNA=1: the dense m == 1 GEMV takes the multirow kernel's row tile of 1
     // (2 launches, the RDNA decode core, fp32 end to end) instead of the f32->f16->f32 old pipeline
     if (exl3_dense_rdna_enabled()) {
         exl3_dense_gemv_multi(0, x, (long) ki * 16, trellis, suh, svh, ki, nj, bits, cb, 1, y,
-                              (long) nj * 16, stream);
+                              (long) nj * 16, stream, frac);
         return;
     }
 #endif
@@ -2991,7 +4360,7 @@ void exl3_gemv_f32(const float* x, const uint16_t* suh, const uint16_t* svh, con
     const int k = ki * 16, n = nj * 16;
     exl3_gemv_reserve(k, n);
     f32_to_f16_out_kernel<<<(k + 255) / 256, 256, 0, st>>>(x, g_ws.x16, k);
-    exl3_gemv(g_ws.x16, suh, svh, trellis, ki, nj, bits, cb, g_ws.y16, stream);
+    exl3_gemv(g_ws.x16, suh, svh, trellis, ki, nj, bits, cb, g_ws.y16, stream, frac);
     f16_to_f32_kernel<<<(n + 255) / 256, 256, 0, st>>>(g_ws.y16, y, n);
 }
 
@@ -3053,12 +4422,20 @@ void exl3_dense_mr_reserve_shape(int slot, int ki, int nj) {
 
 void exl3_dense_gemv_multi(int slot, const float* x, long x_stride, const uint16_t* trellis,
                            const uint16_t* suh, const uint16_t* svh, int ki, int nj, int bits, int cb,
-                           int rows, float* y, long y_stride, void* stream) {
+                           int rows, float* y, long y_stride, void* stream, int frac) {
 #if defined(STRATA_WMMA_GFX11)
     const int k = ki * 16, n = nj * 16;
     if (ki <= 0 || nj <= 0 || rows < 1 || k % HAD || n % HAD) {
         std::fprintf(stderr, "exl3_dense_gemv_multi: dims must be multiples of %d (ki=%d nj=%d rows=%d)\n",
                      HAD, ki, nj, rows);
+        std::abort();
+    }
+    // The multirow kernel's decode core is the RDNA run-funnel one (uniformly spaced windows); the
+    // alternating steps of a half-integer bitrate have no expression in it. Fail loudly here rather
+    // than decode garbage - dense trellis weights are integer-K today, and a caller that ever needs
+    // a half-integer dense GEMV has exl3_gemv_f32's established scalar kernel.
+    if (frac != 0) {
+        std::fprintf(stderr, "exl3_dense_gemv_multi: half-integer bitrates are not implemented\n");
         std::abort();
     }
     exl3_gemv_reserve(k, n);   // the pinv table (and the old path's scratch), allocated outside capture
@@ -3085,7 +4462,7 @@ void exl3_dense_gemv_multi(int slot, const float* x, long x_stride, const uint16
     }
 #else
     (void) slot; (void) x; (void) x_stride; (void) trellis; (void) suh; (void) svh; (void) ki; (void) nj;
-    (void) bits; (void) cb; (void) rows; (void) y; (void) y_stride; (void) stream;
+    (void) bits; (void) cb; (void) rows; (void) y; (void) y_stride; (void) stream; (void) frac;
     std::fprintf(stderr, "exl3_dense_gemv_multi: this build has no gfx11 kernels\n");
     std::abort();
 #endif

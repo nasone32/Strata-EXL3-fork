@@ -130,4 +130,9 @@ void Exl3PeerOutput::release() {
     if(impl_ && !impl_->released.exchange(true)) *(volatile uint32_t*)&impl_->host->aborted=1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
+void Exl3PeerOutput::test_desynchronize() {
+    if(!impl_ || impl_->released.load()) return;
+    ++impl_->host->expected;   // every queued signal is now stale: ready < expected forever
+    std::atomic_thread_fence(std::memory_order_release);
+}
 } // namespace strata::kernels

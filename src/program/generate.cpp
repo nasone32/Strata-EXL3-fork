@@ -94,11 +94,17 @@
 #include "strata/kernels/exl3_experts.hpp"
 #include "strata/kernels/cpu/exl3_moe.hpp"
 #include "strata/artifact/exl3_model.hpp"
+#include "strata/artifact/exl3_band8_store.hpp"
+#include "strata/kernels/exl3_resident_host.hpp"
 #include "strata/kernels/exl3_peer.hpp"
 #include "strata/kernels/exl3_peer_adapt.hpp"
 #include "strata/core/family_layout.hpp"
 #if defined(STRATA_HAVE_QWEN35)
 #include "strata/qwen35/engine.hpp"
+#endif
+#if defined(STRATA_HAVE_MIMO)
+#include "strata/core/mimo_geometry.hpp"
+#include "strata/mimo/engine.hpp"
 #endif
 #if defined(_WIN32)
 #include <windows.h>
@@ -2454,6 +2460,23 @@ int main(int argc, char** argv) {
         break;
     }
 #endif
+#if defined(STRATA_HAVE_MIMO)
+    // **THE THIRD FAMILY SWITCH.**  A MiMo v2 EXL3 dir (config.json model_type mimo_v2) runs on its own engine
+    // path (src/mimo), decided here from the dir's config.json BEFORE any pack is built; every other --exl3
+    // dir goes on below exactly as before.  Only config.json is read - no tensor, no allocation, and a dir
+    // that is not MiMo's says nothing (the normal path below reports a bad dir).
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--exl3") != 0) continue;
+        bool mimo = false;
+        try {
+            mimo = strata::core::mimo_detect_config(std::string(argv[i + 1]) + "/config.json");
+        } catch (const std::exception&) {
+            // not readable here: the normal path below reports it
+        }
+        if (mimo) return strata::mimo::run(argc, argv);
+        break;
+    }
+#endif
     Options o;
     bool have_tokens = false;
     bool have_logits_stride = false;
@@ -2839,7 +2862,25 @@ int main(int argc, char** argv) {
         }
         }
     }
-    if (!o.exl3_dir.empty()) strata::core::apply_exl3_defaults();
+    if (!o.exl3_dir.empty()) {
+        strata::core::apply_exl3_defaults();
+#if defined(STRATA_USE_HIP) && !defined(_WIN32)
+        // --gpu has already selected visible devices. Do not assume a second
+        // card has the primary's architecture, or enable RDNA defaults on CUDA.
+        int devices = 0;
+        bool measured = cudaGetDeviceCount(&devices) == cudaSuccess && devices > 0;
+        for (int d = 0; measured && d < devices; ++d) {
+            cudaDeviceProp p{};
+            measured = cudaGetDeviceProperties(&p, d) == cudaSuccess &&
+                       std::string(p.gcnArchName).substr(0, 7) == "gfx1100";
+        }
+        if (!measured) (void) cudaGetLastError();
+        const auto defaults = strata::core::apply_exl3_fast_defaults(measured);
+        if (!defaults.empty())
+            std::fprintf(stderr, "strata: Qwen EXL3 gfx1100 fast defaults enabled (%zu settings; explicit environment overrides win)\n",
+                         defaults.size());
+#endif
+    }
 #if defined(STRATA_USE_HIP)
     {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
         // any engine code reads its switches (they are read at first use), and the user's own settings are kept
@@ -6506,6 +6547,7 @@ int main(int argc, char** argv) {
     Drive drive;
     Exl3Drive exl3_drive;
     exl3_drive.failed = &drive.d.failed;
+    std::shared_ptr<strata::Exl3ResidentBacking> exl3_resident;
     std::unique_ptr<strata::kernels::Exl3ExpertStream> exl3_stream;
     std::unique_ptr<strata::kernels::cpu::Exl3CpuMoe> exl3_cpu;
     // the CPU tier's registered pointers live in this model's mmaps: it must OUTLIVE the
@@ -6516,6 +6558,227 @@ int main(int argc, char** argv) {
         // GGUF count is global because its blobs are one pool), `auto`/unset sizes it from the free VRAM after
         // this instance's buffers, and 0 turns it off.
         const int exl3_slots = exl3_cache_slots;
+        // ---- Opt-in canonical Band8 packed routed-expert backing (STRATA_QWEN_BAND8): the
+        // shared CPU/GPU physical format the MiMo engine already runs (notes/
+        // MIMO-BAND8-INTEGRATION-2026-11-06.md), opened for THIS family's experts
+        // (notes/QWEN-BAND8-FEASIBILITY-2026-11-08.md: 48x512 K4 mul1, gate/up nj=40=5x8 and
+        // down nj=160=20x8 divide band-8 exactly; the in-file mtp.layers.0 block and the
+        // external drafter stay native). TWO select modes, both before any cache byte or
+        // GPU allocation could be touched: "1" opens/builds the persistent cache under
+        // STRATA_EXL3_BAND8_CACHE (a missing generation packs ~56.7 GiB there once and is
+        // reused by fingerprint); "memory" repacks the routed experts into the canonical
+        // Band8 order DIRECTLY in the resident RAM arena at startup - NO disk cache,
+        // descriptor or payload file is created or read anywhere (Exl3ResidentRepack).
+        // Unset/0 opens nothing and keeps the native byte path exactly as before; nothing
+        // below changes MiMo.
+        std::shared_ptr<const strata::Exl3ExpertBacking> exl3_band8;
+        bool qwen_band8_on = false;
+        if (const char* qwen_band8 = std::getenv("STRATA_QWEN_BAND8");
+                qwen_band8 && qwen_band8[0] && qwen_band8[0] != '0') {
+            const bool band8_memory = std::strcmp(qwen_band8, "memory") == 0;
+            if (!band8_memory && std::strcmp(qwen_band8, "1") != 0) {
+                std::fprintf(stderr, "strata generate: STRATA_QWEN_BAND8 must be 1 (the packed "
+                                     "cache under STRATA_EXL3_BAND8_CACHE) or memory (a runtime "
+                                     "repack into RAM with no disk cache) - got '%s'; refusing "
+                                     "instead of guessing\n", qwen_band8);
+                return 2;
+            }
+            const char* band8_cache = std::getenv("STRATA_EXL3_BAND8_CACHE");
+            if (band8_memory) {
+                if (band8_cache && band8_cache[0]) {
+                    std::fprintf(stderr, "strata generate: STRATA_QWEN_BAND8=memory never builds "
+                                         "or reads a packed disk cache - unset "
+                                         "STRATA_EXL3_BAND8_CACHE (or use =1 for the cache mode); "
+                                         "refusing the mixed intent\n");
+                    return 2;
+                }
+            } else if (!band8_cache || !band8_cache[0]) {
+                std::fprintf(stderr, "strata generate: STRATA_QWEN_BAND8=1 also needs "
+                                     "STRATA_EXL3_BAND8_CACHE=<explicit cache dir> (the packed payload is "
+                                     "written there once and reused by fingerprint)\n");
+                return 2;
+            }
+            if (multi_gpu || !stages.empty()) {
+                std::fprintf(stderr, "strata generate: the Qwen band-8 packed backing needs one stage/"
+                                     "sequence (a layer split is refused, not silently split between a packed "
+                                     "primary and native stages)\n");
+                return 2;
+            }
+            if (o.batch > 0) {
+                std::fprintf(stderr, "strata generate: the Qwen band-8 packed backing is refused with "
+                                     "--batch (untested mode)\n");
+                return 2;
+            }
+            if (o.expert_ram_cache_given && o.expert_ram_cache_mib != 0) {
+                std::fprintf(stderr, "strata generate: the Qwen band-8 packed backing needs "
+                                     "--expert-ram-cache 0 (the backing is the single host copy; the expert "
+                                     "stream refuses a managed RAM cache beside it)\n");
+                return 2;
+            }
+            const char* band8_res = std::getenv("STRATA_EXL3_RESIDENT");
+            if (!band8_res || std::strcmp(band8_res, "all") != 0) {
+                std::fprintf(stderr, "strata generate: STRATA_QWEN_BAND8 (either mode) currently "
+                                     "requires STRATA_EXL3_RESIDENT=all - the single canonical pinned RAM arena both "
+                                     "the CPU tier and GPU staging read (peer-complement exchange is "
+                                     "integrated in MiMo, not here)\n");
+                return 2;
+            }
+            const char* cpu_tier = std::getenv("STRATA_EXL3_CPU_TIER");
+            if (cpu_tier && cpu_tier[0] && cpu_tier[0] != '0' &&
+                    !strata::kernels::cpu::Exl3CpuMoe::band8_supported()) {
+                std::fprintf(stderr, "strata generate: STRATA_QWEN_BAND8=1 with STRATA_EXL3_CPU_TIER=1 "
+                                     "needs the AVX-512BW band kernels on this CPU - refusing before the "
+                                     "packed cache is built (the tier would reject every expert at "
+                                     "registration)\n");
+                return 2;
+            }
+            // Family gate: the packed path is validated on THIS family's geometry (48x512 K4
+            // mul1, nj 40/160). A future family whose export reused the
+            // model.language_model.layers.* prefix would otherwise be packed on name shape
+            // alone; the store's per-projection checks remain the format gate, this is the
+            // narrow up-front refusal (mirrors MiMo's config-detection gate).
+            if (g.family != strata::ModelFamily::Qwen4Exp) {
+                std::fprintf(stderr, "strata generate: STRATA_QWEN_BAND8=1 is validated on the "
+                                     "Qwen3.8-Flash-Next (qwen4exp) EXL3 family only - refusing "
+                                     "this model before any cache byte is written\n");
+                return 2;
+            }
+#if defined(STRATA_USE_HIP)
+            {   // gfx1100/gfx11 is the validated primary/peer pair for the Band8 tile
+                // addressing (the same gate STRATA_MIMO_BAND8 applies): the addressing itself
+                // is GPU-independent, but no other ISA has been validated end to end - refuse
+                // instead of silently accepting an untested feature. cudaGetDeviceProperties
+                // needs no device switch, so this stays cheap and side-effect-free, and it
+                // runs BEFORE the ~56.7 GiB payload could be written. The PEER card is
+                // validated too when --peer-device armed the tier.
+                int band8_dev = 0;
+                cudaDeviceProp band8_prop{};
+                if (cudaGetDevice(&band8_dev) != cudaSuccess ||
+                        cudaGetDeviceProperties(&band8_prop, band8_dev) != cudaSuccess ||
+                        std::strncmp(band8_prop.gcnArchName, "gfx11", 5) != 0) {
+                    std::fprintf(stderr, "strata generate: STRATA_QWEN_BAND8=1 is validated on "
+                                         "gfx11 (RDNA3, gfx1100/gfx110x) HIP builds only - this "
+                                         "GPU/build is not one (no silent untested feature)\n");
+                    return 2;
+                }
+                if (o.peer_device >= 1) {
+                    int band8_n_dev = 0;
+                    cudaDeviceProp band8_pprop{};
+                    const char* band8_why = nullptr;
+                    if (cudaGetDeviceCount(&band8_n_dev) != cudaSuccess || o.peer_device >= band8_n_dev)
+                        band8_why = "is out of range";
+                    else if (o.peer_device == band8_dev)
+                        band8_why = "is the primary GPU";
+                    else if (cudaGetDeviceProperties(&band8_pprop, o.peer_device) != cudaSuccess ||
+                             std::strncmp(band8_pprop.gcnArchName, "gfx11", 5) != 0)
+                        band8_why = "is not a gfx11 part (the band-8 pair is validated on gfx1100/gfx110x only)";
+                    if (band8_why != nullptr) {
+                        std::fprintf(stderr, "strata generate: STRATA_QWEN_BAND8=1 with --peer-device "
+                                             "%d: the peer %s - refusing before any cache write\n",
+                                     o.peer_device, band8_why);
+                        return 2;
+                    }
+                }
+            }
+#else
+            std::fprintf(stderr, "strata generate: STRATA_QWEN_BAND8=1 is validated on HIP (gfx11) "
+                                 "builds only this phase - this is a CUDA build (no silent untested "
+                                 "feature)\n");
+            return 2;
+#endif
+            // EXACTLY the expert stream's own names (expert_prefix "model.language_model."
+            // is spelled out in Exl3ExpertStream::Impl), in the same layer-major /
+            // expert-minor / gate-up-down order exl3_band8_build --qwen generates: the list
+            // order is part of the cache fingerprint, so the CLI and the engine must agree.
+            // The memory mode needs no list at all: Exl3ResidentBacking::create validates
+            // every group projection against the native source itself.
+            qwen_band8_on = true;
+            if (band8_memory) {
+                std::fprintf(stderr, "strata generate: qwen band8 experts: runtime in-memory repack "
+                                     "selected - the canonical Band8 bytes are permuted straight into "
+                                     "the resident RAM arena below (no disk cache, no payload file, "
+                                     "native weights untouched; mtp.layers.0 and the drafter stay native)\n");
+            } else {
+                std::vector<std::string> band8_prefixes;
+                band8_prefixes.reserve((size_t) g.n_layers * (size_t) g.n_expert * 3);
+                for (int64_t l = 0; l < g.n_layers; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e)
+                        for (const char* proj : {"gate", "up", "down"})
+                            band8_prefixes.push_back("model.language_model.layers." + std::to_string(l) +
+                                                     ".mlp.experts." + std::to_string(e) + "." + proj + "_proj");
+                strata::Exl3Band8BuildOptions band8_opts;
+                band8_opts.progress_every_triples = 512;
+                const auto band8_t0 = std::chrono::steady_clock::now();
+                try {
+                    exl3_band8 = strata::Exl3Band8Store::build_or_open(o.exl3_dir, band8_cache,
+                                                                       band8_prefixes, band8_opts);
+                } catch (const std::exception& ex) {
+                    std::fprintf(stderr, "strata generate: qwen band8 expert cache: %s\n", ex.what());
+                    return 1;
+                }
+                const auto* band8_store = static_cast<const strata::Exl3Band8Store*>(exl3_band8.get());
+                std::error_code band8_ec;
+                const uintmax_t band8_payload = std::filesystem::file_size(band8_store->payload_path(), band8_ec);
+                std::fprintf(stderr, "strata generate: qwen band8 experts: %s backing, %zu plane record(s), "
+                                     "%.2f GiB payload at %s (fingerprint %016llx) in %.1f s; native weights "
+                                     "untouched, mtp.layers.0 and the drafter stay native\n",
+                             "shared packed", band8_store->record_count(),
+                             (double) band8_payload / 1073741824.0, band8_store->payload_path().c_str(),
+                             (unsigned long long) band8_store->fingerprint(),
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - band8_t0).count());
+            }
+        }
+        const char* res = std::getenv("STRATA_EXL3_RESIDENT");
+        if (res && res[0] && std::strcmp(res,"0") != 0) {
+            if (std::strcmp(res,"all") != 0 || multi_gpu || o.batch > 0 ||
+                    (o.expert_ram_cache_given && o.expert_ram_cache_mib != 0)) {
+                std::fprintf(stderr,"strata generate: Qwen EXL3 resident backing currently needs "
+                    "STRATA_EXL3_RESIDENT=all, one stage/sequence, --expert-ram-cache 0; "
+                    "peer-complement exchange is integrated in MiMo\n"); return 2;
+            }
+            std::vector<strata::Exl3ResidentBacking::Group> groups;
+            for (int l = 0; l < g.n_layers; ++l) for (int e = 0; e < g.n_expert; ++e) {
+                const auto b = "model.language_model.layers." + std::to_string(l) + ".mlp.experts." + std::to_string(e);
+                groups.push_back({l,e,{b+".gate_proj",b+".up_proj",b+".down_proj"}});
+            }
+            try {
+                // With STRATA_QWEN_BAND8=1 the arena's SOURCE is the packed store: create()
+                // captures the store's Band8 descriptors and payload file ranges, so the
+                // pinned arena holds the SAME packed bytes, layout() reports Band8, and the
+                // CPU tier, the primary stream and the peer all read ONE canonical physical
+                // copy (no native shadow, no runtime repack). With STRATA_QWEN_BAND8=memory
+                // there is no store at all: create() validates the NATIVE source and
+                // activate() below permutes the routed experts' trellis planes straight
+                // into the pinned arena (Exl3ResidentRepack::ToBand8), still before the
+                // stream, the CPU tier or any peer fill exists. Without either the source
+                // is the native shards, byte-identical to the previous behavior.
+                const auto repack = qwen_band8_on && !exl3_band8
+                                        ? strata::Exl3ResidentRepack::ToBand8
+                                        : strata::Exl3ResidentRepack::None;
+                exl3_resident = strata::Exl3ResidentBacking::create(o.exl3_dir, groups, exl3_band8, repack);
+                // Retire the store (and its payload mmap) BEFORE the arena commits - the
+                // same source-lifetime rule the resident loader applies internally
+                // (notes/EXL3-RESIDENT-ALL-BENCH-2026-11-07.md): create() captured every
+                // descriptor and file range, so nothing reads the mapping again.
+                exl3_band8 = nullptr;
+                auto options = strata::kernels::exl3_resident_host_options();
+                options.progress = [](size_t done,size_t total) {
+                    std::fprintf(stderr,"strata generate: resident EXL3 load %zu/%zu experts\n",done,total);
+                };
+                exl3_resident->activate({},std::move(options));
+                std::fprintf(stderr,"strata generate: resident EXL3 full arena: %.2f GiB locked; "
+                                    "no runtime file tier%s%s\n",
+                                    exl3_resident->stats().locked_bytes/1073741824.0,
+                                    qwen_band8_on && repack == strata::Exl3ResidentRepack::None
+                                        ? "; packed band-8 source (CPU/GPU share one physical copy)" : "",
+                                    repack == strata::Exl3ResidentRepack::ToBand8
+                                        ? "; runtime band-8 repack into RAM (no packed disk cache; "
+                                          "CPU/GPU share one physical copy)" : "");
+                exl3_peer_adapt_options.expert_backing = exl3_resident;
+            } catch (const std::exception& ex) {
+                std::fprintf(stderr,"strata generate: %s\n",ex.what()); return 1;
+            }
+        }
         // `--expert-ram-cache auto` (the default): a quarter of what the host reports as available, capped at
         // 4 GiB, so a machine that is already short of RAM is not made shorter.  A number sets it, 0 turns it off.
         size_t exl3_ram = 0;
@@ -6551,7 +6814,7 @@ int main(int argc, char** argv) {
         };
         exl3_stream = std::make_unique<strata::kernels::Exl3ExpertStream>(o.exl3_dir, (int) g.n_embd, (int) g.n_layers,
                     exl3_slots, nullptr, exl3_ram, reserve_for(ss, native_head), 0, multi_gpu ? (int) split_at[0] : (int) g.n_layers,
-                    (int) o.prefill_chunk);
+                    (int) o.prefill_chunk,"model.language_model.layers.",exl3_resident);
         exl3_drive.stream = exl3_stream.get();
         exl3_drive.layers.assign((size_t) g.n_layers, exl3_stream.get());
         for (auto& stage : stages) {
@@ -6597,7 +6860,7 @@ int main(int argc, char** argv) {
             if (strata::kernels::cpu::Exl3CpuMoe::supported()) {
                 const auto cpu_t0 = std::chrono::steady_clock::now();
                 exl3_cpu = std::make_unique<strata::kernels::cpu::Exl3CpuMoe>();
-                exl3_cpu_model = std::make_unique<strata::Exl3Model>(o.exl3_dir);
+                exl3_cpu_model = std::make_unique<strata::Exl3Model>(o.exl3_dir,exl3_resident);
                 strata::Exl3Model& cpu_model = *exl3_cpu_model;
                 std::vector<strata::kernels::cpu::Exl3CpuMatrix> gs, us, ds;
                 for (int64_t l = 0; l < g.n_layers; ++l) {
@@ -6610,6 +6873,15 @@ int main(int argc, char** argv) {
                         auto fill = [](const strata::Exl3Linear& L, strata::kernels::cpu::Exl3CpuMatrix& M) {
                             M.trellis = L.trellis; M.suh = L.suh; M.svh = L.svh;
                             M.k = L.in(); M.n = L.out(); M.bits = L.bits; M.hb = 0;
+                            // The physical layout tag MUST travel with the pointers: a
+                            // Band8 backing (STRATA_QWEN_BAND8) hands out packed views, and
+                            // an untagged registration would decode permuted bytes as
+                            // native. add_layer() refuses a Band8 matrix on a CPU without
+                            // the band kernels or at an unverified rate - before any byte
+                            // is decoded.
+                            M.layout = L.layout == strata::Exl3TrellisLayout::Band8
+                                           ? strata::kernels::cpu::Exl3CpuTrellisLayout::Band8
+                                           : strata::kernels::cpu::Exl3CpuTrellisLayout::Native;
                         };
                         fill(cpu_model.linear(base + ".gate_proj"), gs[(size_t) e]);
                         fill(cpu_model.linear(base + ".up_proj"), us[(size_t) e]);
@@ -6660,7 +6932,7 @@ int main(int argc, char** argv) {
                          "split (untested modes are refused, not broadened)\n");
             return 2;
         }
-        strata::Exl3Model pmodel(o.exl3_dir);
+        strata::Exl3Model pmodel(o.exl3_dir,exl3_resident);
         // the primary's own device (whatever --gpu selected) must differ from the peer's
         int primary_dev = 0;
         (void) cudaGetDevice(&primary_dev);

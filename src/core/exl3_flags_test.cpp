@@ -97,6 +97,22 @@ int main() {
     unset("STRATA_QFUSE"); unset("STRATA_MMVQ_BUNCH"); unset("STRATA_PF_GEMM");
     unset("STRATA_EXL3_QFUSE"); unset("STRATA_EXL3_MMVQ_BUNCH"); unset("STRATA_EXL3_PF_GEMM");
 
+    unset("STRATA_EXL3_RDNA"); unset("STRATA_EXL3_FUSE");
+    CHECK(apply_exl3_fast_defaults(false).empty());
+    CHECK(std::getenv("STRATA_EXL3_RDNA") == nullptr);
+    put("STRATA_EXL3_WMMA", "0");
+    put("STRATA_EXL3_PRIMARY_MULTIROW", "0");
+    const auto fast = apply_exl3_fast_defaults(true);
+    CHECK(!fast.empty());
+    CHECK(std::string(std::getenv("STRATA_EXL3_RDNA")) == "1");
+    CHECK(std::string(std::getenv("STRATA_EXL3_FUSE")) == "3");
+    CHECK(std::string(std::getenv("STRATA_EXL3_WMMA")) == "0");
+    CHECK(std::string(std::getenv("STRATA_EXL3_PRIMARY_MULTIROW")) == "0");
+    CHECK(std::string(std::getenv("STRATA_EXL3_RESIDENT_DIRECT_DMA")) == "1");
+    CHECK(apply_exl3_fast_defaults(true).empty());
+    CHECK(std::getenv("STRATA_QWEN_BAND8") == nullptr);
+    CHECK(std::getenv("STRATA_EXL3_RESIDENT") == nullptr);
+    CHECK(std::getenv("STRATA_EXL3_CPU_TIER") == nullptr);
     std::printf(fails ? "exl3_flags_test: %d FAILED\n" : "exl3_flags_test: OK\n", fails);
     return fails ? 1 : 0;
 }

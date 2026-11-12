@@ -10,6 +10,8 @@ bench/micro/*.dll
 bench/micro/*.txt
 *.log
 build*/
+# Also match the external-build symlink used by developer worktrees.
+/build-hip-exl3
 pack/
 logs/
 __pycache__/
@@ -37,6 +39,7 @@ td.log
 # ... except this fork's own launchers, which are source (setup.py's own run-* scripts stay ignored)
 !/run-peer.sh
 !/run-peer-4bpw.sh
+!/run-mimo-mopd.sh
 /strata-*.json
 /strata-*.log
 /build-strata.bat

@@ -57,7 +57,11 @@ class LoaderTests(unittest.TestCase):
                     t["data_offsets"][1] = count
                 result = self.run_model(edit, pad=True)
                 self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertIn("integer K=1..8", result.stderr)
+                # Half-integer K is a supported bitrate now (mul1 only): a shape like [8, 8, 24]
+                # is RECOGNIZED as K = 1.5 and rejected for its missing mul1 marker instead of the
+                # geometry rule; the malformed shapes keep failing the geometry rule.
+                self.assertTrue("K=1..8 in 0.5 steps" in result.stderr or
+                                "requires the mul1 codebook" in result.stderr, result.stderr)
 
     def test_bad_scales(self):
         for key, value in (("dtype", "I16"), ("shape", [64, 2])):

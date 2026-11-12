@@ -38,6 +38,17 @@ bool native_mmvq_multi_exact();
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
                           void* stream);
 
+// P2's companion: the SAME quantize kernel and bytes for one 16- or 32-column image.  Every
+// pre-existing entry keeps validate_shape's 1..8 cap untouched, so the wide tiles quantize
+// through this separate entry instead (exactly 16 or 32; n_in's rules as ever; n_in * ncols
+// must fit int, the kernel's index type).  Columns contiguous as always - a wide image's
+// column j is bit-identical to a <= 8-column call's column j (mmvq_multi_parity checks the bytes).
+void native_quantize_q8_1_wide(const float* x, void* x_q8_1, int n_in, int ncols,
+                               void* stream);
+// native_q8_1_bytes for the wide image (the same 36 bytes per 32 elements per column; the original
+// helper's 1..8 column check stays as it is).
+std::size_t native_q8_1_wide_bytes(int n_in, int ncols);
+
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream);
 
@@ -139,6 +150,63 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
 bool native_mmvq_bunch(int ggml_type, const void* w1, const void* w2, const void* w3, const void* x_q8_1,
                        float* y1, float* y2, float* y3, int n_in, int n_out1, int n_out2, int n_out3,
                        int ncols, void* stream);
+
+/// Caller-side gate for bunch users that must stay BITWISE the sequential native_mmvq calls (the
+/// native_q8_0_f32 baseline).  True exactly where native_mmvq_bunch may launch AND the sequential path on
+/// this build runs the same multi kernels: false on a STRATA_HIP_GFX906 build with the wave kernels active
+/// (STRATA_MMVQ_WAVE != "0"), where the baseline runs native_mmvq_wave_kernel's 64-lane butterfly while the
+/// bunch runs native_mmvq_multi_kernel's LDS/XOR-tree reduction - different partial-sum grouping.  Also
+/// mirrors the bunch's own shape rules (Q8_0, the exact multi layout, 2-8 columns, n_in % 32 == 0 and
+/// n_in / 32 >= BPI); a Q8_0-packed-registered weight is left to the bunch call itself (it declines).
+/// native_mmvq_bunch is NOT modified - its existing callers keep their behaviour on every build.
+bool native_mmvq_bunch_supported(int ggml_type, int n_in, int ncols);
+
+// ---- P2 wide-column MMVQ (opt-in, default off in every caller; validate_shape's 1..8 cap is unchanged) ----
+//
+// The exact-layout multi kernel at NCOLS = 16 or 32: the same q8_1 bytes, the same DP4A integer dots, the
+// same per-block F32 products and the same per-element accumulation/reduction order as the ncols <= 8
+// launches - one weight traversal serving 16/32 activation columns (columns j at x_q8_1 + j * n_in / 32,
+// outputs at y + j * n_out, as ever).  These entries accept ONLY 16 or 32, keep the baseline's geometry
+// (4 warps, two rows per block, odd n_out tails guarded per row) and enqueue NOTHING when they return
+// false - eligibility is decided first, so a declined call leaves the caller's scratch and outputs
+// untouched.  Declines: STRATA_TSUM=1 (the transposed butterfly pads to pow2(NCOLS * ROWS) - not bitwise
+// across widths), the upstream multi layout (native_mmvq_set_multi_exact(false)), a STRATA_HIP_GFX906
+// build with the wave kernels active, a Q8_0-packed-registered weight (STRATA_Q8_PACKED), a NULL or
+// misaligned pointer (the library's 4-byte device-pointer contract; checked before the registry lookup),
+// a NULL stream (the library's explicit non-null stream contract - the default stream is not accepted),
+// n_out <= 0, and a two-rows-per-block grid that does not fit dim3.x / int when summed in 64 bits
+// (n_out3 < 0 is rejected: 0 or positive only).  Bitwise equality with the <= 8-column launches is the
+// DESIGN (the per-element order is NCOLS-independent) and a VERIFY-BEFORE-ENABLE property: this TU
+// compiles with fast math, and a compiler may contract differently under register pressure
+// (NCOLS = 32 keeps 64 accumulator registers) - run mmvq_multi_parity's wide section on the target
+// before turning any caller on.  The caller owns one q8_1 image of native_q8_1_bytes(n_in, ncols).
+
+/// One Q8_0 matrix, 16 or 32 PRE-QUANTIZED columns (native_quantize_q8_1's image).
+bool native_q8_0_mmvq_wide(const void* weights, const void* x_q8_1, float* y,
+                           int n_in, int n_out, int ncols, void* stream);
+/// The same launch for a caller that also owns the quantization: eligibility first, then
+/// native_quantize_q8_1 + the wide kernel; a false enqueues NOTHING (scratch untouched).
+bool native_q8_0_f32_wide(const void* weights, const float* x, void* scratch_q8_1,
+                          float* y, int n_in, int n_out, int ncols, void* stream);
+/// The q|k|v bundle at 16 or 32 columns - DIFFERENT n_out widths on one shared q8_1 image, one launch,
+/// bitwise the sequential per-matrix wide calls (n_out3 <= 0 or w3/y3 null: a two-matrix bunch).  Gated as
+/// above; NCOLS = 32's register profile is unmeasured - a parity/test surface until a GPU A/B picks a width.
+bool native_mmvq_bunch_wide(int ggml_type, const void* w1, const void* w2, const void* w3, const void* x_q8_1,
+                            float* y1, float* y2, float* y3, int n_in, int n_out1, int n_out2, int n_out3,
+                            int ncols, void* stream);
+
+/// The wide entries' eligibility as a PURE query (no device, no enqueue): native_q8_0_mmvq_wide's gates
+/// minus the pointer checks - ncols 16/32, n_in's shape rules, the exact multi layout, STRATA_TSUM off,
+/// not a gfx906 wave build (the packed registry stays per-pointer, with the launch calls themselves).
+/// Lets a caller skip the harmless-but-nonzero wide quantize it would otherwise enqueue before a
+/// refused launch (flag-on-unsupported would pay an unused quantize per tile without this).
+bool native_q8_0_wide_supported(int n_in, int ncols);
+
+/// The wide kernels' ACTUAL compiled resources, read from the loaded code object
+/// (cudaFuncGetAttributes): vgprs, shared-memory bytes and max threads per block for NCOLS 16/32
+/// (ncols = 8 queries the <= 8 baseline's exact-layout ROWS = 2 kernel).  A bench/diagnostic surface
+/// for the width choice - no engine path calls it.
+void native_q8_0_wide_resources(int ncols, int* vgprs, int* smem_bytes, int* max_threads);
 
 // Fork F4 (Eddoursul): 2..4 columns also INTERLEAVED, so one 16-byte load reads a position of every column: CP = 2 (2
 // columns) or 4 (3-4), zero-padded; nb = n_in / 32 blocks; int32 bm[nb][8][CP] (block-major), int32 pm[8][nb][CP]

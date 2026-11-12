@@ -2190,6 +2190,31 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
     launch_check();
 }
 
+std::size_t native_q8_1_wide_bytes(int n_in, int ncols) {
+    if (ncols != 16 && ncols != 32)
+        throw std::invalid_argument("native_q8_1_wide_bytes requires ncols 16 or 32");
+    validate_shape(n_in, 1);   // n_in's rules only - the 1..8 cap does not apply to the wide image
+    return std::size_t(ncols) * std::size_t(n_in / Q8K) * sizeof(Q81Block);
+}
+
+void native_quantize_q8_1_wide(const float* x, void* x_q8_1, int n_in, int ncols, void* stream) {
+    if (ncols != 16 && ncols != 32)
+        throw std::invalid_argument("native_quantize_q8_1_wide requires ncols 16 or 32");
+    validate_shape(n_in, 1);   // n_in's rules only - the 1..8 cap does not apply to the wide image
+    validate_pointer(x);
+    validate_pointer(x_q8_1);
+    validate_stream(stream);
+    const long long n_total = (long long) n_in * ncols;   // the kernel's bound is an int
+    if (n_total > 0x7fffffffll) throw std::invalid_argument("native_quantize_q8_1_wide: n_in * ncols overflows int");
+    // Columns are contiguous and n_in is a multiple of 32, so the whole image quantizes as one
+    // vector of n_total elements: every 32-element block stays inside one column (native_quantize_q8_1's
+    // argument, at 16/32 columns).
+    const unsigned blocks = unsigned((n_total + QUANT_THREADS - 1) / QUANT_THREADS);
+    launch_pdl(native_quantize_q8_1_kernel, dim3(blocks), dim3(QUANT_THREADS), 0,
+               static_cast<cudaStream_t>(stream), x, static_cast<Q81Block*>(x_q8_1), int(n_total));
+    launch_check();
+}
+
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream) {
     validate_shape(n_in, ncols);
@@ -2561,6 +2586,180 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
         case 7: q8_0_pair_launch<7>(a, b, x, y1, y2, n_in, n_out, s); break;
         default: q8_0_pair_launch<8>(a, b, x, y1, y2, n_in, n_out, s); break;
     }
+    launch_check();
+    return true;
+}
+
+// ---- P1/P2 dense-prefill design (2026-11-05): a caller-side bunch gate and the wide-column entries.
+// Everything a caller needs to stay BITWISE the <= 8-column sequential baseline; nothing above changes -
+// native_mmvq_bunch itself and its existing callers (STRATA_MMVQ_BUNCH on the Qwen paths) behave exactly as
+// before on every build.
+
+// True when the sequential ncols <= 8 baseline on this build takes native_mmvq_wave_kernel instead of the
+// multi kernels: gfx906 wave builds with STRATA_MMVQ_WAVE != "0" (g_wave_off false).  The wave kernel's
+// 64-lane butterfly groups the partial sums differently than the multi kernel's LDS + XOR tree, so a fused
+// launch of the multi kernel (bunch, wide) is not bitwise that baseline there.  Other builds compile no
+// wave path at all.
+static bool mmvq_wave_dispatch_active() {
+#if defined(STRATA_HIP_GFX906)
+    return !g_wave_off;
+#else
+    return false;
+#endif
+}
+
+// The wide entries' shared gate: decided BEFORE anything is enqueued, so a declined call leaves the
+// caller's scratch and outputs untouched.  ncols stays 1..8 for every pre-existing entry
+// (validate_shape is untouched); these entries take exactly 16 or 32.
+static bool q8_0_wide_env_ok(int n_in, int ncols, void* stream) {
+    using F = SmallTraits<Q80Block, 8>;
+    if (ncols != 16 && ncols != 32) return false;
+    if (n_in <= 0 || n_in % 32 != 0 || n_in / F::DIV < F::BPI) return false;   // BPI = 32 (as the bunch)
+    if (!g_multi_exact) return false;   // the <= 8 baseline would run the upstream layout
+    if (s26_tsum_on()) return false;    // the butterfly pads to pow2(NCOLS * ROWS): not bitwise across widths
+    if (mmvq_wave_dispatch_active()) return false;
+    return stream != nullptr;
+}
+
+static bool q8_0_wide_registered(const void* p) {
+    return p != nullptr && q8_packed_registry().count(p) != 0;   // STRATA_Q8_PACKED=1 tensors
+}
+
+// The pointer contract every pre-existing entry enforces (validate_pointer): device pointers, at least
+// 4-byte aligned, no overlap.  The bool entries RETURN FALSE instead of throwing; the check runs before
+// the packed-registry lookup and before anything is enqueued, so an odd pointer never reaches CUDA.
+static bool wide_ptr_ok(const void* p) {
+    return p != nullptr && reinterpret_cast<std::uintptr_t>(p) % 4 == 0;
+}
+
+// dim3.x's limit - and `int`: the summed two-rows-per-block grid must fit it.  Computed in 64 bits:
+// n_out near INT_MAX overflows the naive (n_out + 1) / 2 int arithmetic (personal audit, 2026-11-05).
+static bool wide_grid_ok(std::int64_t blocks) { return blocks > 0 && blocks <= 0x7fffffffll; }
+
+bool native_mmvq_bunch_supported(int ggml_type, int n_in, int ncols) {
+    using F = SmallTraits<Q80Block, 8>;
+    return ggml_type == 8 && g_multi_exact && ncols >= 2 && ncols <= 8 && n_in > 0 && n_in % 32 == 0 &&
+           n_in / F::DIV >= F::BPI && !mmvq_wave_dispatch_active();
+    // a Q8-packed-registered weight stays the bunch call's own decline (as today)
+}
+
+// The wide entries' pure eligibility query: the launch gates minus pointers/registry, so a caller can
+// skip the wide quantize it would otherwise enqueue before a refused launch.  The dummy non-null
+// stream satisfies env_ok's explicit-stream marker without touching any device.
+bool native_q8_0_wide_supported(int n_in, int ncols) {
+    return q8_0_wide_env_ok(n_in, ncols, reinterpret_cast<void*>(1));
+}
+
+// The ACTUAL compiled resources of the wide kernels (from the loaded code object, not a prediction) -
+// the width-choice diagnostic.  ncols = 8 reads the <= 8 baseline's exact-layout ROWS = 2 kernel.
+void native_q8_0_wide_resources(int ncols, int* vgprs, int* smem_bytes, int* max_threads) {
+    const void* k = nullptr;
+    if (ncols == 8)
+        k = (const void*) &native_mmvq_multi_kernel<SmallTraits<Q80Block, 8>, 8, WARPS, 2, false, false>;
+    else if (ncols == 16)
+        k = (const void*) &native_mmvq_multi_kernel<SmallTraits<Q80Block, 8>, 16, WARPS, 2, false, false>;
+    else if (ncols == 32)
+        k = (const void*) &native_mmvq_multi_kernel<SmallTraits<Q80Block, 8>, 32, WARPS, 2, false, false>;
+    else
+        throw std::invalid_argument("native_q8_0_wide_resources requires ncols 8, 16 or 32");
+#if defined(__HIPCC__)
+    hipFuncAttributes a {};
+    if (hipFuncGetAttributes(&a, k) != hipSuccess)
+        throw std::runtime_error("native_q8_0_wide_resources: func attributes failed");
+#else
+    cudaFuncAttributes a {};
+    if (cudaFuncGetAttributes(&a, k) != cudaSuccess)
+        throw std::runtime_error("native_q8_0_wide_resources: func attributes failed");
+#endif
+    if (vgprs) *vgprs = a.numRegs;
+    if (smem_bytes) *smem_bytes = a.sharedSizeBytes;
+    if (max_threads) *max_threads = a.maxThreadsPerBlock;
+}
+
+// The wide single-matrix launch: the baseline exact-layout geometry - NW = WARPS = 4, two rows per block
+// (row bounds guarded per row, so any n_out runs as launch_multi_n's ROWS = 2 path does), the multi kernel
+// instantiated at NCOLS = 16 / 32.  One row vs two agree bitwise (each row its own partials); two rows is
+// the baseline's default on everything but gfx12 / sm_86 large-out heuristics, which the wide entries do
+// not chase - bits first, and the rows choice is bit-neutral anyway.
+template<int NCOLS>
+static void q8_0_wide_launch(const Q80Block* w, const Q81Block* x, float* y, int n_in, int n_out,
+                             cudaStream_t s) {
+    const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
+    launch_pdl(native_mmvq_multi_kernel<SmallTraits<Q80Block, 8>, NCOLS, WARPS, 2, false, false>, dim3(blocks),
+               dim3(WARP, WARPS), 0, s, w, x, y, n_in, n_out, (const Q80Block*) nullptr, (float*) nullptr,
+               (const Q80Block*) nullptr, (float*) nullptr, 0, 0, 0, 0);
+}
+
+bool native_q8_0_mmvq_wide(const void* weights, const void* x_q8_1, float* y,
+                           int n_in, int n_out, int ncols, void* stream) {
+    if (n_out <= 0 || !wide_ptr_ok(weights) || !wide_ptr_ok(x_q8_1) || !wide_ptr_ok(y)) return false;
+    if (!q8_0_wide_env_ok(n_in, ncols, stream)) return false;   // null stream included: explicit only
+    if (!wide_grid_ok((std::int64_t(n_out) + 1) / 2)) return false;
+    if (q8_0_wide_registered(weights)) return false;
+    const auto s = static_cast<cudaStream_t>(stream);
+    const auto* w = static_cast<const Q80Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    if (ncols == 16) q8_0_wide_launch<16>(w, x, y, n_in, n_out, s);
+    else q8_0_wide_launch<32>(w, x, y, n_in, n_out, s);
+    launch_check();
+    return true;
+}
+
+bool native_q8_0_f32_wide(const void* weights, const float* x, void* scratch_q8_1,
+                          float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (n_out <= 0 || !wide_ptr_ok(weights) || !wide_ptr_ok(x) || !wide_ptr_ok(scratch_q8_1) ||
+        !wide_ptr_ok(y))
+        return false;
+    if (!q8_0_wide_env_ok(n_in, ncols, stream)) return false;   // null stream included: explicit only
+    if (!wide_grid_ok((std::int64_t(n_out) + 1) / 2)) return false;
+    if (q8_0_wide_registered(weights)) return false;
+    // eligibility decided: the SAME quantize kernel the <= 8 baseline runs (identical q8_1 bytes, via
+    // the wide entry so the 1..8 cap elsewhere stays untouched), then the single wide launch - no
+    // partial enqueue is possible past this point
+    const auto s = static_cast<cudaStream_t>(stream);
+    native_quantize_q8_1_wide(x, scratch_q8_1, n_in, ncols, s);
+    const auto* w = static_cast<const Q80Block*>(weights);
+    const auto* xq = static_cast<const Q81Block*>(scratch_q8_1);
+    if (ncols == 16) q8_0_wide_launch<16>(w, xq, y, n_in, n_out, s);
+    else q8_0_wide_launch<32>(w, xq, y, n_in, n_out, s);
+    launch_check();
+    return true;
+}
+
+bool native_mmvq_bunch_wide(int ggml_type, const void* w1, const void* w2, const void* w3, const void* x_q8_1,
+                            float* y1, float* y2, float* y3, int n_in, int n_out1, int n_out2, int n_out3,
+                            int ncols, void* stream) {
+    if (ggml_type != 8 || n_out1 <= 0 || n_out2 <= 0 || n_out3 < 0) return false;   // n_out3: 0 or positive
+    if (n_out3 > 0 && (!w3 || !y3)) return false;
+    if (!wide_ptr_ok(w1) || !wide_ptr_ok(w2) || !wide_ptr_ok(x_q8_1) || !wide_ptr_ok(y1) || !wide_ptr_ok(y2) ||
+        (n_out3 > 0 && (!wide_ptr_ok(w3) || !wide_ptr_ok(y3))))
+        return false;
+    if (!q8_0_wide_env_ok(n_in, ncols, stream)) return false;   // null stream included: explicit only
+    // two rows per matrix block, summed in 64 bits: three INT_MAX widths must reject, not wrap
+    const std::int64_t r1 = (std::int64_t(n_out1) + 1) / 2, r2 = (std::int64_t(n_out2) + 1) / 2;
+    const std::int64_t r3 = n_out3 > 0 ? (std::int64_t(n_out3) + 1) / 2 : 0;
+    if (!wide_grid_ok(r1) || !wide_grid_ok(r2) || (n_out3 > 0 && !wide_grid_ok(r3))) return false;
+    if (!wide_grid_ok(r1 + r2 + r3)) return false;
+    if (q8_0_wide_registered(w1) || q8_0_wide_registered(w2) ||
+        (n_out3 > 0 && q8_0_wide_registered(w3)))
+        return false;
+    const auto s = static_cast<cudaStream_t>(stream);
+    const auto* a = static_cast<const Q80Block*>(w1);
+    const auto* b = static_cast<const Q80Block*>(w2);
+    const auto* c = n_out3 > 0 ? static_cast<const Q80Block*>(w3) : nullptr;
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    float* const y3p = n_out3 > 0 ? y3 : nullptr;
+    // the remap is q8_0_bunch_launch's with the wide entries' fixed ROWS = 2
+    constexpr int ROWS = 2;
+    const dim3 grid(unsigned(r1 + r2 + r3));
+    if (ncols == 16)
+        launch_pdl(native_mmvq_multi_kernel<SmallTraits<Q80Block, 8>, 16, WARPS, ROWS, false, false, true>, grid,
+                   dim3(WARP, WARPS), 0, s, a, x, y1, n_in, n_out1, b, y2, c, y3p, n_out2, n_out3, int(r1),
+                   int(r2));
+    else
+        launch_pdl(native_mmvq_multi_kernel<SmallTraits<Q80Block, 8>, 32, WARPS, ROWS, false, false, true>, grid,
+                   dim3(WARP, WARPS), 0, s, a, x, y1, n_in, n_out1, b, y2, c, y3p, n_out2, n_out3, int(r1),
+                   int(r2));
     launch_check();
     return true;
 }

@@ -51,10 +51,10 @@ bool layout(const Exl3Peer::Entry& e, int n, int hidden, std::array<size_t, 9>& 
         const auto& m = mats[p];
         if (!m.trellis || !m.suh || !m.svh || m.ki <= 0 || m.nj <= 0 ||
             m.ki > INT32_MAX/16 || m.nj > INT32_MAX/16 || m.ki % 8 || m.nj % 8 ||
-            m.bits < 1 || m.bits > 8 || m.cb < 0 || m.cb > 2) return false;
+            m.bits < 1 || m.bits > 8 || (m.bits == 8 && m.frac != 0) || m.cb < 0 || m.cb > 2) return false;
         size_t tiles = 0;
         if (!mul_ok((size_t) m.ki, (size_t) m.nj, &tiles) ||
-            !mul_ok(tiles, (size_t) m.bits * 32, &bytes[p*3])) return false;
+            !mul_ok(tiles, (size_t) (2 * m.words()), &bytes[p*3])) return false;
         bytes[p*3+1] = (size_t) m.ki * 32;
         bytes[p*3+2] = (size_t) m.nj * 32;
         for (int q = 0; q < 3; ++q) if (bytes[p*3+q] > ((size_t) 1 << 32)) return false;
@@ -95,13 +95,38 @@ struct Exl3Peer::Impl {
     bool profile_finish = false;
     bool vector_convert = false;
     int multirow = 0;
+    // STRATA_EXL3_PEER_MULTIROW_FRAC=1 (default off): admit half-integer-K (frac) experts into
+    // the grouped arm.  The grouped RDNA twin decodes the TESTED frac configurations (K2/K2.5
+    // mul1, K <= 4.5 ceiling host-validated in moe_rows_grouped_impl exactly like the indexed
+    // entry; on the parity fixtures its fused output is byte-identical to the indexed entry at
+    // the same call shape - exl3_moe_multi_parity's fused mixed-frac battery).  Measured
+    // end-to-end results were MIXED (no reliable win; stream divergence at fp16-ulp row
+    // differences), the admission was removed 2026-11-03 per the failed-experiment rule, and was
+    // RESTORED the same day at the user's explicit request as a launcher trial
+    // (run-mimo.sh exports it; engine default stays OFF; Qwen untouched).  Evidence and the
+    // exact matched numbers: notes/MIMO-PEER-FRAC-GROUPED-2026-11-03.md.
+    bool multirow_frac = false;
     bool pack_plan = false;
     uint8_t *h_plan = nullptr, *d_plan = nullptr;
     size_t plan_capacity = 0;
     int64_t packed_calls = 0, packed_bytes = 0;
     int64_t grouped_calls = 0, grouped_rows = 0, grouped_groups = 0;
+    // STRATA_EXL3_PEER_NATIVE_WIDTH4 (default off): width-4 groups are permitted past the
+    // established float-slice LDS rule ONLY while the native grouped core is armed.  This
+    // field is the OPEN-TIME guard only (new gate + native envs present + the native fp16
+    // budget fits); every launch re-validates the ACTUAL route descriptors through the
+    // host-only exl3_native_grouped_plan and degrades 4 -> 2 -> indexed per call, never
+    // sticky.  The counters below count launches that kept width 4 and their routed rows.
+    bool native_width4 = false;
+    int64_t native_width4_calls = 0, native_width4_rows = 0;
     int64_t finishes = 0;
     double wait_ms = 0, scatter_ms = 0;
+    // The subset's ONE physical trellis layout (derived and validated at open: every entry,
+    // every projection must declare the same tag; mixed Native/packed opens are refused before
+    // any allocation).  All device-only descriptor work on `ws` reads it, and every refill
+    // candidate must match it - an incoming entry of the other format is rejected BEFORE any
+    // slot is withdrawn.  Native (the default) is byte-identical to the pre-layout behavior.
+    Exl3TrellisLayout trellis_layout = Exl3TrellisLayout::Native;
 
     // per-instance test seam (no globals: independent instances cannot race):
     // STRATA_EXL3_PEER_FAULT=N fails the Nth injectable operation of the next open()/launch().
@@ -131,6 +156,7 @@ struct Exl3Peer::Impl {
         std::array<size_t, 9> capacity{};
     };
     std::vector<DevEntry> dev;
+    uint8_t* plane_arena = nullptr;    // opt-in: dev[].plane pointers borrow this allocation
     std::map<std::pair<int64_t, int32_t>, size_t> where;
 
     float* d_x32 = nullptr;
@@ -169,6 +195,18 @@ struct Exl3Peer::Impl {
     bool pf_batch = false;             // STRATA_EXL3_PEER_BATCH=1: consecutive uniform groups per
                                        // launch through exl3_moe_expert_batch (the C1 launch
                                        // compaction on the peer's prefill chain)
+    bool pf_recon = false;             // STRATA_EXL3_PEER_RECON_BATCH=1: the same compaction for
+                                       // the experts the WMMA batch rejects (frac/low-K - MiMo),
+                                       // through exl3_moe_recon_batch (C2's batched reconstruct)
+    int pf_recon_max = 8;
+    int64_t pf_recon_batches = 0;
+    size_t pf_rgrp_off = 0;            // the slab's compacted batch-descriptor region
+    std::vector<int> pf_recon_m;       // per layer, flattened: the batches' member groups in order
+    std::vector<int> pf_recon_mbegin;  // per group: its batch's member-list start, or -1 (not a start)
+    std::vector<int> pf_recon_mend;    // per group (starts only): one past the batch's members
+    std::vector<int> pf_recon_base;    // per group (starts only): the batch's rire/rdest row base
+    std::vector<int> pf_recon_desc;    // per group (starts only): the batch's rgrp descriptor offset
+    std::vector<int> pf_recon_rows;    // per group (starts only): the batch's total rows
     int pf_k = 0;
     int64_t pf_n_expert = 0;
     int64_t pf_tokens_cap = 0, pf_rows_cap = 0;
@@ -180,6 +218,8 @@ struct Exl3Peer::Impl {
     int32_t* pf_d_ires = nullptr;       // per peer route: its token's row in x16
     int32_t* pf_d_pair = nullptr;       // per peer route: its position in the ids array (t*k + kk)
     int32_t* pf_d_dest = nullptr;       // per route: its row in the rows slab (a static iota)
+    int32_t* pf_d_rire = nullptr;       // STRATA_EXL3_PEER_RECON_BATCH: a batch's compacted token rows
+    int32_t* pf_d_rdest = nullptr;      // ... and its compacted destination rows (absolute slab rows)
     Exl3Group* pf_d_grp = nullptr;      // per group descriptors (batched path; first = within-batch)
     float* pf_host_sum = nullptr;       // mapped+portable: the sums D2H target the caller reads
     cudaEvent_t pf_done = nullptr;
@@ -187,7 +227,7 @@ struct Exl3Peer::Impl {
     uint8_t* pf_h_slab = nullptr;
     uint8_t* pf_d_slab = nullptr;
     size_t pf_slab_bytes = 0;
-    size_t pf_off[5] = {};              // the slab layout: ires, pair, wk, dest, groups
+    size_t pf_off[7] = {};              // slab layout: ires, pair, wk, dest, rire, rdest, groups
     int pf_groups = 0;
     std::vector<int> pf_first;          // per group: its absolute row in the rows slab (host-side)
     std::vector<int> pf_rowsn;          // per group: its row count (host-side)
@@ -207,7 +247,8 @@ struct Exl3Peer::Impl {
 
     void free_all() {
         for (DevEntry& e : dev)
-            for (uint8_t*& p : e.plane) { if (p) { (void) cudaFree(p); p = nullptr; } }
+            for (uint8_t*& p : e.plane) { if (p && !plane_arena) (void) cudaFree(p); p = nullptr; }
+        if (plane_arena) { (void) cudaFree(plane_arena); plane_arena = nullptr; }
         dev.clear();
         where.clear();
         row_of.clear();
@@ -218,6 +259,7 @@ struct Exl3Peer::Impl {
                          (void**) &h_group_first, (void**) &h_group_rows, (void**) &h_plan})
             if (*p) { (void) cudaFreeHost(*p); *p = nullptr; }
         ws.reset();
+        trellis_layout = Exl3TrellisLayout::Native;
         pack_plan = false; plan_capacity = 0;
         if (h_refill) { (void) cudaFreeHost(h_refill); h_refill = nullptr; }
         if (refill_done) { (void) cudaEventDestroy(refill_done); refill_done = nullptr; }
@@ -229,6 +271,7 @@ struct Exl3Peer::Impl {
     // A failed device switch at close: release nothing device-side (freeing across contexts is
     // not safe) - the process exit reclaims; tracking is dropped so nothing is double-freed.
     void drop_without_free() {
+        plane_arena = nullptr;
         dev.clear();
         where.clear();
         row_of.clear();
@@ -244,7 +287,7 @@ struct Exl3Peer::Impl {
         h_plan = d_plan = nullptr; pack_plan = false; plan_capacity = 0;
         pf_d_x16 = nullptr; pf_d_rows = pf_d_sum = nullptr;
         pf_d_slab = nullptr; pf_h_slab = nullptr; pf_host_sum = nullptr;
-        pf_d_ires = pf_d_pair = nullptr; pf_d_wk = nullptr;
+        pf_d_ires = pf_d_pair = nullptr; pf_d_wk = nullptr; pf_d_rire = pf_d_rdest = nullptr;
         pf_d_dest = nullptr; pf_d_grp = nullptr;
         pf_done = nullptr; pf_on = pf_pending = false; pf_slab_bytes = 0;
         ws.release();
@@ -275,12 +318,26 @@ int64_t Exl3Peer::resident() const {
     return valid() ? (int64_t) (impl_->where.size() - impl_->replacing.size()) : 0;
 }
 
+Exl3TrellisLayout Exl3Peer::slot_layout(int64_t layer, int32_t expert) const {
+    if (!valid()) return Exl3TrellisLayout::Native;
+    const auto it = impl_->where.find({layer, expert});
+    if (it == impl_->where.end() || it->second == SIZE_MAX) return Exl3TrellisLayout::Native;
+    return impl_->dev[it->second].g.layout;
+}
+
 size_t Exl3Peer::bytes() const {
     if (!valid()) return 0;
     size_t total = 0;
     for (const Impl::DevEntry& e : impl_->dev) total += e.bytes;
     return total;
 }
+
+int64_t Exl3Peer::grouped_launches() const { return impl_ ? impl_->grouped_calls : 0; }
+int64_t Exl3Peer::grouped_routes() const { return impl_ ? impl_->grouped_rows : 0; }
+int64_t Exl3Peer::grouped_groups() const { return impl_ ? impl_->grouped_groups : 0; }
+bool Exl3Peer::native_width4() const { return impl_ && impl_->native_width4; }
+int64_t Exl3Peer::native_width4_calls() const { return impl_ ? impl_->native_width4_calls : 0; }
+int64_t Exl3Peer::native_width4_rows() const { return impl_ ? impl_->native_width4_rows : 0; }
 
 bool Exl3Peer::busy() const {
     if (impl_ == nullptr || impl_->device < 0) return false;
@@ -335,6 +392,13 @@ bool Exl3Peer::enable_adaptation(int max_swaps, size_t byte_cap, std::string& er
 
 bool Exl3Peer::can_replace(const Replacement& r) const {
     if (!valid() || r.out == r.in.expert || has(r.in.layer, r.in.expert)) return false;
+    // Refill format guard, BEFORE any slot is withdrawn: the tier's device-only descriptor
+    // tables run in ONE physical layout (the open()-derived mode), so an incoming entry of the
+    // other format - or with disagreeing projections - is simply ineligible.  A same-backing
+    // adapter always proposes the tier's own mode, so this never fires for it.
+    if (r.in.g.layout != impl_->trellis_layout || r.in.u.layout != impl_->trellis_layout ||
+        r.in.d.layout != impl_->trellis_layout)
+        return false;
     const auto it = impl_->where.find({r.in.layer, r.out});
     if (it == impl_->where.end() || it->second == SIZE_MAX) return false;
     std::array<size_t, 9> sizes{};
@@ -350,6 +414,42 @@ size_t Exl3Peer::replacement_bytes(const Replacement& r) const {
     size_t total = 0;
     for (size_t b : sizes) if (!add_ok(total, b, &total)) return 0;
     return total;
+}
+
+bool Exl3Peer::copy_to_host(const Entry& target, std::string& err) {
+    if (!valid() || pending() || refilling() || !impl_->refill) {
+        err = "exl3 peer: copy-back needs an idle configured tier"; return false;
+    }
+    auto& m = *impl_;
+    const auto it = m.where.find({target.layer,target.expert});
+    std::array<size_t,9> sizes{};
+    if (it == m.where.end() || it->second == SIZE_MAX || !layout(target,m.n_embd,m.hidden,sizes)) {
+        err = "exl3 peer: missing/invalid copy-back target"; return false;
+    }
+    const auto& slot = m.dev[it->second];
+    const Exl3Mat dst[] = {target.g,target.u,target.d};
+    const Exl3Mat src[] = {slot.g,slot.u,slot.d};
+    for (int p = 0; p < 3; ++p)
+        if (dst[p].layout != src[p].layout || dst[p].ki != src[p].ki || dst[p].nj != src[p].nj ||
+                dst[p].bits != src[p].bits || dst[p].frac != src[p].frac || dst[p].cb != src[p].cb) {
+            err = "exl3 peer: copy-back geometry/layout mismatch"; return false;
+        }
+    int caller = -1; (void)cudaGetDevice(&caller);
+    if (!switch_to(m.device)) { err = "exl3 peer: copy-back device switch failed"; return false; }
+    struct Restore { int prev; ~Restore() { (void)cudaSetDevice(prev); } } restore{caller};
+    m.fault_arm("STRATA_EXL3_PEER_FAULT_COPYBACK");
+    for (int p = 0; p < 3; ++p) {
+        const void* ptr[] = {dst[p].trellis,dst[p].suh,dst[p].svh};
+        for (int q = 0; q < 3; ++q)
+            if (m.fault_trip(err,"expert copy-back")) {
+                (void)cudaStreamSynchronize(m.refill); return false;
+            } else if (!ck(cudaMemcpyAsync(const_cast<void*>(ptr[q]),slot.plane[p*3+q],sizes[p*3+q],
+                                   cudaMemcpyDeviceToHost,m.refill),"expert copy-back",err)) {
+                (void)cudaStreamSynchronize(m.refill); m.failed = true; return false;
+            }
+    }
+    if (!ck(cudaStreamSynchronize(m.refill),"expert copy-back completion",err)) { m.failed = true; return false; }
+    return true;
 }
 
 bool Exl3Peer::replace(const std::vector<Replacement>& replacements, std::string& err) {
@@ -462,7 +562,7 @@ bool Exl3Peer::apply_refill(bool wait, std::vector<Replacement>& landed, std::st
 }
 
 bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
-                    int max_tokens, int max_k, std::string& err) {
+                    int max_tokens, int max_k, std::string& err, size_t min_free_bytes) {
     close();
     Impl& m = *impl_;
     m.fault_arm("STRATA_EXL3_PEER_FAULT");
@@ -479,8 +579,11 @@ bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
     if (routes_cap > 65535) { err = "exl3 peer: max_tokens x max_k exceeds 65535 (the indexed kernel's limit)"; return false; }
     const int k_max = INT32_MAX / 16;   // dims must fit *16 in int before any such multiply
     int hidden = 0;
+    Exl3TrellisLayout layout_mode = subset[0].g.layout;
     std::vector<std::array<size_t, 9>> plane_bytes;
     size_t plane_total = 0;
+    size_t arena_bytes = 0;
+    const bool arena = strata::core::exl3_flag("STRATA_EXL3_PEER_ARENA", nullptr, false);
     try {
     plane_bytes.resize(subset.size());
     for (size_t i = 0; i < subset.size(); ++i) {
@@ -495,12 +598,34 @@ bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
                 err = "exl3 peer: entry " + std::to_string(i) + ": ki/nj must be multiples of 8";
                 return false;
             }
-            if (mm.bits < 1 || mm.bits > 8 || mm.cb < 0 || mm.cb > 2) {
-                err = "exl3 peer: entry " + std::to_string(i) + ": bits must be 1..8 and cb 0..2";
+            if (mm.bits < 1 || mm.bits > 8 || (mm.bits == 8 && mm.frac != 0) || mm.cb < 0 || mm.cb > 2) {
+                err = "exl3 peer: entry " + std::to_string(i) + ": bits must be 1..8 (0.5 steps) and cb 0..2";
                 return false;
             }
             if (!mm.trellis || !mm.suh || !mm.svh) {
                 err = "exl3 peer: entry " + std::to_string(i) + ": null plane pointer";
+                return false;
+            }
+            // ONE format per tier: the three projections of an entry agree, and every entry
+            // agrees with the first.  A mixed Native/packed subset would read half its bytes
+            // with the wrong tile address - refused here, before any allocation or upload.
+            if (mm.layout != e.g.layout) {
+                err = "exl3 peer: entry " + std::to_string(i) + ": mixed trellis layout tags within one entry";
+                return false;
+            }
+            if (e.g.layout != layout_mode) {
+                err = "exl3 peer: mixed trellis layouts across the subset are not supported";
+                return false;
+            }
+            // A Band8 tier carries packed bytes: only the verified band8 rates (mul1
+            // K2/K2.5/K3/K4) are admitted, and the refusal is here, at open, before the
+            // planes are uploaded - never a launch-time fallback to a native reader.
+            if (mm.layout == Exl3TrellisLayout::Band8 &&
+                (mm.cb != 2 || mm.bits < 2 || mm.bits > 4 ||
+                 (mm.bits == 4 && mm.frac != 0) || (mm.bits == 3 && mm.frac != 0) ||
+                 (mm.bits == 2 && mm.frac > 1))) {
+                err = "exl3 peer: entry " + std::to_string(i) +
+                      ": band8 experts need cb=mul1 at K2/K2.5/K3/K4";
                 return false;
             }
         }
@@ -525,7 +650,7 @@ bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
         for (int p = 0; p < 3; ++p) {
             size_t tiles = 0, tr = 0;
             if (!mul_ok((size_t) mats[p].ki, (size_t) mats[p].nj, &tiles) ||
-                !mul_ok(tiles, (size_t) (256 * mats[p].bits / 16) * 2, &tr)) {
+                !mul_ok(tiles, (size_t) (2 * mats[p].words()), &tr)) {
                 err = "exl3 peer: plane size overflow";
                 return false;
             }
@@ -536,6 +661,10 @@ bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
                 const size_t b = plane_bytes[i][(size_t) p * 3 + q];
                 if (b == 0 || b > kPlaneCap || !add_ok(plane_total, b, &plane_total)) {
                     err = "exl3 peer: plane size cap/overflow";
+                    return false;
+                }
+                if (arena && !add_ok(arena_bytes, (b + 255) & ~(size_t)255, &arena_bytes)) {
+                    err = "exl3 peer: arena size overflow";
                     return false;
                 }
             }
@@ -587,8 +716,23 @@ bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
         ~Restore() { (void) cudaSetDevice(prev); }
     } restore{caller};
     try {
+        auto room = [&](size_t bytes) {
+            if (min_free_bytes == 0) return true;
+            size_t free = 0, total = 0;
+            if (!ck(cudaMemGetInfo(&free, &total), "reserve probe", err)) return false;
+            // Leave an extra allocation-granularity margin. In particular, do not deliberately
+            // exhaust a display device and rely on an OOM/retry to size the resident tier.
+            const size_t margin = (size_t) 2 << 20;
+            if (free < min_free_bytes || free - min_free_bytes < margin ||
+                bytes > free - min_free_bytes - margin) {
+                err = "exl3 peer: device reserve would be crossed";
+                return false;
+            }
+            return true;
+        };
         auto alloc = [&](void** p, size_t bytes, bool host, const char* what) {
             if (m.fault_trip(err, what)) return false;
+            if (!host && !room(bytes)) return false;
             return ck(host ? cudaHostAlloc(p, bytes, cudaHostAllocPortable) : cudaMalloc(p, bytes), what, err);
         };
         if (m.fault_trip(err, "stream create") ||
@@ -607,8 +751,14 @@ bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
             return false;
         }
         m.row_of.assign((size_t) routes_cap, 0);   // inside the try; released by close()
+        m.trellis_layout = layout_mode;
         m.ws = std::make_unique<Exl3MoeWorkspace>();   // binds to the peer device (we are on it)
         m.ws->reserve((int) routes_cap, n_embd, hidden, n_embd, true);
+        // The routed AND prefill paths share this one workspace; both build device-only
+        // descriptor tables (grouped/indexed plans, the prefill group slab).  It is BRAND NEW
+        // here - the drained init window the layout mode contract requires; the entries this
+        // tier uploads were all validated against `layout_mode` before the first allocation.
+        m.ws->set_trellis_layout(layout_mode);
         const auto enabled = [](const char* name) {
             const char* v = std::getenv(name);
             return v && v[0] && v[0] != '0';
@@ -618,12 +768,41 @@ bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
         const char* mr = std::getenv("STRATA_EXL3_PEER_MULTIROW");
         m.multirow = mr ? std::max(0, std::min(4, std::atoi(mr))) : 0;
         if (m.multirow == 1) m.multirow = 2;
+        // STRATA_EXL3_PEER_NATIVE_WIDTH4 (default off): keep a REQUESTED width 4 past the
+        // float-slice LDS rule ONLY when the native grouped core is armed at open
+        // (fused-multirow support + STRATA_EXL3_RDNA_NATIVE=1 + STRATA_EXL3_NATIVE_GROUPED=1)
+        // and its fp16-slice budget fits - the native kernel prices width x widest x 2 bytes,
+        // so a 4096-wide geometry (64 KiB as float slices) fits as 32 KiB.  Without the arm
+        // the startup behavior below is EXACTLY the old global downgrade (multirow = 0,
+        // indexed FFNs).  The two native envs are re-read at EVERY launch, so a later flip
+        // degrades that call's groups to width 2 (then indexed) instead of failing or
+        // sticking; the float twin's own gate is untouched.
+        m.native_width4 = false;
+        if (m.multirow == 4 && exl3_fused_multirow_supported()) {
+            const char* w4 = std::getenv("STRATA_EXL3_PEER_NATIVE_WIDTH4");
+            const char* ng = std::getenv("STRATA_EXL3_NATIVE_GROUPED");
+            const char* rn = std::getenv("STRATA_EXL3_RDNA_NATIVE");
+            if (w4 && w4[0] != '\0' && w4[0] != '0' && ng && ng[0] != '\0' && ng[0] != '0' &&
+                rn && rn[0] == '1' && (size_t) std::max(n_embd, hidden) * 4 * 2 <= 40 * 1024)
+                m.native_width4 = true;
+        }
         if (m.multirow && (!exl3_fused_multirow_supported() ||
             (size_t) std::max(n_embd, hidden) * (m.multirow <= 2 ? 2 : 4) * sizeof(float) > 40 * 1024)) {
-            std::fprintf(stderr, "exl3 peer multirow: unsupported mode/geometry; using indexed FFNs\n");
-            m.multirow = 0;
+            if (!m.native_width4) {
+                std::fprintf(stderr, "exl3 peer multirow: unsupported mode/geometry; using indexed FFNs\n");
+                m.multirow = 0;
+            } else {
+                std::fprintf(stderr, "exl3 peer multirow: width 4 kept under STRATA_EXL3_PEER_NATIVE_WIDTH4 "
+                                     "(native fp16 slices fit the 40 KiB budget; each launch re-plans "
+                                     "4 -> 2 -> indexed, never sticky)\n");
+            }
         }
         if (m.multirow) {
+            const char* mf = std::getenv("STRATA_EXL3_PEER_MULTIROW_FRAC");
+            m.multirow_frac = mf && mf[0] != '\0' && mf[0] != '0';
+            if (m.multirow_frac)
+                std::fprintf(stderr, "exl3 peer multirow: frac experts admitted (K <= 4.5, mul1); "
+                                     "wider or non-mul1 tiles keep the indexed fallback\n");
             if (!alloc((void**) &m.h_group_first, (size_t) routes_cap * sizeof(int), true, "pinned group first") ||
                 !alloc((void**) &m.h_group_rows, (size_t) routes_cap * sizeof(int), true, "pinned group rows")) {
                 close(); return false;
@@ -642,6 +821,17 @@ bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
                 std::memset(m.h_plan, 0, m.plan_capacity);
             }
         }
+        // NOTE (2026-11-01, measured and removed): an opt-in STRATA_EXL3_PEER_PACK_INDEXED arm
+        // that collapsed the indexed call's x/idx/descriptor H2Ds and output D2D into one packed
+        // upload (the grouped arm's transport) produced byte-identical outputs and removed all
+        // five small copies per decode layer-call, but peer_wait fell only 0.226 -> 0.209 ms and
+        // end-to-end decode stayed within session variance: the peer chain's latency is bound by
+        // GPU1 compute-launch gaps (desktop contention), not by copy dispatches. Evidence:
+        // notes/MIMO-PROFILING-2026-11-01.md "Failed experiment".
+        if (arena && !alloc((void**) &m.plane_arena, arena_bytes, false, "weight arena")) {
+            close(); return false;
+        }
+        size_t arena_at = 0;
         for (size_t i = 0; i < subset.size(); ++i) {
             const Entry& e = subset[i];
             m.where[{e.layer, e.expert}] = m.dev.size();
@@ -657,8 +847,12 @@ bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
                 for (int q = 0; q < 3; ++q) {
                     const size_t b = plane_bytes[i][(size_t) p * 3 + q];
                     d.capacity[(size_t) p * 3 + q] = b;
+                    if (arena) {
+                        d.plane[p * 3 + q] = m.plane_arena + arena_at;
+                        arena_at += (b + 255) & ~(size_t)255;
+                    }
                     if (m.fault_trip(err, "plane alloc/copy") ||
-                        !ck(cudaMalloc(&d.plane[p * 3 + q], b), "plane alloc", err) ||
+                        (!arena && (!room(b) || !ck(cudaMalloc(&d.plane[p * 3 + q], b), "plane alloc", err))) ||
                         m.fault_trip(err, "plane copy") ||
                         !ck(cudaMemcpy(d.plane[p * 3 + q], src[q], b, cudaMemcpyHostToDevice), "plane copy", err)) {
                         close();   // free_all releases every plane published so far, exactly once
@@ -672,10 +866,19 @@ bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
                 devm[p]->ki = host[p].ki;
                 devm[p]->nj = host[p].nj;
                 devm[p]->bits = host[p].bits;
+                devm[p]->frac = host[p].frac;
                 devm[p]->cb = host[p].cb;
+                // The uploaded bytes keep the entry's physical format: without this the slot
+                // carried the default Native tag over PACKED planes, and after the first
+                // adapt refill (which copies the whole descriptor, tag included) one tier
+                // held both tags - the mixed-layout guard then refused every launch (the
+                // 2026-11-06 full-model band-8 peer run; negative-controlled in
+                // mimo_band8_parity 5b).  Native entries set Native, unchanged.
+                devm[p]->layout = host[p].layout;
             }
             d.bytes = total;
         }
+        if (!room(0)) { close(); return false; }
     } catch (const std::exception& e) {
         err = std::string("exl3 peer: open: ") + e.what();
         close();
@@ -696,8 +899,15 @@ void Exl3Peer::close() {
     if (m.multirow && m.grouped_calls)
         std::fprintf(stderr, "exl3 peer multirow: width %d, %lld calls, %lld routes / %lld groups\n",
                      m.multirow, (long long) m.grouped_calls, (long long) m.grouped_rows, (long long) m.grouped_groups);
+    if (m.native_width4 && m.native_width4_calls)
+        std::fprintf(stderr, "exl3 peer native width-4: %lld calls kept width 4 (%lld routes); the rest "
+                             "re-chunked at width 2 or fell back indexed, per call\n",
+                     (long long) m.native_width4_calls, (long long) m.native_width4_rows);
     m.multirow = 0;
+    m.multirow_frac = false;
+    m.native_width4 = false;
     m.grouped_calls = m.grouped_rows = m.grouped_groups = 0;
+    m.native_width4_calls = m.native_width4_rows = 0;
     if (m.profile_finish && m.finishes > 0)
         std::fprintf(stderr, "exl3 peer finish split: %lld calls, wait %.3f ms/call, host fp16->fp32 scatter %.3f ms/call\n",
                      (long long) m.finishes, m.wait_ms / m.finishes, m.scatter_ms / m.finishes);
@@ -720,9 +930,11 @@ void Exl3Peer::close() {
             if (m.pf_layers > 0) {
                 const std::string batches = m.pf_batch
                     ? ", " + std::to_string(m.pf_batches) + " batched launch chains" : std::string();
-                std::fprintf(stderr, "exl3 peer prefill: %lld layers, %lld rows / %lld groups computed on the peer%s\n",
+                const std::string recon = m.pf_recon
+                    ? ", " + std::to_string(m.pf_recon_batches) + " recon-batch chains" : std::string();
+                std::fprintf(stderr, "exl3 peer prefill: %lld layers, %lld rows / %lld groups computed on the peer%s%s\n",
                              (long long) m.pf_layers, (long long) m.pf_rows_total,
-                             (long long) m.pf_groups_total, batches.c_str());
+                             (long long) m.pf_groups_total, batches.c_str(), recon.c_str());
             }
             m.free_all();
             m.pf_free();
@@ -780,7 +992,16 @@ bool Exl3Peer::launch(int64_t layer, const float* x, const int32_t* ids, int tok
     if (grouped) {
         for (int64_t q = 0; q < m_rows; ++q) {
             const auto& e = m.dev[m.where.at({layer, ids[m.row_of[(size_t) q]]})];
-            if (e.g.cb != 2 || e.u.cb != 2 || e.d.cb != 2) { grouped = false; break; }
+            // frac != 0 (half-integer K, the MiMo v2 experts): the grouped RDNA twin decodes the
+            // tested configurations only up to K 4.5 with the mul1 codebook (moe_rows_grouped_impl's
+            // ceiling, the same one the indexed entry enforces).  STRATA_EXL3_PEER_MULTIROW_FRAC
+            // (default off; launcher trial after mixed end-to-end results - Impl note above)
+            // admits exactly that range; anything wider or non-mul1 keeps the frac-safe indexed
+            // fallback.
+            const bool frac_ok = m.multirow_frac &&
+                e.g.bits <= 4 && e.u.bits <= 4 && e.d.bits <= 4;
+            if (e.g.cb != 2 || e.u.cb != 2 || e.d.cb != 2 ||
+                ((e.g.frac != 0 || e.u.frac != 0 || e.d.frac != 0) && !frac_ok)) { grouped = false; break; }
         }
     }
     if (grouped)
@@ -805,9 +1026,67 @@ bool Exl3Peer::launch(int64_t layer, const float* x, const int32_t* ids, int tok
     }
     grouped = grouped && groups < m_rows;
     if (grouped) {
+        // Compact the mats per group (the grouped entry and the plan below read one trio per
+        // group).  ONE pass is safe: group g's first route is >= g (every group holds >= 1
+        // row), so every read h_g[first] at slot first >= g happens before that slot is
+        // written, and writes never clobber a slot a later group still needs.  A SECOND pass
+        // over the same arrays is NOT safe: after this pass slot q holds GROUP q's mats, not
+        // route q's (first_f >= f, and route f generally lies in an earlier group), so a
+        // re-chunk's h_g[first] would read a stale group's descriptor.  The width-2 fallback
+        // below therefore refills from the CANONICAL m.dev/where source, never from these.
         for (int g = 0; g < groups; ++g) {
             const int first = m.h_group_first[g];
             m.h_g[g] = m.h_g[first]; m.h_u[g] = m.h_u[first]; m.h_d[g] = m.h_d[first];
+        }
+        if (m.native_width4) {
+            // EXACT dispatcher mirror, not a conservative superset: the same COMPACTED
+            // per-group arrays, the same group count and widest group, and the same
+            // armed/fused inputs the grouped entry below re-reads in this call - so the
+            // decision is identical and an admit can never be refused downstream.  (A
+            // per-ROUTE check at groups = m_rows would NOT be equivalent:
+            // native_grouped_parts' occupancy floor ceil(288 / ((outputs/128) * groups))
+            // moves with the group count, so the actual window could refuse a shape the
+            // precheck admitted - the width-4 fused arm would then hit the float-LDS
+            // bound at wide geometry and throw.  Running the plan on the real groups
+            // closes that corner by construction.)
+            int widest = 1;
+            for (int g = 0; g < groups; ++g) widest = std::max(widest, m.h_group_rows[g]);
+            const char* ng = std::getenv("STRATA_EXL3_NATIVE_GROUPED");
+            const char* rn = std::getenv("STRATA_EXL3_RDNA_NATIVE");
+            int rates[3] = {0, 0, 0}, parts[3] = {0, 0, 0};
+            if (ng && ng[0] != '\0' && ng[0] != '0' && rn && rn[0] == '1' &&
+                exl3_native_grouped_plan(m.h_g, m.h_u, m.h_d, groups, widest, true, true, rates, parts)) {
+                ++m.native_width4_calls;
+                m.native_width4_rows += m_rows;
+            } else {
+                // Refused (native envs flipped off after open, an unsupported rate among the
+                // CURRENT experts - refills included - or an infeasible shape): rebuild the
+                // group table at width 2 with the SAME per-route scan the builder above used
+                // (it reads only ids/row_of, untouched).  Then refill the per-group mats
+                // DIRECTLY from the canonical m.dev[m.where] source of each new group's first
+                // route - NOT from m.h_g, which now holds the width-4 groups' compacted
+                // descriptors (a stale-group read there would compute the wrong experts, the
+                // AAAABBBBCCCC bug class).  No new buffer: the same pinned slabs.  The float
+                // twin fits at width 2 wherever the native fp16-4 budget fit (both are
+                // max(n_embd, hidden) x 8 bytes), so this fallback is always legal, per call
+                // and never sticky; non-mul1 tiles never reach here (indexed fallback above).
+                int regrouped = 0;
+                for (int64_t q = 0; q < m_rows; ++q) {
+                    const int i = m.row_of[(size_t) q];
+                    if (q == 0 || ids[i] != ids[m.row_of[(size_t) q - 1]] ||
+                        m.h_group_rows[regrouped - 1] == 2) {
+                        m.h_group_first[regrouped] = (int) q;
+                        m.h_group_rows[regrouped++] = 0;
+                    }
+                    ++m.h_group_rows[regrouped - 1];
+                }
+                groups = regrouped;
+                for (int g = 0; g < groups; ++g) {
+                    const int i = m.row_of[(size_t) m.h_group_first[g]];
+                    const size_t at = m.where.at({layer, ids[i]});
+                    m.h_g[g] = m.dev[at].g; m.h_u[g] = m.dev[at].u; m.h_d[g] = m.dev[at].d;
+                }
+            }
         }
         ++m.grouped_calls; m.grouped_rows += m_rows; m.grouped_groups += groups;
     }
@@ -961,7 +1240,10 @@ bool Exl3Peer::enable_prefill(int64_t max_tokens, int k, int64_t n_expert, int64
     if (!valid()) { err = "exl3 peer: prefill needs an open tier"; return false; }
     Impl& m = *impl_;
     if (m.pf_on) return true;
-    if (k != 10) { err = "exl3 peer: prefill transport assumes top-10 routing"; return false; }
+    // k is a runtime width of the transport kernels (the scatter-add takes it per launch; the
+    // route plan builds with it): any top-k in 1..64 works. The historical check pinned the
+    // Qwen family's 10; MiMo v2's peer tier runs with 8.
+    if (k < 1 || k > 64) { err = "exl3 peer: prefill transport needs top-k in 1..64"; return false; }
     if (max_tokens <= 0 || max_tokens > 1 << 20 || n_expert <= 0 || max_rows <= 0 ||
         max_tokens > INT64_MAX / k || max_tokens > INT64_MAX / (int64_t) m.n_embd) {
         err = "exl3 peer: prefill caps out of range"; return false;
@@ -969,18 +1251,31 @@ bool Exl3Peer::enable_prefill(int64_t max_tokens, int k, int64_t n_expert, int64
     if (m.dev.empty()) { err = "exl3 peer: prefill needs resident entries"; return false; }
     const int64_t routes = max_tokens * k;
     const int64_t n = m.n_embd;
-    // One pinned/device slab per layer: [ires | pair | wk | gate | up | down | first | rowsn].
+    // One pinned/device slab per layer: [ires | pair | wk | dest | groups] plus, when the recon
+    // batch is on, two compacted per-batch tables [rire | rdest] (a batch may take non-consecutive
+    // groups, so its rows/destinations cannot be slices of the wave-contiguous arrays).
     // The per-group tables are sized for the degenerate one-expert-per-route case (n_expert
     // groups max); the per-route arrays for the caller's row cap.
+    const char* pr_env = std::getenv("STRATA_EXL3_PEER_RECON_BATCH");
+    m.pf_recon = pr_env && pr_env[0] && pr_env[0] != '0';
+    if (const char* cap = std::getenv("STRATA_EXL3_PEER_RECON_BATCH_MAX"); cap && cap[0])
+        m.pf_recon_max = std::max(2, std::min(16, std::atoi(cap)));
     size_t off = 0;
     const auto take = [&](size_t bytes) { const size_t at = off; off = (off + bytes + 255) & ~(size_t)255; return at; };
     const size_t o_ires = take((size_t) max_rows * sizeof(int32_t));
     const size_t o_pair = take((size_t) max_rows * sizeof(int32_t));
     const size_t o_wk   = take((size_t) routes * sizeof(float));
     const size_t o_dest = take((size_t) max_rows * sizeof(int32_t));
+    // C2's compacted per-batch tables and descriptors exist only when the flag is on, so a
+    // flag-off (Qwen) peer prefill keeps its exact previous slab layout and sizes
+    const size_t o_rire = m.pf_recon ? take((size_t) max_rows * sizeof(int32_t)) : 0;
+    const size_t o_rdest = m.pf_recon ? take((size_t) max_rows * sizeof(int32_t)) : 0;
     const size_t o_grp  = take((size_t) n_expert * sizeof(Exl3Group));
+    const size_t o_rgrp = m.pf_recon ? take((size_t) n_expert * sizeof(Exl3Group)) : 0;
     const size_t slab = off;
-    m.pf_off[0] = o_ires; m.pf_off[1] = o_pair; m.pf_off[2] = o_wk; m.pf_off[3] = o_dest; m.pf_off[4] = o_grp;
+    m.pf_rgrp_off = o_rgrp;
+    m.pf_off[0] = o_ires; m.pf_off[1] = o_pair; m.pf_off[2] = o_wk; m.pf_off[3] = o_dest;
+    m.pf_off[4] = o_rire; m.pf_off[5] = o_rdest; m.pf_off[6] = o_grp;
     // The workspace's group buffers (wmma_x, group_y, the f16 slabs) for a whole-chunk group,
     // grown once here: no allocation under queued work.  `ws` binds to the device current at
     // each call, so this must run under the peer-device guard below.
@@ -994,6 +1289,22 @@ bool Exl3Peer::enable_prefill(int64_t max_tokens, int k, int64_t n_expert, int64
     struct Restore { int prev; ~Restore() { (void) cudaSetDevice(prev); } } restore{caller};
     m.ws->reserve_group_scratch((int) max_tokens, in, ff, in, true);
     if (m.pf_batch) m.ws->reserve_expert_batch(8, (int) std::min<int64_t>(4096, max_rows), in, ff, in);
+    {   // surface and clear any sticky error the setup left (the retry loop's freed attempts, a
+        // refused batch reserve), so the first prefill layer's kernel checks see only their own
+        // launches - the engine already does this at setup_peer; embeded callers get it here
+        const cudaError_t de = cudaGetLastError();
+        if (de != cudaSuccess)
+            std::fprintf(stderr, "exl3 peer prefill: setup left a cuda error state: %s (cleared)\n",
+                         cudaGetErrorString(de));
+    }
+    if (m.pf_recon) {   // C2's slab (2 x cap F16 matrices + padded activations): a growth failure
+        try {           // is a soft refusal - the peer's prefill keeps the standalone group chain
+            m.ws->reserve_recon_batch(m.pf_recon_max, (int) std::min<int64_t>(4096, max_rows), in, ff, in);
+        } catch (const std::exception&) {
+            std::fprintf(stderr, "exl3 peer prefill recon batch: slab did not fit; standalone groups\n");
+            m.pf_recon = false;
+        }
+    }
     size_t free_b = 0, total_b = 0;
     const bool have_free = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
     const size_t need = (size_t) max_tokens * n * 2 +          // x16
@@ -1031,6 +1342,8 @@ bool Exl3Peer::enable_prefill(int64_t max_tokens, int k, int64_t n_expert, int64
     m.pf_d_pair = (int32_t*)  (m.pf_d_slab + o_pair);
     m.pf_d_wk   = (float*)    (m.pf_d_slab + o_wk);
     m.pf_d_dest = (int32_t*)  (m.pf_d_slab + o_dest);
+    m.pf_d_rire = (int32_t*)  (m.pf_d_slab + o_rire);
+    m.pf_d_rdest = (int32_t*) (m.pf_d_slab + o_rdest);
     m.pf_d_grp  = (Exl3Group*) (m.pf_d_slab + o_grp);
     m.pf_k = (int) k;
     m.pf_n_expert = n_expert;
@@ -1066,7 +1379,7 @@ bool Exl3Peer::launch_prefill(int64_t layer, const uint16_t* x16, int64_t tokens
     std::memcpy((float*) (h + m.pf_off[2]), weights, (size_t) routes * sizeof(float));
     auto* out_ires = (int32_t*) (h + m.pf_off[0]);
     auto* out_pair = (int32_t*) (h + m.pf_off[1]);
-    auto* out_grp  = (Exl3Group*) (h + m.pf_off[4]);
+    auto* out_grp  = (Exl3Group*) (h + m.pf_off[6]);
     m.pf_first.clear();
     m.pf_rowsn.clear();
     m.pf_batch_end.clear();
@@ -1102,13 +1415,80 @@ bool Exl3Peer::launch_prefill(int64_t layer, const uint16_t* x16, int64_t tokens
     // `first` becomes the within-batch prefix, as that entry validates).  Anything else -
     // small groups, regime changes, lone tails - stays a standalone group_wmma call.
     m.pf_batch_end.assign((size_t) groups, -1);
-    if (m.pf_batch) {
+    int recon_batches = 0, recon_rows = 0;
+    if (m.pf_recon) {
+        // STRATA_EXL3_PEER_RECON_BATCH: >=16-row groups (the reconstruct+BLAS regime - the
+        // frac/low-K experts the WMMA batch rejects) batch through exl3_moe_recon_batch.  Members
+        // may be NON-CONSECUTIVE (the expert-ID plan interleaves big and small groups freely), so
+        // each batch gets compacted token-row/destination tables [rire | rdest] and a compacted
+        // descriptor run in the slab - the destination values are the members' own slab rows, so
+        // every member's weighted sum still scatters from its consecutive [first, first+rows)
+        // range.  Padding to the batch's widest group stays within a factor of two; cap
+        // pf_recon_max experts and 4096 padded rows.  Lone/small groups stay standalone.
+        auto* rire = (int32_t*) (h + m.pf_off[4]);
+        auto* rdest = (int32_t*) (h + m.pf_off[5]);
+        auto* rgrp = (Exl3Group*) (h + m.pf_rgrp_off);
+        std::vector<uint8_t> taken((size_t) groups, 0);
+        int compact = 0, rgrp_at = 0;
+        m.pf_recon_m.clear();
+        m.pf_recon_mbegin.assign((size_t) groups, -1);
+        m.pf_recon_mend.assign((size_t) groups, 0);
+        m.pf_recon_base.assign((size_t) groups, 0);
+        m.pf_recon_desc.assign((size_t) groups, 0);
+        m.pf_recon_rows.assign((size_t) groups, 0);
+        int i = 0;
+        while (i < groups) {
+            if (taken[(size_t) i] || m.pf_rowsn[(size_t) i] < 16 || m.pf_rowsn[(size_t) i] > 4096) { ++i; continue; }
+            const int base = compact;                    // this batch's rire/rdest base
+            const int desc = rgrp_at;                    // ... and its rgrp descriptor offset
+            int members = 0, rows_total = 0, widest = 0;
+            const int member_begin = (int) m.pf_recon_m.size();
+            for (int q = i; q < groups; ++q) {
+                const int rows = m.pf_rowsn[(size_t) q];
+                if (taken[(size_t) q] || rows < 16 || rows > 4096) continue;
+                if (widest > 0 && (rows < (widest + 1) / 2 || rows > 2 * widest)) continue;  // padding <= 2x
+                if ((members + 1) * std::max(widest, rows) > 4096 || members >= m.pf_recon_max) break;
+                for (int r = 0; r < rows; ++r) {
+                    rire[(size_t) base + rows_total + r] = out_ires[(size_t) m.pf_first[(size_t) q] + r];
+                    rdest[(size_t) base + rows_total + r] = m.pf_first[(size_t) q] + r;
+                }
+                rgrp[rgrp_at + members] =
+                    Exl3Group{out_grp[q].gate, out_grp[q].up, out_grp[q].down, rows_total, rows};
+                m.pf_recon_m.push_back(q);
+                taken[(size_t) q] = 1;
+                rows_total += rows;
+                widest = std::max(widest, rows);
+                ++members;
+            }
+            if (members >= 2) {
+                m.pf_recon_mbegin[(size_t) i] = member_begin;
+                m.pf_recon_mend[(size_t) i] = (int) m.pf_recon_m.size();
+                m.pf_recon_base[(size_t) i] = base;
+                m.pf_recon_desc[(size_t) i] = desc;
+                m.pf_recon_rows[(size_t) i] = rows_total;
+                for (int q = member_begin; q < (int) m.pf_recon_m.size(); ++q)
+                    m.pf_batch_end[(size_t) m.pf_recon_m[(size_t) q]] = -2;   // consumed by a batch
+                ++recon_batches;
+                recon_rows += rows_total;
+                compact += rows_total;
+                rgrp_at += members;
+            } else {   // a lone anchor: not worth a batch, leave it standalone
+                m.pf_recon_m.resize((size_t) member_begin);
+                taken[(size_t) i] = 0;
+            }
+            ++i;
+        }
+    } else if (m.pf_batch) {
         int i = 0;
         while (i < groups) {
             if (m.pf_rowsn[(size_t) i] < 16) { ++i; continue; }
             int j = i, rows = 0;
+            // one K per launch (the WMMA batch's stride/decode are per-(bits, frac)): a K2/K2.5
+            // mix ends the run and the next K starts its own batch on the following pass
             while (j < groups && j - i < 8 && m.pf_rowsn[(size_t) j] >= 16 &&
                    (m.pf_rowsn[(size_t) j] >= 24) == (m.pf_rowsn[(size_t) i] >= 24) &&
+                   out_grp[j].gate.bits == out_grp[i].gate.bits &&
+                   out_grp[j].gate.frac == out_grp[i].gate.frac &&
                    rows + m.pf_rowsn[(size_t) j] <= 4096) {
                 rows += m.pf_rowsn[(size_t) j];
                 ++j;
@@ -1136,7 +1516,22 @@ bool Exl3Peer::launch_prefill(int64_t layer, const uint16_t* x16, int64_t tokens
     struct Restore { int prev; ~Restore() { (void) cudaSetDevice(prev); } } restore{caller};
     bool enq = true;
     try {
-        const size_t used = m.pf_off[4] + (size_t) groups * sizeof(Exl3Group);
+        // the recon batches' descriptor count (their slab region follows grp); the mbegin/mend
+        // tables exist only when the recon arm built them this layer - reading them with the arm
+        // off (the PEER_BATCH-only combination) indexes empty vectors.  The upload covers the
+        // whole slab through its last live region: the rgrp run when the recon arm is on (its
+        // offset already sits past the grp region), the grp region itself otherwise (the
+        // PEER_BATCH-only arm still needs its descriptors on the device).
+        int recon_desc = 0;
+        size_t used;
+        if (m.pf_recon) {
+            for (int g = 0; g < groups; ++g)
+                if (m.pf_recon_mbegin[(size_t) g] >= 0)
+                    recon_desc = m.pf_recon_mend[(size_t) g];
+            used = m.pf_rgrp_off + (size_t) recon_desc * sizeof(Exl3Group);
+        } else {
+            used = m.pf_off[6] + (size_t) groups * sizeof(Exl3Group);
+        }
         enq = ck(cudaMemcpyAsync(m.pf_d_slab, m.pf_h_slab, used, cudaMemcpyHostToDevice, m.stream),
                  "prefill plan H2D", err) &&
               ck(cudaMemcpyAsync(m.pf_d_x16, x16, (size_t) tokens * m.n_embd * sizeof(uint16_t),
@@ -1158,9 +1553,41 @@ bool Exl3Peer::launch_prefill(int64_t layer, const uint16_t* x16, int64_t tokens
         };
         int g = 0;
         while (enq && g < groups) {
+            if (m.pf_recon) {
+                const int mb = m.pf_recon_mbegin[(size_t) g];
+                if (mb >= 0) {
+                    // the batch's compacted descriptors live in the slab's rgrp run (uploaded with
+                    // the plan); its rows scatter to the members' OWN slab ranges, so every
+                    // member's weighted sum stays its consecutive [first, first+rows) launch
+                    const int me = m.pf_recon_mend[(size_t) g];
+                    auto* rgrp = (Exl3Group*) ((unsigned char*) m.pf_h_slab + m.pf_rgrp_off);
+                    if (exl3_moe_recon_batch(rgrp + m.pf_recon_desc[(size_t) g], me - mb, m.pf_d_x16,
+                                             m.pf_d_rire + m.pf_recon_base[(size_t) g],
+                                             m.pf_d_rdest + m.pf_recon_base[(size_t) g],
+                                             m.pf_d_rows, m.stream, *m.ws)) {
+                        for (int q = mb; q < me; ++q) {
+                            const int member = m.pf_recon_m[(size_t) q];
+                            const int first = m.pf_first[(size_t) member];
+                            exl3_pf_scatter_add(m.pf_d_sum, m.pf_d_rows + (size_t) first * m.n_embd,
+                                                m.pf_d_wk, m.pf_d_pair + first,
+                                                m.pf_rowsn[(size_t) member], m.pf_k, m.n_embd, m.stream);
+                        }
+                        ++m.pf_recon_batches;
+                        ++g;
+                        continue;
+                    }
+                    // refused (unexpected): this group falls through to its standalone chain
+                } else if (m.pf_batch_end[(size_t) g] == -2) {
+                    ++g;   // consumed by an earlier batch of this layer
+                    continue;
+                }
+                standalone(g);
+                ++g;
+                continue;
+            }
             const int j = m.pf_batch_end[(size_t) g];
             if (j >= g + 2 &&
-                exl3_moe_expert_batch((const Exl3Group*) ((unsigned char*) m.pf_h_slab + m.pf_off[4]) + g,
+                exl3_moe_expert_batch((const Exl3Group*) ((unsigned char*) m.pf_h_slab + m.pf_off[6]) + g,
                                       j - g, m.pf_d_x16, m.pf_d_ires + m.pf_first[(size_t) g],
                                       m.pf_d_dest + m.pf_first[(size_t) g], m.pf_d_rows, m.stream, *m.ws)) {
                 const int rows = (int) ((j < groups ? (int64_t) m.pf_first[(size_t) j] : total) -

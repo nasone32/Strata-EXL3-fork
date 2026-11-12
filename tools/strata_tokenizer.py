@@ -66,7 +66,8 @@ QWEN35_PATTERN = (
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
-                 pre: str = "qwen35", special_ids: dict[str, int] | None = None):
+                 pre: str = "qwen35", special_ids: dict[str, int] | None = None,
+                 pre_pattern: str | None = None, normalizer: str | None = None):
         self.tokens = tokens
         self.pre = pre
         self.token_types = token_types
@@ -86,7 +87,22 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        # The pre-tokenizer split is the pack's own, not a property of the BPE: a `qwen35` pack splits on
+        # QWEN35_PATTERN, and a family whose tokenizer.json declares another regex ships that regex verbatim in
+        # its tokenizer.json (pre_pattern) instead of being forced through this one.  MiMo v2 (Qwen2-style BPE,
+        # `\p{L}+` without the qwen35 `\p{M}`) is the first: the two patterns disagree on a combining mark, which
+        # changes the ids.  `None` (every pack before) keeps QWEN35_PATTERN, byte for byte.
+        self._re = regex.compile(pre_pattern or QWEN35_PATTERN)
+        # A Unicode normalization the source tokenizer.json declares (HF's `normalizer`, e.g. MiMo v2's NFC) is
+        # applied per run between special-token matches, not to the whole input: the whole-input offsets (the
+        # `plain` spans of #537, the literal marks of #554) stay valid, and no composition can reach across a
+        # special-token match anyway (the literals are ASCII, which NFC never changes).  `None` (every pack
+        # before) normalizes nothing.  With one, decode(encode(s)) is NFC(s), exactly as the HF tokenizer's
+        # own round trip is.
+        import unicodedata
+        self._norm = (lambda s: unicodedata.normalize(normalizer, s)) if normalizer else None
+        if normalizer:
+            unicodedata.is_normalized(normalizer, "")    # an unknown form is a build error, not silence
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -219,6 +235,8 @@ class Tokenizer:
         # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
         # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
         cache = self._piece_ids
+        if self._norm is not None:
+            text = self._norm(text)          # per run between special-token matches, not whole-input (see __init__)
         for piece in self._re.findall(text):
             got = cache.get(piece)
             if got is None:
