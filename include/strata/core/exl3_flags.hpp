@@ -60,7 +60,7 @@ inline std::vector<std::string> apply_exl3_defaults() {
 /// Qwen's tested fast path, selected by the engine, not by a shell recipe.
 /// Only the measured gfx1100 family is selected automatically. Other backends
 /// retain their previous dispatch. No memory, CPU, topology or repack policy here.
-inline std::vector<std::string> apply_exl3_fast_defaults(bool gfx1100) {
+inline std::vector<std::string> apply_exl3_fast_defaults(bool gfx1100, bool native_serial = false) {
     std::vector<std::string> changed;
     if (!gfx1100) return changed;
     const std::pair<const char*, const char*> defaults[] = {
@@ -72,15 +72,26 @@ inline std::vector<std::string> apply_exl3_fast_defaults(bool gfx1100) {
         {"STRATA_EXL3_EXPERT_BATCH", "1"}, {"STRATA_EXL3_PEER_BATCH", "1"},
         {"STRATA_EXL3_RESIDENT_DIRECT_DMA", "1"},
     };
-    for (const auto& [key, value] : defaults) {
-        if (exl3_env(key)) continue; // explicit 0 is a real override
+    const std::pair<const char*, const char*> serial_prefill_defaults[] = {
+        {"STRATA_EXL3_PF_SMALL_WMMA_SILU", "1"},
+        {"STRATA_EXL3_PEER_SMALL_BATCH", "1"},
+        {"STRATA_EXL3_PEER_DOWN_ACCUMULATE", "1"},
+        {"STRATA_EXL3_PREFILL_INDEXED_BATCH", "1"},
+        {"STRATA_GDN_CONVL2", "1"}, {"STRATA_GDN_HEAD", "1"}, {"STRATA_GDN_PP", "2"},
+        {"STRATA_HC_NO_FLOAT_ATTN", "1"}, {"STRATA_PF_QSA_SPLIT_NORM", "1"},
+    };
+    const auto set_default = [&](const char* key, const char* value) {
+        if (exl3_env(key)) return; // explicit 0 is a real override
 #if defined(_WIN32)
         _putenv_s(key, value);
 #else
         setenv(key, value, 1);
 #endif
         changed.emplace_back(key);
-    }
+    };
+    for (const auto& [key, value] : defaults) set_default(key, value);
+    if (native_serial)
+        for (const auto& [key, value] : serial_prefill_defaults) set_default(key, value);
     return changed;
 }
 

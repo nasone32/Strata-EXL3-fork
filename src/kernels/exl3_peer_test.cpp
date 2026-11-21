@@ -1042,6 +1042,18 @@ int main() {
         // band (banded VRAM can miss small leaks); pinned-host/heap release is by code
         // inspection of free_all, NOT directly observed.
         {
+            Exl3Peer limited;
+            bool vram_short = false;
+            check(!limited.open(1, n_embd, subset, max_tokens, max_k, err, SIZE_MAX, &vram_short) &&
+                      vram_short && !limited.valid(),
+                  "peer sizing: an unmet VRAM reserve is retryable and leaves no live tier");
+            check(!limited.open(-1, n_embd, subset, max_tokens, max_k, err, 0, &vram_short) &&
+                      !vram_short,
+                  "peer sizing: an invalid device is not a retryable VRAM failure");
+            check(limited.open(1, n_embd, subset, max_tokens, max_k, err, 0, &vram_short) &&
+                      !vram_short && limited.resident() == (int64_t) subset.size(),
+                  "peer sizing: reopen succeeds after a rejected attempt");
+            limited.close();
             const char* mr = std::getenv("STRATA_EXL3_PEER_MULTIROW");
             const bool extra_pinned = mr && std::atoi(mr) > 0 && strata::kernels::exl3_fused_multirow_supported();
             const char* pack = std::getenv("STRATA_EXL3_PEER_PACK_PLAN");
@@ -1905,6 +1917,50 @@ int main() {
         check(q.open(1,128,{a.entry(0,0)},1,1,err) && q.enable_adaptation(1,1,err) &&
               !q.replace({r},err) && q.has(0,0) && !q.refilling(),
               "adapt synthetic: byte cap rejects oversized batch without withdrawal");
+    }
+
+    // ---- lend_tail_preview (STRATA_EXL3_RESIDENT=peer's borrow): the preview must mirror
+    // lend_experts' selection exactly - same tail order, same quarter cap, same skips - and
+    // mutate nothing.  The engine copies the previewed experts' planes GPU->RAM between the
+    // preview and the lend; a divergence would free planes with no host copy (the post-lend
+    // invariant in generate.cpp catches that loudly; this pins the selection itself).
+    {
+        auto e0 = make_expert(8, 8, 3, 2, 911), e1 = make_expert(8, 8, 3, 2, 913),
+             e2 = make_expert(8, 8, 3, 2, 917), e3 = make_expert(8, 8, 3, 2, 919),
+             e4 = make_expert(8, 8, 3, 2, 923), e5 = make_expert(8, 8, 3, 2, 929),
+             e6 = make_expert(8, 8, 3, 2, 931), e7 = make_expert(8, 8, 3, 2, 937);
+        Exl3Peer p;
+        const char* old_arena = std::getenv("STRATA_EXL3_PEER_ARENA");
+        const std::string saved_arena = old_arena ? old_arena : "";
+        unsetenv("STRATA_EXL3_PEER_ARENA");   // the loan refuses the pooled mode
+        check(p.open(1, 128, {e0.entry(0, 0), e1.entry(0, 1), e2.entry(0, 2), e3.entry(0, 3),
+                              e4.entry(1, 0), e5.entry(1, 1), e6.entry(1, 2), e7.entry(1, 3)},
+                     1, 2, err), "loan preview: open 8 experts over 2 layers");
+        std::vector<std::pair<int32_t, int32_t>> preview;
+        check(p.lend_tail_preview(3, preview) && preview.size() == 2,
+              "loan preview: the quarter cap (8/4 = 2) bounds the request");
+        check(p.lent_experts() == 0 && p.has(1, 3) && p.has(1, 2) && p.resident() == 8,
+              "loan preview: mutates nothing (all 8 still resident)");
+        check(p.lend_experts(3, err), "loan preview: the lend itself succeeds");
+        const auto lent = p.lent_list();
+        check(lent.size() == preview.size() && lent.size() == 2 &&
+              lent[0] == preview[0] && lent[1] == preview[1],
+              "loan preview: the lend freed exactly the previewed experts, same order");
+        check(p.lend_tail_preview(3, preview) && preview.empty(),
+              "loan preview: at the cap nothing further is previewed");
+        // restore, then the cycle again (the engine's per-prompt rhythm)
+        std::vector<Exl3Peer::Entry> sources;
+        for (const auto& key : lent)
+            sources.push_back(key.first == 0
+                ? (key.second == 2 ? e2.entry(0, 2) : e3.entry(0, 3))
+                : (key.second == 3 ? e7.entry(1, 3) : e6.entry(1, 2)));
+        check(p.restore_lent(sources, err) && p.lent_experts() == 0 && p.has(1, 3) && p.has(1, 2),
+              "loan preview: restore returns the loan to resident");
+        check(p.lend_tail_preview(1, preview) && preview.size() == 1 &&
+              p.lend_experts(1, err) && p.lent_list()[0] == preview[0],
+              "loan preview: the cycle repeats after a restore");
+        p.close();
+        if (!saved_arena.empty()) setenv("STRATA_EXL3_PEER_ARENA", saved_arena.c_str(), 1);
     }
 
     std::printf("exl3_peer_test: %s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);

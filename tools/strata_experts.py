@@ -1279,13 +1279,45 @@ def apply_auto_profile(cfg, cfg_env, notes, family, model_dir, probe_env):
         arm(QWEN_AUTO_FLAGS)
         if peer_armed_in_args(cfg["args"]):
             arm(QWEN_AUTO_PEER_FLAGS)
+        # STRATA_EXL3_RESIDENT on the NATIVE path (the packed/artifact composition below
+        # enforces =all on its own): an explicit shell/config value is the user choosing
+        # file-backed (0), the full pinned arena (all) or the peer-complement arena (peer,
+        # 2026-11-20).  Materialize it into the derived env - a launch layer that dropped
+        # the choice would silently downgrade the memory mode.  The engine's own gate
+        # (generate.cpp) stays the single validator of the value and its requirements.
+        resident_sel = explicit_env_value(cfg_env, "STRATA_EXL3_RESIDENT")
+        if resident_sel is not None:
+            cfg_env["STRATA_EXL3_RESIDENT"] = resident_sel[1]
+            notes.append(f"STRATA_EXL3_RESIDENT={resident_sel[1]} ({resident_sel[0]} "
+                         f"wins; the engine's resident gate validates the mode)")
         if resolved("STRATA_EXL3_CPU_TIER") == "0":
             notes.append("CPU assistance skipped: STRATA_EXL3_CPU_TIER=0 is explicit - "
                          "no hybrid/cache/swizzle/worker keys were added")
         elif probe_env["avx512bw"] is True:
             arm(QWEN_AUTO_CPU_FLAGS)
             if peer_armed_in_args(cfg["args"]):
-                if resolved("STRATA_EXL3_CPU_HYBRID_PEER") is None:
+                # STRATA_EXL3_RESIDENT=peer (RAM complement, 2026-11-20): the hybrid's
+                # PEER arm computes peer-RESIDENT rows on the CPU, and under the
+                # complement those experts have no host bytes (the engine refuses the
+                # arm at startup).  Never arm it beside the complement, and treat an
+                # explicit pairing as conflicting intent - the same rule as the packed
+                # guards above.  The plain CPU tier stays available either way.
+                resident_mode = explicit_env_value(cfg_env, "STRATA_EXL3_RESIDENT")
+                hybrid_peer = explicit_env_value(cfg_env, "STRATA_EXL3_CPU_HYBRID_PEER")
+                if resident_mode is not None and resident_mode[1] == "peer":
+                    if hybrid_peer is not None and hybrid_peer[1] not in ("0", ""):
+                        raise Refused(
+                            f"STRATA_EXL3_CPU_HYBRID_PEER={hybrid_peer[1]} ({hybrid_peer[0]}) "
+                            f"cannot run with STRATA_EXL3_RESIDENT=peer "
+                            f"({resident_mode[0]}): the peer-complement arena keeps "
+                            f"peer-owned experts off the host, so the CPU cannot compute "
+                            f"their rows. Unset STRATA_EXL3_CPU_HYBRID_PEER (the plain "
+                            f"CPU tier still works) or use STRATA_EXL3_RESIDENT=all. "
+                            f"Nothing was started.")
+                    notes.append("STRATA_EXL3_CPU_HYBRID_PEER skipped: "
+                                 "STRATA_EXL3_RESIDENT=peer keeps peer-owned experts off "
+                                 "the host (the plain CPU tier is unaffected)")
+                elif resolved("STRATA_EXL3_CPU_HYBRID_PEER") is None:
                     cfg_env["STRATA_EXL3_CPU_HYBRID_PEER"] = "1"
                     notes.append("STRATA_EXL3_CPU_HYBRID_PEER=1 (the peer-complement "
                                  "rows are the supported CPU-assist surface with a peer "

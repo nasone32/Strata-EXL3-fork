@@ -74,8 +74,10 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+namespace strata { class Exl3ExpertBacking; }
 namespace strata::kernels {
 
 // Experimental bounded fp16 transport with device-side completion/scatter. Owns its
@@ -130,8 +132,10 @@ public:
 
     // min_free_bytes optionally preserves a device reserve DURING allocation, not only after
     // a trial open. STRATA_EXL3_PEER_ARENA=1 packs weight planes into one aligned allocation.
+    // vram_short is only set for device-memory exhaustion or a reserve refusal.
     bool open(int device, int n_embd, const std::vector<Entry>& subset,
-              int max_tokens, int max_k, std::string& err, size_t min_free_bytes = 0);
+              int max_tokens, int max_k, std::string& err, size_t min_free_bytes = 0,
+              bool* vram_short = nullptr);
     void close();
 
     /// false while closed OR failed (a failed tier advertises nothing until close()).
@@ -140,6 +144,7 @@ public:
     bool has(int64_t layer, int32_t expert) const;
     int64_t resident() const;
     size_t bytes() const;   ///< uploaded subset bytes (nine planes per entry, geometry-derived)
+    int64_t hidden_width() const;   ///< the subset's uniform expert intermediate width (0 closed)
 
     /// Test-only inspector: the trellis-layout tag a RESIDENT slot's device descriptors carry.
     /// open()'s fill must propagate each entry's tag into the slot: a slot left at the default
@@ -197,7 +202,14 @@ public:
     // the bytes (the desktop reserve stays intact); the prompt path then stays on the primary.
     // `k` is the model's top-k (1..64 - a runtime width of the plan/scatter kernels; the Qwen
     // family runs 10, MiMo v2's peer tier 8) and `n_expert` the model's expert count.
-    bool enable_prefill(int64_t max_tokens, int k, int64_t n_expert, int64_t max_rows, std::string& err);
+    // `defer_device=true` (the peer-loan setup only): prepare everything EXCEPT the four device
+    // buffers - host slab, mapped sums, event, workspace reserves, caps - and leave the device
+    // buffers to the first lend()'s pf_alloc_device, so startup never holds the full resident
+    // set AND the prompt buffers at once.  prefill_enabled() is true immediately;
+    // launch_prefill refuses until the buffers exist (never a null-pointer dereference), and a
+    // lend that cannot allocate them fails the request honestly.
+    bool enable_prefill(int64_t max_tokens, int k, int64_t n_expert, int64_t max_rows, std::string& err,
+                        bool defer_device = false, bool* vram_short = nullptr);
     bool prefill_enabled() const;
     int64_t prefill_rows_cap() const;
     /// `x16` is the caller's MAPPED pinned FP16 image of the layer's mixed activations (T x n_embd),
@@ -213,6 +225,46 @@ public:
     int64_t prefill_last_rows() const;       ///< the pending/last layer's peer rows
     int64_t prefill_layers() const;          ///< counters (STRATA_EXL3_TIME reports them at close)
     int64_t prefill_rows_total() const;
+
+    // ---- STRATA_EXL3_PEER_PREFILL_BORROW (opt-in): the prompt-time loan of resident planes ----
+    //
+    // The GGUF PfPart lifecycle and the primary arena's lend_tail/restore_tail, on this tier:
+    // a prompt LENDS the tail of the resident subset - the experts' device planes are FREED and
+    // their identities saved - so the chunk-sized prefill workspace above fits next to the full
+    // resident set without a permanent --peer-slots cut.  A lent expert is not resident (has()
+    // false): the prompt path re-reads residency per chunk (Prefill::run) and routes those rows
+    // to the primary, whose ownership-scratch path computes them without admission; decode's
+    // live has() does the same.  restore_lent() re-allocates the saved planes and re-uploads the
+    // bytes from the CALLER's host sources (the model mmap, the same planes open() copied)
+    // before any window reads - new plane addresses are safe because every launch rebuilds its
+    // descriptors from the tier's own tables and no graph captures peer planes.  When the card
+    // is too full to restore, the prefill device buffers are released first (the next lend
+    // re-allocates them); if the bytes still do not fit, restore fails HONESTLY (the request
+    // errors like a failed arena-loan restore; the still-lent experts stay non-resident and
+    // decode computes them on the primary - slower, never wrong).
+    //
+    // Constraints kept: the plane-arena mode refuses the loan (one allocation has no tail to
+    // free); a lend/restore needs the tier idle (no pending launch, no in-flight replacement -
+    // the engine's request boundary drains both); no single layer lends more than 32 experts
+    // (the primary computes lent rows through its bounded one-wave scratch); the total loan is
+    // capped at a quarter of the subset.  Nothing here runs unless the engine opts in.
+    bool lend_experts(int count, std::string& err);   ///< lend up to `count` MORE tail experts
+    /// STRATA_EXL3_RESIDENT=peer (Qwen peer-complement RAM): the identities lend_experts(count)
+    /// WOULD free next, in lend order, without mutating anything.  Pure walk of the same state
+    /// lend_experts reads (tail order, the 32-per-layer cap, the quarter-of-subset cap, the
+    /// already-lent skip); the caller runs it and the matching lend_experts back to back on one
+    /// thread, so the two agree.  A caller that needs the planes' bytes somewhere else before
+    /// they are freed (the resident arena's GPU->RAM return) copies them between the two calls.
+    bool lend_tail_preview(int count, std::vector<std::pair<int32_t, int32_t>>& out) const;
+    bool restore_lent(const std::vector<Entry>& sources, std::string& err);
+    int64_t lent_experts() const;          ///< currently lent (0 = no loan out)
+    size_t lent_expert_bytes() const;
+    std::vector<std::pair<int32_t, int32_t>> lent_list() const;   ///< (layer, expert) still lent
+    /// true while the prefill device buffers are allocated (a tight restore releases them;
+    /// prefill_ensure_device re-allocates before the next prompt chunk launches).
+    bool prefill_device_ready() const;
+    bool prefill_release_device(std::string& err);
+    bool prefill_ensure_device(std::string& err);
 
     // Optional adaptation resources, allocated at setup only. Replacements reuse the
     // existing slot planes; larger/different-layer candidates are ineligible.

@@ -64,6 +64,14 @@ def main():
                 env.update(HIP_VISIBLE_DEVICES='0' if a.single_gpu_only else '0,1', STRATA_AUX_CPUS='off',
                            STRATA_EXL3_CPU_TIER='0', STRATA_EXL3_PEER_ADAPT='0',
                            STRATA_EXL3_RESIDENT='0' if arm == 'published' else 'all')
+                # Reproduce the November 12 profiles, not the later serial prefill defaults.
+                env.update(dict.fromkeys((
+                    'STRATA_EXL3_PF_SMALL_WMMA_SILU', 'STRATA_EXL3_PEER_SMALL_BATCH',
+                    'STRATA_EXL3_PEER_DOWN_ACCUMULATE', 'STRATA_EXL3_PREFILL_INDEXED_BATCH',
+                    'STRATA_GDN_CONVL2', 'STRATA_GDN_HEAD', 'STRATA_GDN_PP',
+                    'STRATA_HC_NO_FLOAT_ATTN', 'STRATA_PF_QSA_SPLIT_NORM',
+                    'STRATA_EXL3_PEER_PREFILL_BORROW',
+                ), '0'))
                 if arm == 'cpu-ram-repack':
                     env.update(STRATA_QWEN_BAND8='memory', STRATA_EXL3_CPU_TIER='1',
                                STRATA_EXL3_CPU_THREADS='8', STRATA_EXL3_CPU_HYBRID='2',

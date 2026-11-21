@@ -48,7 +48,7 @@ python3 -m venv .venv
 python -m pip install -r requirements.txt -r tools/exl3/requirements.txt
 cmake -S . -B build-hip-exl3 -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_BUILD_TESTS=ON \
-  -DCMAKE_HIP_ARCHITECTURES=gfx1100
+  -DCMAKE_HIP_ARCHITECTURES=gfx1100 -DCMAKE_PREFIX_PATH=/opt/rocm
 cmake --build build-hip-exl3 --target strata exl3_band8_build -j2
 ```
 
@@ -56,13 +56,29 @@ CMake fetches the pinned llama.cpp source dependency. To use an existing checkou
 add `-DSTRATA_GGML_DIR=/path/to/llama.cpp`. Do not use `-j$(nproc)` on a low-RAM PC;
 HIP compilation uses quite a bit of memory.
 
+Adjust `/opt/rocm` if ROCm is installed elsewhere. Run `ldd build-hip-exl3/strata`
+before starting the server or benchmarks. If ROCm libraries such as
+`libhipblaslt.so.1` show `not found`, add the directory that contains them to
+the current shell and rerun `ldd`. For example, for an install using `/opt/rocm/lib`:
+
+```sh
+export LD_LIBRARY_PATH="/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
 Convert the downloaded model's tokenizer once:
 
 ```sh
 python tools/exl3/tokenizer_to_pack.py --hf /path/to/qwen-exl3 --out /path/to/qwen-exl3/tokenizer
 ```
 
-## Start Qwen
+## Start Qwen: smoke test, not the benchmark profile
+
+See the [portable two-GPU examples](examples/README.md) for 3.05 bpw full
+residency and 4.05 bpw peer residency, or read the
+[release notes](docs/RELEASE_EXL3_2026-11-21.md).
+
+These commands do not enable MTP. To compare decode rates, use the
+[published two-GPU settings](#match-the-published-two-gpu-qwen-setup) below.
 
 ```sh
 # One GPU. CPU help is enabled by default.
@@ -71,8 +87,9 @@ python tools/exl3/tokenizer_to_pack.py --hf /path/to/qwen-exl3 --out /path/to/qw
 # The 4.05 bpw model uses the same launcher settings.
 ./run-peer-4bpw.sh --model-dir /path/to/qwen-4.05bpw
 
-# Two GPUs: the first runs the main model, the second holds more experts.
-./run-peer.sh --model-dir /path/to/qwen-3.05bpw --gpu 0,1 --peer-device 1
+# Two GPUs: example with GPU 0 on the faster PCIe link and GPU 1 driving the display.
+./run-peer.sh --model-dir /path/to/qwen-3.05bpw --gpu 0,1 --peer-device 1 \
+  --expert-cache auto --reserve 768 --peer-reserve 2048
 ```
 
 Open **http://127.0.0.1:8085**. For an app, use **http://127.0.0.1:8085/v1** as the
@@ -85,7 +102,9 @@ Use `--tokenizer DIR` or `--ple-file FILE` if you keep them elsewhere.
 without starting the model.
 
 There is no long speed-flag recipe to paste. The engine selects the tested fast
-kernel defaults on gfx1100. Other architectures keep their existing dispatch.
+kernel defaults on gfx1100, including the optimized native serial prefill
+kernels. Those kernels are active with the standard 8K chunk as well.
+Other architectures keep their existing dispatch.
 An explicit environment value, including `0`, still overrides a kernel default.
 Repacking is **off** unless you select it yourself.
 
@@ -94,17 +113,32 @@ Repacking is **off** unless you select it yourself.
 These depend on your PC or workload. Start with the defaults, not someone else's
 CPU affinity list or a cache sized for a different GPU.
 
+For two-GPU Qwen, start with **automatic sizing on both cards**. Leave
+`--peer-slots` unset and use `--expert-cache auto`. Choose the reserves for
+the workload and the desktop: start with **768 MiB on the headless GPU**
+and **2,048 MiB on the GPU that drives the display**. Use the GPU with the
+fastest effective PCIe link as the primary (for example, x16 over x8 at
+the same generation). Ideally connect the display to the other GPU; if
+the links are equivalent, prefer the headless GPU as primary.
+
+These are recommendations, not changes to the launcher defaults. With a
+display on the primary and a headless peer, use `--reserve 2048 --peer-reserve
+768` with automatic sizing. Check the actual expert counts in the engine log and
+free VRAM during prefill and decode. If the desktop slows down, increase
+the reserve on the display GPU first. Use fixed counts to reproduce a
+benchmark or to cap an otherwise unstable setup.
+
 | Setting | Default / when to change it |
 | --- | --- |
 | `--resident all` | Full pinned expert pool in RAM. Use `--resident 0` for native Qwen if RAM is too tight; this uses file-backed expert staging and can be slower. |
-| `--resident peer` | **MiMo with a peer GPU only.** Keeps the peer-owned experts out of the RAM complement. Qwen rejects this mode. RAM-only repacking needs `all`. |
+| `--resident peer` | Native Qwen or MiMo with a peer GPU. Stores peer-owned experts only on that GPU, not in pinned RAM. Qwen requires the serial server and peer prefill. Repacking needs `all`. |
 | `--gpu 0,1 --peer-device 1` | A peer is optional; default is GPU 0 alone. Peer index 1 means the second card in the visible list. This is expert offload, not a layer split. |
 | `--cpu auto\|on\|off` | Auto enables CPU help for one-GPU Qwen and for MiMo; it leaves it off for Qwen with a peer. Try `--cpu on` with one Qwen GPU. MiMo is normally run with it on. |
 | `--cpu-threads N` | At most 8 workers by default, based on available CPU count. More is not always faster. |
 | `--aux-cpus LIST` | Unpinned by default. `off`, `auto`, or a list such as `4-7`; numbering is machine-specific. This is separate from the expert worker count. |
 | `--expert-cache N` | Qwen: `auto` sizes the primary GPU cache. Smaller caches leave room for context or the desktop. |
-| `--peer-slots N` | Qwen: limit peer expert slots. By default the launcher asks the engine to fill its available-VRAM budget, keeping the reserve. |
-| `--reserve MiB`, `--peer-reserve MiB` | Qwen: 2048 / 4096 MiB kept free. Leave a reserve on a card driving a display. MiMo's peer reserve uses the same launcher option; primary experts use `--expert-vram GiB`. |
+| `--peer-slots N` | Qwen: optional upper limit on peer experts. Leave unset for automatic sizing from available VRAM. Automatic sizing can retry a smaller subset if the device allocations do not fit. |
+| `--reserve MiB`, `--peer-reserve MiB` | Qwen: primary/peer sizing margins, default 2048/4096 MiB. These are not runtime guarantees; desktop activity and inference can change free VRAM. An explicit primary cache count is not resized by `--reserve`. MiMo uses `--expert-vram GiB` for primary experts. |
 | `--max-context N` | Qwen 65536, MiMo 16384. This is capacity, not a guarantee that a long prompt fits your VRAM. |
 | `--prefill N` | Qwen 8192, MiMo 512. Smaller prompt chunks can reduce peak memory. |
 | `--expert-profile FILE` | Optional initial expert placement; the bundled Qwen profile is used when available. `--no-expert-profile` starts without it. |
@@ -123,9 +157,97 @@ For a saved server JSON, the portable interface is:
 `python tools/strata_experts.py launch --config my-qwen.json -- --port 8085`.
 Its `config` subcommand can create a starting file; see `--help`.
 
-The benchmark's optional MTP runtime is not included in an EXL3 download. See
-[Qwen draft setup](docs/QWEN_MTP.md) to reuse or build one. Without a drafter, the
-model still runs, but the benchmark's decode rates are not the expected baseline.
+## Match the published two-GPU Qwen setup
+
+The fixed counts in this section are for benchmark reproduction, not the
+recommended starting point for a different GPU pair or desktop load.
+
+**All published Qwen decode rates below use MTP.** The matching
+[Qwen MTP runtime](docs/QWEN_MTP.md) is separate from the EXL3 model directory.
+These are the candidate settings for two 24 GiB RX 7900 XTX cards. Use the
+[release benchmark runner](bench/release-2026-11-12/README.md) to also match the
+prompts, generation lengths and cache handling. That runner keeps the later
+serial prefill switches off to reproduce the November 12 profiles.
+
+```sh
+STRATA_EXL3_PEER_ADAPT=0 ./run-peer.sh --model-dir /path/to/qwen-3.05bpw \
+  --gpu 0,1 --peer-device 1 --cpu off --resident all \
+  --expert-cache 165 --peer-slots 10200 --prefill 8192 --max-context 65536 \
+  --mtp-dir /path/to/mtp/rt --spec 4 --spec-min-p 0.5
+
+STRATA_EXL3_PEER_ADAPT=0 ./run-peer-4bpw.sh --model-dir /path/to/qwen-4.05bpw \
+  --gpu 0,1 --peer-device 1 --cpu off --resident all \
+  --expert-cache 104 --peer-slots 7200 --prefill 8192 --max-context 65536 \
+  --mtp-dir /path/to/mtp/rt --spec 4 --spec-min-p 0.5
+```
+
+Run one command at a time. Add `--dry-run` to check the resolved config. If
+the fixed benchmark profile does not fit, use automatic sizing or lower
+the appropriate cache cap. Report any change when comparing results.
+
+On the tested build, `--resident all` locked **42.66 GiB** (3.05 bpw) or
+**56.72 GiB** (4.05 bpw) for the expert arena alone, before other engine and OS
+memory. Installed RAM is not available RAM. For native Qwen, `--resident 0`
+selects file-backed expert staging. This is a different benchmark mode; the
+OS can still cache file pages, so file-backed does not imply physical SSD
+reads on every miss.
+
+### Low-RAM option for two-GPU Qwen
+
+```sh
+STRATA_EXL3_PEER_ADAPT=0 ./run-peer-4bpw.sh --model-dir /path/to/qwen-4.05bpw \
+  --gpu 0,1 --peer-device 1 --resident peer \
+  --expert-cache auto --reserve 768 --peer-reserve 2048 --mtp-dir /path/to/mtp/rt
+```
+
+`--resident all` remains the default. With `--resident peer` and 7,200
+experts on the peer, the registered expert arena measured **40.10 GiB instead of
+56.72 GiB** at 4.05 bpw, and **30.16 instead of 42.66 GiB** at 3.05 bpw.
+These are arena sizes, not whole-process requirements or validation on a 64 GB
+machine. With static peer placement, 4.05 bpw decode was essentially unchanged
+in the controlled A/B; adaptive swaps are slower in this mode because outgoing
+experts must be copied back to RAM. Start with adaptation off.
+
+Lowering `--peer-slots` frees peer VRAM but **increases** the pinned RAM
+complement. The primary can still lend cache space during prefill. With
+`--resident peer`, only the peer loan is disabled, so peer-owned weights
+stay on that card.
+
+### Optional: 16K prefill on two RX 7900 XTX
+
+If both GPUs have enough free VRAM, add `--qwen-16k-peer` to the native
+4.05 bpw command to improve long-prompt prefill. It selects 16K chunks,
+defaults to 7,200 peer experts. Native serial Qwen normally borrows space
+from the primary cache and, except with `--resident peer`, from the peer
+cache during prefill; the experts are restored before decode. This profile
+sets the peer loan target to 400 where borrowing is enabled. If VRAM is tight, omit this option and keep the
+standard 8K chunks. This profile is separate from the historical benchmark below.
+
+### Optional: direct peer-to-primary output for Qwen
+
+The second GPU still computes its experts with P2P off. The default sends
+their decode results through the host; keep that path for baseline tests.
+To try direct peer-to-primary output with fused wait/scatter, use the serial
+two-GPU launcher with `--cpu off` and prefix your usual command with:
+
+```sh
+STRATA_EXL3_PEER_DEVICE_OUT=2 STRATA_EXL3_PEER_OUTPUT_FUSED=1 \
+  ./run-peer-4bpw.sh --model-dir /path/to/qwen-4.05bpw \
+  --gpu 0,1 --peer-device 1 --peer-slots 7200 --cpu off \
+  --mtp-dir /path/to/mtp/rt
+```
+
+This requires working GPU peer access. It enables the external verifier's
+GPU-hit path and changes decode output transport only; activations going to
+the peer still travel through the host. To turn it off, unset both variables
+or set `STRATA_EXL3_PEER_DEVICE_OUT=0`. Fused P2P did not consistently beat
+host collection on the tested pair, so it is not a default.
+
+For a slow run, record the commit and resolved config. If saving engine logs
+is needed, use a saved server JSON with a `log` path. Check for
+`resident EXL3 full arena`, `EXL3 peer tier on device 1`, the shutdown
+`EXL3 peer summary` (computed routes and fallbacks), and `drafts accepted` in
+the request stats. GPU detection or VRAM usage alone does not confirm peer compute.
 
 ## Optional: repack the experts
 
@@ -256,6 +378,16 @@ If a run fails, keep the config and engine log. Report the exact quant, CPU, RAM
 GPU(s), ROCm version, context size and launch command in
 [this fork's issues](https://github.com/nasone32/Strata-EXL3-fork/issues).
 Do not include API keys or private prompts in a public log.
+
+On the tested dual RX 7900 XTX system, moving the monitor between GPUs
+while Linux was running was followed by a severe slowdown. Rebooting
+with the monitor still on the primary restored normal performance on
+both Qwen quants without a code or configuration change. The exact
+driver or desktop trigger is unknown.
+
+An intermittent ROCclr shutdown abort (`Memobj map does not have ptr`)
+has also been observed after a completed request. A successful generation
+does not imply a clean shutdown; keep the engine log if this happens.
 
 The server is local-only by default. Listening on another interface requires
 `--host ADDRESS --api-key SECRET`; do not expose it without a key.

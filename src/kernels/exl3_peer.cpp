@@ -184,6 +184,14 @@ struct Exl3Peer::Impl {
     std::vector<size_t> refill_slots;
     std::unique_ptr<Exl3MoeWorkspace> ws;   // created under the peer device guard (it binds to
                                             // the device current at construction)
+    // STRATA_EXL3_PEER_PREFILL_BORROW's deferred mode: the prefill path's OWN workspace, so its
+    // chunk-sized reserves (group scratch, the batch slabs, the lazily-grown base arrays) live
+    // only between a lend and the next restore - never next to the full resident set at startup
+    // and never through decode.  Null unless enable_prefill ran deferred; the decode workspace
+    // `ws` and every buffer open() reserved for it are untouched.
+    std::unique_ptr<Exl3MoeWorkspace> ws_pf;
+    bool pf_own_ws = false;      // enable_prefill's deferred marker: launch_prefill uses ws_pf
+    int pf_in = 0, pf_ff = 0;    // the prefill geometry (for ws_pf's reserves at each lend)
 
     // ---- STRATA_EXL3_PEER_PREFILL: the prompt chunks' peer-owned experts (enable_prefill) ----
     // Every buffer is allocated once by enable_prefill() at setup; a layer's work is enqueued by
@@ -210,7 +218,29 @@ struct Exl3Peer::Impl {
     int pf_k = 0;
     int64_t pf_n_expert = 0;
     int64_t pf_tokens_cap = 0, pf_rows_cap = 0;
+    // ---- STRATA_EXL3_PEER_PREFILL_BORROW: the saved side of an open plane loan ----
+    // A lent expert's DevEntry keeps its slot and per-plane capacities but its planes are
+    // FREED and its identity withdrawn from `where` (not resident: every router re-asks).
+    // restore_lent() re-allocates at the SAVED capacities and re-uploads the caller's bytes.
+    struct LentEntry {
+        int64_t layer = -1;
+        int32_t expert = -1;
+        size_t slot = 0;
+        std::array<size_t, 9> capacity{};
+        size_t bytes = 0;
+    };
+    std::vector<LentEntry> lent;
+    size_t lent_bytes_total = 0;
+    int64_t lent_restored_total = 0;
     int64_t pf_last_rows = 0, pf_layers = 0, pf_rows_total = 0, pf_groups_total = 0, pf_batches = 0;
+    int64_t pf_small_wmma_groups = 0;
+    bool pf_small_batch = false;
+    bool pf_reuse_plan = false, pf_host_timing = false;
+    Exl3RoutePlan pf_plan;
+    double pf_plan_ms = 0, pf_submit_ms = 0, pf_wait_ms = 0;
+    bool pf_down_accumulate = false;
+    int64_t pf_down_accumulated = 0;
+    int64_t pf_small_batches = 0, pf_small_batched_groups = 0;
     uint16_t* pf_d_x16 = nullptr;       // tokens x n_embd FP16 activations
     float* pf_d_rows = nullptr;         // rows_peer x n_embd unweighted FFN rows
     float* pf_d_sum = nullptr;          // tokens x n_embd weighted per-token sums
@@ -243,6 +273,46 @@ struct Exl3Peer::Impl {
         if (pf_done) { (void) cudaEventDestroy(pf_done); pf_done = nullptr; }
         pf_on = pf_pending = false;
         pf_slab_bytes = 0;
+        ws_pf.reset();      // the deferred mode's prefill workspace, if a lend built one
+        pf_own_ws = false;
+    }
+
+    // The prefill path's DEVICE buffers again after a tight loan-restore released them: the same
+    // four allocations and the same free-card check enable_prefill applied at setup (the card's
+    // state at a re-allocation is not the startup state).  A partially-present set is fine: every
+    // allocation is skipped when its pointer is set, and prefill_device_ready()/launch_prefill's
+    // guard refuse to run on a partial set, so a later call heals it.  Runs on the tier device.
+    bool pf_alloc_device(std::string& err) {
+        size_t free_b = 0, total_b = 0;
+        const bool have_free = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
+        const size_t need = (size_t) pf_tokens_cap * n_embd * 2 +          // x16
+                            (size_t) pf_rows_cap * n_embd * 4 +            // rows
+                            (size_t) pf_tokens_cap * n_embd * 4 +          // sum
+                            (size_t) pf_tokens_cap * pf_k * 4 * 3 + pf_slab_bytes * 2 + ((size_t) 1 << 20);
+        if (have_free && free_b < need) {
+            err = "exl3 peer: prefill buffers need " + std::to_string(need >> 20) + " MiB, the peer card has " +
+                  std::to_string(free_b >> 20) + " MiB free";
+            return false;
+        }
+        auto alloc_d = [](void** p, size_t bytes, const char* what, std::string& e) {
+            if (*p) return true;
+            if (cudaMalloc(p, bytes) != cudaSuccess) { e = std::string("exl3 peer: prefill ") + what; return false; }
+            return true;
+        };
+        if (!alloc_d((void**) &pf_d_x16, (size_t) pf_tokens_cap * n_embd * 2, "x16", err) ||
+            !alloc_d((void**) &pf_d_rows, (size_t) pf_rows_cap * n_embd * 4, "rows", err) ||
+            !alloc_d((void**) &pf_d_sum, (size_t) pf_tokens_cap * n_embd * 4, "sum", err) ||
+            !alloc_d((void**) &pf_d_slab, pf_slab_bytes, "plan slab", err))
+            return false;
+        // the slab views move with the new slab; the host slab (and its dest iota) never left
+        pf_d_ires  = (int32_t*)  (pf_d_slab + pf_off[0]);
+        pf_d_pair  = (int32_t*)  (pf_d_slab + pf_off[1]);
+        pf_d_wk    = (float*)    (pf_d_slab + pf_off[2]);
+        pf_d_dest  = (int32_t*)  (pf_d_slab + pf_off[3]);
+        pf_d_rire  = (int32_t*)  (pf_d_slab + pf_off[4]);
+        pf_d_rdest = (int32_t*)  (pf_d_slab + pf_off[5]);
+        pf_d_grp   = (Exl3Group*) (pf_d_slab + pf_off[6]);
+        return true;
     }
 
     void free_all() {
@@ -252,6 +322,8 @@ struct Exl3Peer::Impl {
         dev.clear();
         where.clear();
         row_of.clear();
+        lent.clear();   // lent planes were freed at lend time; only the bookkeeping remains
+        lent_bytes_total = 0;
         for (void** p : {(void**) &d_x32, (void**) &d_x16, (void**) &d_rows_idx, (void**) &d_rows16, (void**) &d_plan})
             if (*p) { (void) cudaFree(*p); *p = nullptr; }
         for (void** p : {(void**) &h_x32, (void**) &h_rows_idx, (void**) &h_rows16,
@@ -291,6 +363,7 @@ struct Exl3Peer::Impl {
         pf_d_dest = nullptr; pf_d_grp = nullptr;
         pf_done = nullptr; pf_on = pf_pending = false; pf_slab_bytes = 0;
         ws.release();
+        ws_pf.release();   // the loan's prefill workspace: same cross-context rule as ws
         stream = nullptr;
         refill = nullptr; refill_done = refill_start = nullptr; h_refill = nullptr;
         replacing.clear(); refill_slots.clear(); refill_capacity = 0; refill_max = 0;
@@ -316,6 +389,10 @@ bool Exl3Peer::has(int64_t layer, int32_t expert) const {
 
 int64_t Exl3Peer::resident() const {
     return valid() ? (int64_t) (impl_->where.size() - impl_->replacing.size()) : 0;
+}
+
+int64_t Exl3Peer::hidden_width() const {
+    return impl_ != nullptr && impl_->device >= 0 ? (int64_t) impl_->hidden : 0;
 }
 
 Exl3TrellisLayout Exl3Peer::slot_layout(int64_t layer, int32_t expert) const {
@@ -562,7 +639,9 @@ bool Exl3Peer::apply_refill(bool wait, std::vector<Replacement>& landed, std::st
 }
 
 bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
-                    int max_tokens, int max_k, std::string& err, size_t min_free_bytes) {
+                    int max_tokens, int max_k, std::string& err, size_t min_free_bytes,
+                    bool* vram_short) {
+    if (vram_short) *vram_short = false;
     close();
     Impl& m = *impl_;
     m.fault_arm("STRATA_EXL3_PEER_FAULT");
@@ -726,6 +805,7 @@ bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
             if (free < min_free_bytes || free - min_free_bytes < margin ||
                 bytes > free - min_free_bytes - margin) {
                 err = "exl3 peer: device reserve would be crossed";
+                if (vram_short) *vram_short = true;
                 return false;
             }
             return true;
@@ -733,7 +813,9 @@ bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
         auto alloc = [&](void** p, size_t bytes, bool host, const char* what) {
             if (m.fault_trip(err, what)) return false;
             if (!host && !room(bytes)) return false;
-            return ck(host ? cudaHostAlloc(p, bytes, cudaHostAllocPortable) : cudaMalloc(p, bytes), what, err);
+            const auto status = host ? cudaHostAlloc(p, bytes, cudaHostAllocPortable) : cudaMalloc(p, bytes);
+            if (vram_short && !host && status == cudaErrorMemoryAllocation) *vram_short = true;
+            return ck(status, what, err);
         };
         if (m.fault_trip(err, "stream create") ||
             !ck(cudaStreamCreateWithFlags(&m.stream, cudaStreamNonBlocking), "stream", err) ||
@@ -832,7 +914,34 @@ bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
             close(); return false;
         }
         size_t arena_at = 0;
+        size_t sampled_free = 0, uploaded = 0;
+        if (!arena && min_free_bytes && vram_short) {
+            size_t total = 0;
+            if (!ck(cudaMemGetInfo(&sampled_free, &total), "plane budget baseline", err)) {
+                close(); return false;
+            }
+        }
         for (size_t i = 0; i < subset.size(); ++i) {
+            // Measure after enough real allocations to amortize driver accounting
+            // granularity. Reject an oversized plan before pushing the allocator
+            // into eviction or a long stall; room() still checks individual planes.
+            if (sampled_free && i && i % 256 == 0) {
+                size_t free = 0, total = 0;
+                if (!ck(cudaMemGetInfo(&free, &total), "plane budget sample", err)) {
+                    close(); return false;
+                }
+                const size_t consumed = sampled_free > free ? sampled_free - free : 0;
+                const double multiplier = std::max(1.0, (double) consumed / uploaded);
+                const double remaining = (plane_total - uploaded) * multiplier;
+                if (free < min_free_bytes || remaining > (double)(free - min_free_bytes)) {
+                    *vram_short = true;
+                    err = "exl3 peer: after " + std::to_string(i) + " experts, measured " +
+                          std::to_string(consumed >> 20) + " MiB for " +
+                          std::to_string(uploaded >> 20) + " MiB of weights; projected tail exceeds reserve";
+                    close();
+                    return false;
+                }
+            }
             const Entry& e = subset[i];
             m.where[{e.layer, e.expert}] = m.dev.size();
             m.dev.emplace_back();   // owned from here; a failure below unwinds through close()
@@ -852,7 +961,12 @@ bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
                         arena_at += (b + 255) & ~(size_t)255;
                     }
                     if (m.fault_trip(err, "plane alloc/copy") ||
-                        (!arena && (!room(b) || !ck(cudaMalloc(&d.plane[p * 3 + q], b), "plane alloc", err))) ||
+                        (!arena && [&] {
+                            if (!room(b)) return true;
+                            const auto status = cudaMalloc(&d.plane[p * 3 + q], b);
+                            if (vram_short && status == cudaErrorMemoryAllocation) *vram_short = true;
+                            return !ck(status, "plane alloc", err);
+                        }()) ||
                         m.fault_trip(err, "plane copy") ||
                         !ck(cudaMemcpy(d.plane[p * 3 + q], src[q], b, cudaMemcpyHostToDevice), "plane copy", err)) {
                         close();   // free_all releases every plane published so far, exactly once
@@ -877,8 +991,14 @@ bool Exl3Peer::open(int device, int n_embd, const std::vector<Entry>& subset,
                 devm[p]->layout = host[p].layout;
             }
             d.bytes = total;
+            uploaded += total;
         }
         if (!room(0)) { close(); return false; }
+    } catch (const Exl3WorkspaceOom& e) {
+        if (vram_short) *vram_short = true;
+        err = std::string("exl3 peer: open: ") + e.what();
+        close();
+        return false;
     } catch (const std::exception& e) {
         err = std::string("exl3 peer: open: ") + e.what();
         close();
@@ -935,7 +1055,23 @@ void Exl3Peer::close() {
                 std::fprintf(stderr, "exl3 peer prefill: %lld layers, %lld rows / %lld groups computed on the peer%s%s\n",
                              (long long) m.pf_layers, (long long) m.pf_rows_total,
                              (long long) m.pf_groups_total, batches.c_str(), recon.c_str());
+                std::fprintf(stderr, "exl3 peer prefill: %lld standalone WMMA groups with 1..15 rows\n",
+                             (long long) m.pf_small_wmma_groups);
+                if (m.pf_small_batch)
+                    std::fprintf(stderr, "exl3 peer prefill: %lld small groups in %lld batched chains\n",
+                                 (long long) m.pf_small_batched_groups, (long long) m.pf_small_batches);
+                if (m.pf_down_accumulate)
+                    std::fprintf(stderr, "exl3 peer prefill: %lld groups with fused down accumulation\n",
+                                 (long long) m.pf_down_accumulated);
+                if (m.pf_host_timing)
+                    std::fprintf(stderr, "exl3 peer prefill host: %lld layers; plan %.3f ms, submit %.3f ms, exposed wait %.3f ms\n",
+                                 (long long) m.pf_layers, m.pf_plan_ms, m.pf_submit_ms, m.pf_wait_ms);
             }
+            if (!m.lent.empty())
+                std::fprintf(stderr, "exl3 peer loan: %lld experts (%.2f GiB, %lld restored earlier) "
+                                     "were still lent at close\n",
+                             (long long) m.lent.size(), (double) m.lent_bytes_total / 1073741824.0,
+                             (long long) m.lent_restored_total);
             m.free_all();
             m.pf_free();
         } else {
@@ -1236,7 +1372,9 @@ bool Exl3Peer::finish_deferred(std::string& err) {
 
 // ---- STRATA_EXL3_PEER_PREFILL: the prompt chunks' peer-owned experts (see exl3_peer.hpp) ----
 
-bool Exl3Peer::enable_prefill(int64_t max_tokens, int k, int64_t n_expert, int64_t max_rows, std::string& err) {
+bool Exl3Peer::enable_prefill(int64_t max_tokens, int k, int64_t n_expert, int64_t max_rows, std::string& err,
+                              bool defer_device, bool* vram_short) {
+    if (vram_short) *vram_short = false;
     if (!valid()) { err = "exl3 peer: prefill needs an open tier"; return false; }
     Impl& m = *impl_;
     if (m.pf_on) return true;
@@ -1278,17 +1416,46 @@ bool Exl3Peer::enable_prefill(int64_t max_tokens, int k, int64_t n_expert, int64
     m.pf_off[4] = o_rire; m.pf_off[5] = o_rdest; m.pf_off[6] = o_grp;
     // The workspace's group buffers (wmma_x, group_y, the f16 slabs) for a whole-chunk group,
     // grown once here: no allocation under queued work.  `ws` binds to the device current at
-    // each call, so this must run under the peer-device guard below.
+    // each call, so this must run under the peer-device guard below.  DEFERRED mode (the peer
+    // loan): these are PREFILL-ONLY buffers, so they move to the loan's own workspace
+    // (ws_pf, built at each lend by prefill_ensure_device and dropped at each restore) instead
+    // of sitting next to the full resident set through startup and decode; the flag-off and
+    // non-deferred path keeps this exact reserve, byte for byte.
     const int in = m.dev[0].g.ki * 16, ff = m.dev[0].g.nj * 16;
+    m.pf_in = in;
+    m.pf_ff = ff;
     const char* pb_env = std::getenv("STRATA_EXL3_PEER_BATCH");
     m.pf_batch = pb_env && pb_env[0] && pb_env[0] != '0';
+    const char* small = std::getenv("STRATA_EXL3_PEER_SMALL_BATCH");
+    m.pf_small_batch = m.pf_batch && in == 2560 && ff == 640 &&
+                       m.trellis_layout == Exl3TrellisLayout::Native &&
+                       small && small[0] == '1' && !small[1];
+    const char* accum = std::getenv("STRATA_EXL3_PEER_DOWN_ACCUMULATE");
+    m.pf_down_accumulate = in == 2560 && ff == 640 &&
+                           m.trellis_layout == Exl3TrellisLayout::Native &&
+                           accum && accum[0] == '1' && !accum[1];
+    const auto enabled = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v && v[0] == '1' && !v[1];
+    };
+    m.pf_reuse_plan = enabled("STRATA_EXL3_PEER_REUSE_PREFILL_PLAN");
+    m.pf_host_timing = enabled("STRATA_EXL3_PEER_PREFILL_HOST_TIMING");
 
     int caller = -1;
     (void) cudaGetDevice(&caller);
     if (!switch_to(m.device)) { err = "exl3 peer: cannot switch to the tier device"; return false; }
     struct Restore { int prev; ~Restore() { (void) cudaSetDevice(prev); } } restore{caller};
-    m.ws->reserve_group_scratch((int) max_tokens, in, ff, in, true);
-    if (m.pf_batch) m.ws->reserve_expert_batch(8, (int) std::min<int64_t>(4096, max_rows), in, ff, in);
+    m.pf_own_ws = defer_device;
+    try {
+        if (!defer_device)
+            m.ws->reserve_group_scratch((int) max_tokens, in, ff, in, true);
+        if (m.pf_batch && !defer_device)
+            m.ws->reserve_expert_batch(8, (int) std::min<int64_t>(4096, max_rows), in, ff, in);
+    } catch (const Exl3WorkspaceOom& e) {
+        if (vram_short) *vram_short = true;
+        err = e.what();
+        return false;
+    }
     {   // surface and clear any sticky error the setup left (the retry loop's freed attempts, a
         // refused batch reserve), so the first prefill layer's kernel checks see only their own
         // launches - the engine already does this at setup_peer; embeded callers get it here
@@ -1297,7 +1464,7 @@ bool Exl3Peer::enable_prefill(int64_t max_tokens, int k, int64_t n_expert, int64
             std::fprintf(stderr, "exl3 peer prefill: setup left a cuda error state: %s (cleared)\n",
                          cudaGetErrorString(de));
     }
-    if (m.pf_recon) {   // C2's slab (2 x cap F16 matrices + padded activations): a growth failure
+    if (m.pf_recon && !defer_device) {   // C2's slab (2 x cap F16 matrices + padded activations): a growth failure
         try {           // is a soft refusal - the peer's prefill keeps the standalone group chain
             m.ws->reserve_recon_batch(m.pf_recon_max, (int) std::min<int64_t>(4096, max_rows), in, ff, in);
         } catch (const std::exception&) {
@@ -1311,20 +1478,28 @@ bool Exl3Peer::enable_prefill(int64_t max_tokens, int k, int64_t n_expert, int64
                         (size_t) max_rows * n * 4 +            // rows
                         (size_t) max_tokens * n * 4 +          // sum
                         (size_t) routes * 4 * 3 + slab * 2 + ((size_t) 1 << 20);
-    if (have_free && free_b < need) {
+    // STRATA_EXL3_PEER_PREFILL_BORROW's deferred mode: with the loan on, the four DEVICE buffers
+    // (x16/rows/sum/slab, ~the whole `need` above) are NOT taken next to the full resident set
+    // at startup - the first lend() allocates them through pf_alloc_device, into plane bytes
+    // the loan just freed.  prefill_enabled() is still true and launch_prefill's existing guard
+    // refuses any launch until the buffers exist, so a bug cannot compute on missing buffers.
+    if (!defer_device && have_free && free_b < need) {
+        if (vram_short) *vram_short = true;
         err = "exl3 peer: prefill buffers need " + std::to_string(need >> 20) + " MiB, the peer card has " +
               std::to_string(free_b >> 20) + " MiB free";
         return false;
     }
     auto alloc_d = [&](void** p, size_t bytes, const char* what) {
         if (*p) return true;
-        if (cudaMalloc(p, bytes) != cudaSuccess) { err = std::string("exl3 peer: prefill ") + what; return false; }
-        return true;
+        const auto status = cudaMalloc(p, bytes);
+        if (vram_short && status == cudaErrorMemoryAllocation) *vram_short = true;
+        return ck(status, what, err);
     };
-    if (!alloc_d((void**) &m.pf_d_x16, (size_t) max_tokens * n * 2, "x16") ||
-        !alloc_d((void**) &m.pf_d_rows, (size_t) max_rows * n * 4, "rows") ||
-        !alloc_d((void**) &m.pf_d_sum, (size_t) max_tokens * n * 4, "sum") ||
-        !alloc_d((void**) &m.pf_d_slab, slab, "plan slab") ||
+    if ((!defer_device &&
+         (!alloc_d((void**) &m.pf_d_x16, (size_t) max_tokens * n * 2, "x16") ||
+          !alloc_d((void**) &m.pf_d_rows, (size_t) max_rows * n * 4, "rows") ||
+          !alloc_d((void**) &m.pf_d_sum, (size_t) max_tokens * n * 4, "sum") ||
+          !alloc_d((void**) &m.pf_d_slab, slab, "plan slab"))) ||
         cudaHostAlloc((void**) &m.pf_h_slab, slab, cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &m.pf_host_sum, (size_t) max_tokens * n * 4,
                       cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
@@ -1338,13 +1513,15 @@ bool Exl3Peer::enable_prefill(int64_t max_tokens, int k, int64_t n_expert, int64
         auto* dest = (int32_t*) ((unsigned char*) m.pf_h_slab + o_dest);
         for (int64_t i = 0; i < max_rows; ++i) dest[i] = (int32_t) i;
     }
-    m.pf_d_ires = (int32_t*)  (m.pf_d_slab + o_ires);
-    m.pf_d_pair = (int32_t*)  (m.pf_d_slab + o_pair);
-    m.pf_d_wk   = (float*)    (m.pf_d_slab + o_wk);
-    m.pf_d_dest = (int32_t*)  (m.pf_d_slab + o_dest);
-    m.pf_d_rire = (int32_t*)  (m.pf_d_slab + o_rire);
-    m.pf_d_rdest = (int32_t*) (m.pf_d_slab + o_rdest);
-    m.pf_d_grp  = (Exl3Group*) (m.pf_d_slab + o_grp);
+    if (m.pf_d_slab != nullptr) {   // deferred mode leaves the views null until the first lend
+        m.pf_d_ires = (int32_t*)  (m.pf_d_slab + o_ires);
+        m.pf_d_pair = (int32_t*)  (m.pf_d_slab + o_pair);
+        m.pf_d_wk   = (float*)    (m.pf_d_slab + o_wk);
+        m.pf_d_dest = (int32_t*)  (m.pf_d_slab + o_dest);
+        m.pf_d_rire = (int32_t*)  (m.pf_d_slab + o_rire);
+        m.pf_d_rdest = (int32_t*) (m.pf_d_slab + o_rdest);
+        m.pf_d_grp  = (Exl3Group*) (m.pf_d_slab + o_grp);
+    }
     m.pf_k = (int) k;
     m.pf_n_expert = n_expert;
     m.pf_tokens_cap = max_tokens;
@@ -1361,19 +1538,346 @@ int64_t Exl3Peer::prefill_last_rows() const { return impl_ ? impl_->pf_last_rows
 int64_t Exl3Peer::prefill_layers() const { return impl_ ? impl_->pf_layers : 0; }
 int64_t Exl3Peer::prefill_rows_total() const { return impl_ ? impl_->pf_rows_total : 0; }
 
+// ---- STRATA_EXL3_PEER_PREFILL_BORROW ----
+bool Exl3Peer::prefill_device_ready() const {
+    return impl_ != nullptr && impl_->pf_d_x16 != nullptr && impl_->pf_d_rows != nullptr &&
+           impl_->pf_d_sum != nullptr && impl_->pf_d_slab != nullptr;
+}
+
+bool Exl3Peer::prefill_release_device(std::string& err) {
+    if (!impl_ || impl_->device < 0) { err = "exl3 peer: prefill release needs an open tier"; return false; }
+    Impl& m = *impl_;
+    if (m.pf_pending) { err = "exl3 peer: prefill release needs an idle prefill layer"; return false; }
+    int caller = -1;
+    (void) cudaGetDevice(&caller);
+    if (!switch_to(m.device)) { err = "exl3 peer: prefill release device switch failed"; return false; }
+    struct Restore { int prev; ~Restore() { (void) cudaSetDevice(prev); } } restore{caller};
+    if (m.stream && cudaStreamSynchronize(m.stream) != cudaSuccess) {
+        err = "exl3 peer: prefill release drain failed";
+        return false;
+    }
+    // only the DEVICE buffers; the pinned slab, the mapped sums and the event stay allocated
+    for (void** p : {(void**) &m.pf_d_x16, (void**) &m.pf_d_rows, (void**) &m.pf_d_sum, (void**) &m.pf_d_slab})
+        if (*p) { (void) cudaFree(*p); *p = nullptr; }
+    for (void** p : {(void**) &m.pf_d_ires, (void**) &m.pf_d_pair, (void**) &m.pf_d_wk, (void**) &m.pf_d_dest,
+                     (void**) &m.pf_d_rire, (void**) &m.pf_d_rdest, (void**) &m.pf_d_grp})
+        *p = nullptr;
+    // the deferred mode's own prefill workspace goes with them (the decode workspace stays):
+    // the destructor drains nothing itself, and the caller is between prompts with the tier idle
+    m.ws_pf.reset();
+    return true;
+}
+
+bool Exl3Peer::prefill_ensure_device(std::string& err) {
+    if (!impl_ || !impl_->pf_on) { err = "exl3 peer: prefill buffers need prefill enabled"; return false; }
+    if (prefill_device_ready()) return true;
+    Impl& m = *impl_;
+    int caller = -1;
+    (void) cudaGetDevice(&caller);
+    if (!switch_to(m.device)) { err = "exl3 peer: prefill re-allocation device switch failed"; return false; }
+    struct Restore { int prev; ~Restore() { (void) cudaSetDevice(prev); } } restore{caller};
+    if (m.pf_own_ws && !m.ws_pf) {
+        // the deferred mode's prefill workspace: the reserves enable_prefill skipped, built here
+        // into the lend's freed bytes (the same sizes, the same order, its own buffers).  A
+        // failure destroys it and leaves the loan untouched - the next boundary retries.
+        try {
+            m.ws_pf = std::make_unique<Exl3MoeWorkspace>();   // binds to the peer device
+            m.ws_pf->set_trellis_layout(m.trellis_layout);
+            m.ws_pf->reserve_group_scratch((int) m.pf_tokens_cap, m.pf_in, m.pf_ff, m.pf_in, true);
+            if (m.pf_batch)
+                m.ws_pf->reserve_expert_batch(8, (int) std::min<int64_t>(4096, m.pf_rows_cap),
+                                              m.pf_in, m.pf_ff, m.pf_in);
+            if (m.pf_recon)
+                m.ws_pf->reserve_recon_batch(m.pf_recon_max, (int) std::min<int64_t>(4096, m.pf_rows_cap),
+                                             m.pf_in, m.pf_ff, m.pf_in);
+        } catch (const std::exception& e) {
+            m.ws_pf.reset();
+            err = std::string("exl3 peer: prefill workspace re-allocation failed: ") + e.what();
+            return false;
+        }
+    }
+    return m.pf_alloc_device(err);
+}
+
+int64_t Exl3Peer::lent_experts() const { return impl_ ? (int64_t) impl_->lent.size() : 0; }
+size_t Exl3Peer::lent_expert_bytes() const { return impl_ ? impl_->lent_bytes_total : 0; }
+std::vector<std::pair<int32_t, int32_t>> Exl3Peer::lent_list() const {
+    std::vector<std::pair<int32_t, int32_t>> out;
+    if (impl_ == nullptr) return out;
+    out.reserve(impl_->lent.size());
+    for (const Impl::LentEntry& l : impl_->lent) out.emplace_back((int32_t) l.layer, l.expert);
+    return out;
+}
+
+bool Exl3Peer::lend_experts(int count, std::string& err) {
+    if (count <= 0) return true;
+    if (!valid()) { err = failed() ? "exl3 peer: lend on a failed tier" : "exl3 peer: lend needs an open tier"; return false; }
+    Impl& m = *impl_;
+    if (m.plane_arena) { err = "exl3 peer: lend refuses the plane-arena mode (one allocation, no tail)"; return false; }
+    if (m.pending || m.pf_pending) { err = "exl3 peer: lend needs an idle tier"; return false; }
+    if (!m.replacing.empty()) { err = "exl3 peer: lend needs the refill stream landed"; return false; }
+    const int64_t resident_now = (int64_t) (m.where.size() - m.replacing.size());
+    // a quarter of the ORIGINAL subset, enforced across every lend/escalation call: computing
+    // the cap from the CURRENT resident count would let successive calls creep past it
+    const int64_t total_cap = (int64_t) (m.dev.size() / 4);
+    const int64_t want_total = std::min<int64_t>((int64_t) m.lent.size() + count, total_cap);
+    if (want_total <= (int64_t) m.lent.size()) return true;
+    int caller = -1;
+    (void) cudaGetDevice(&caller);
+    if (!switch_to(m.device)) { err = "exl3 peer: lend device switch failed"; return false; }
+    struct Restore { int prev; ~Restore() { (void) cudaSetDevice(prev); } } restore{caller};
+    if (cudaStreamSynchronize(m.stream) != cudaSuccess || cudaStreamSynchronize(m.refill) != cudaSuccess) {
+        err = "exl3 peer: lend stream drain failed";
+        return false;
+    }
+    // the primary computes a lent expert's rows through its bounded one-wave scratch; keep any
+    // one layer's lent share far inside it.  The subset's fill interleaves layers, so the tail
+    // spreads roughly evenly and this cap only bites a drifted distribution.
+    constexpr int64_t kMaxPerLayer = 32;
+    std::map<int64_t, int64_t> per_layer;
+    for (const Impl::LentEntry& l : m.lent) ++per_layer[l.layer];
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t freed = 0;
+    int64_t lent_before = (int64_t) m.lent.size();
+    for (size_t i = m.dev.size(); i-- > 0 && (int64_t) m.lent.size() < want_total; ) {
+        Impl::DevEntry& d = m.dev[i];
+        const auto it = m.where.find({d.layer, d.expert});
+        if (it == m.where.end() || it->second != i) continue;   // already lent (or not resident)
+        if (per_layer[d.layer] >= kMaxPerLayer) continue;
+        size_t bytes = 0;
+        for (int p = 0; p < 9; ++p) {
+            if (d.plane[p]) { (void) cudaFree(d.plane[p]); d.plane[p] = nullptr; }
+            bytes += d.capacity[(size_t) p];
+        }
+        m.where.erase(it);
+        d.g = {}; d.u = {}; d.d = {};
+        d.bytes = 0;
+        m.lent.push_back({d.layer, d.expert, i, d.capacity, bytes});
+        m.lent_bytes_total += bytes;
+        freed += bytes;
+        ++per_layer[d.layer];
+    }
+    const int64_t n_lent = (int64_t) m.lent.size() - lent_before;
+    if (n_lent > 0) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "exl3 peer loan: lent %lld tail experts (%.2f GiB freed, %lld of %lld slots) "
+                             "for the prompt; %lld resident while lent, in %.1f ms\n",
+                     (long long) n_lent, (double) freed / 1073741824.0, (long long) m.lent.size(),
+                     (long long) m.dev.size(), (long long) resident_now - n_lent, ms);
+    }
+    return true;
+}
+
+// The preview is the lend walk's selection read again: per-layer caps counted from m.lent,
+// the quarter-of-original-subset total cap, tail order over resident slots only.  lend_experts
+// applies the identical state mutations; nothing here touches m.  A divergence between the two
+// (only possible through a concurrent mutation, which the single-owner contract forbids) would
+// be caught by the caller's post-lend RAM-ownership check, not silently mismatched.
+bool Exl3Peer::lend_tail_preview(int count, std::vector<std::pair<int32_t, int32_t>>& out) const {
+    out.clear();
+    if (impl_ == nullptr || count <= 0 || !valid()) return true;
+    const Impl& m = *impl_;
+    const int64_t total_cap = (int64_t) (m.dev.size() / 4);
+    const int64_t want_total = std::min<int64_t>((int64_t) m.lent.size() + count, total_cap);
+    if (want_total <= (int64_t) m.lent.size()) return true;
+    constexpr int64_t kMaxPerLayer = 32;
+    std::map<int64_t, int64_t> per_layer;
+    for (const Impl::LentEntry& l : m.lent) ++per_layer[l.layer];
+    for (size_t i = m.dev.size(); i-- > 0 && (int64_t) m.lent.size() + (int64_t) out.size() < want_total; ) {
+        const Impl::DevEntry& d = m.dev[i];
+        const auto it = m.where.find({d.layer, d.expert});
+        if (it == m.where.end() || it->second != i) continue;   // already lent (or not resident)
+        if (per_layer[d.layer] >= kMaxPerLayer) continue;
+        out.emplace_back((int32_t) d.layer, d.expert);
+        ++per_layer[d.layer];
+    }
+    return true;
+}
+
+bool Exl3Peer::restore_lent(const std::vector<Entry>& sources, std::string& err) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (impl_ == nullptr || impl_->lent.empty()) return true;   // nothing out: a no-op, not an error
+    if (!valid()) { err = failed() ? "exl3 peer: restore on a failed tier" : "exl3 peer: restore needs an open tier"; return false; }
+    Impl& m = *impl_;
+    if (m.pending || m.pf_pending) { err = "exl3 peer: restore needs an idle tier"; return false; }
+    if (!m.replacing.empty()) { err = "exl3 peer: restore needs the refill stream landed"; return false; }
+    // plan first (nothing mutated): match caller sources to lent records.  A source whose expert
+    // is not lent is skipped exactly once, and one the adapt path re-admitted meanwhile (it was
+    // hot in decode) is only DROPPED from the loan - restoring it would leave two slots for one
+    // identity and leak the adapt's planes.
+    std::vector<size_t> take;
+    std::vector<const Entry*> src_of(m.lent.size(), nullptr);
+    for (const Entry& s : sources) {
+        for (size_t i = 0; i < m.lent.size(); ++i) {
+            if (src_of[i] != nullptr || m.lent[i].layer != s.layer || m.lent[i].expert != s.expert) continue;
+            if (has(s.layer, s.expert)) {   // re-admitted by adapt: the loan's record ends here
+                src_of[i] = &s;
+                break;
+            }
+            std::array<size_t, 9> sizes{};
+            if (!layout(s, m.n_embd, m.hidden, sizes)) {
+                err = "exl3 peer: restore source layer " + std::to_string(s.layer) + " expert " +
+                      std::to_string(s.expert) + " has the wrong geometry";
+                return false;
+            }
+            for (int p = 0; p < 9; ++p)
+                if (sizes[(size_t) p] != m.lent[i].capacity[(size_t) p]) {
+                    err = "exl3 peer: restore source layer " + std::to_string(s.layer) + " expert " +
+                          std::to_string(s.expert) + " plane sizes changed since the lend";
+                    return false;
+                }
+            src_of[i] = &s;
+            take.push_back(i);
+            break;
+        }
+    }
+    if (take.empty()) return true;
+    size_t total = 0;
+    for (const size_t i : take) total += m.lent[i].bytes;
+    int caller = -1;
+    (void) cudaGetDevice(&caller);
+    if (!switch_to(m.device)) { err = "exl3 peer: restore device switch failed"; return false; }
+    struct Restore { int prev; ~Restore() { (void) cudaSetDevice(prev); } } restore{caller};
+    if (cudaStreamSynchronize(m.stream) != cudaSuccess || cudaStreamSynchronize(m.refill) != cudaSuccess) {
+        err = "exl3 peer: restore stream drain failed";
+        return false;
+    }
+    // a full peer card is the NORMAL state after a prompt (the workspace grew), and the raw
+    // byte check under-counts allocator rounding across thousands of plane allocations (a
+    // 220-of-242 partial restore was observed that way) - so the prefill device buffers are
+    // released FIRST, unconditionally, and only a still-short card is an error.  The next lend
+    // re-allocates them before its first chunk launches.
+    if (prefill_device_ready()) {
+        std::string rel;
+        if (!prefill_release_device(rel)) { err = rel; return false; }
+        std::fprintf(stderr, "exl3 peer loan: released the prefill device buffers for the restore "
+                             "(the next prompt re-allocates them)\n");
+    }
+    {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < total + ((size_t) 64 << 20)) {
+            err = "exl3 peer: restore needs " + std::to_string(total >> 20) + " MiB, the peer card has " +
+                  std::to_string(free_b >> 20) + " MiB free even with the prefill buffers released";
+            return false;
+        }
+    }
+    // allocate every plane first (a failure frees exactly this call's planes - the loan stays
+    // exactly as it was, and the next boundary retries), then upload, then publish
+    struct Restored { size_t lent_at; uint8_t* plane[9]; };
+    std::vector<Restored> done;
+    auto unwind = [&]() {
+        for (Restored& r : done)
+            for (int p = 0; p < 9; ++p)
+                if (r.plane[p]) { (void) cudaFree(r.plane[p]); r.plane[p] = nullptr; }
+    };
+    for (const size_t i : take) {
+        Restored r{};
+        r.lent_at = i;
+        bool ok = true;
+        for (int p = 0; p < 9 && ok; ++p) {
+            const size_t b = m.lent[i].capacity[(size_t) p];
+            if (cudaMalloc((void**) &r.plane[p], b) != cudaSuccess) {
+                err = "exl3 peer: restore plane allocation failed (" + std::to_string(done.size()) + " of " +
+                      std::to_string(take.size()) + " experts back)";
+                ok = false;
+            }
+        }
+        if (!ok) { for (int p = 0; p < 9; ++p) if (r.plane[p]) (void) cudaFree(r.plane[p]); unwind(); return false; }
+        done.push_back(r);
+    }
+    for (const Restored& r : done) {
+        const Entry& s = *src_of[r.lent_at];
+        const Exl3Mat mats[3] = {s.g, s.u, s.d};
+        bool ok = true;
+        for (int p = 0; p < 3 && ok; ++p) {
+            const void* from[] = {mats[p].trellis, mats[p].suh, mats[p].svh};
+            for (int q = 0; q < 3 && ok; ++q)
+                ok = cudaMemcpyAsync(r.plane[(size_t) p * 3 + q], from[q],
+                                     m.lent[r.lent_at].capacity[(size_t) (p * 3 + q)],
+                                     cudaMemcpyHostToDevice, m.refill) == cudaSuccess;
+        }
+        if (!ok) {
+            (void) cudaStreamSynchronize(m.refill);
+            unwind();
+            m.failed = true;   // the stream state is suspect: refuse everything until close()
+            err = "exl3 peer: restore upload failed";
+            return false;
+        }
+    }
+    if (cudaStreamSynchronize(m.refill) != cudaSuccess) {
+        unwind();
+        m.failed = true;
+        err = "exl3 peer: restore upload completion failed";
+        return false;
+    }
+    // publish (noexcept from here): the open() descriptor rules, plane pointers redirected
+    size_t bytes = 0;
+    for (const Restored& r : done) {
+        const Entry& s = *src_of[r.lent_at];
+        Impl::DevEntry& d = m.dev[m.lent[r.lent_at].slot];
+        const Exl3Mat host[3] = {s.g, s.u, s.d};
+        Exl3Mat* devm[3] = {&d.g, &d.u, &d.d};
+        for (int p = 0; p < 3; ++p) {
+            devm[p]->trellis = (const uint16_t*) r.plane[(size_t) p * 3 + 0];
+            devm[p]->suh = (const uint16_t*) r.plane[(size_t) p * 3 + 1];
+            devm[p]->svh = (const uint16_t*) r.plane[(size_t) p * 3 + 2];
+            devm[p]->ki = host[p].ki;
+            devm[p]->nj = host[p].nj;
+            devm[p]->bits = host[p].bits;
+            devm[p]->frac = host[p].frac;
+            devm[p]->cb = host[p].cb;
+            devm[p]->layout = host[p].layout;
+            for (int q = 0; q < 3; ++q) d.plane[(size_t) p * 3 + q] = r.plane[(size_t) p * 3 + q];
+        }
+        d.bytes = m.lent[r.lent_at].bytes;
+        m.where[{m.lent[r.lent_at].layer, m.lent[r.lent_at].expert}] = m.lent[r.lent_at].slot;
+        bytes += d.bytes;
+    }
+    // drop the loan's ended records: every restored one and every one the adapt path
+    // re-admitted (matched but skipped above); unmatched records stay for the next boundary
+    std::vector<bool> keep(m.lent.size(), true);
+    size_t ended_bytes = 0;
+    for (const Restored& r : done) { keep[r.lent_at] = false; ended_bytes += m.lent[r.lent_at].bytes; }
+    for (size_t i = 0; i < m.lent.size(); ++i)
+        if (src_of[i] != nullptr) {
+            if (keep[i]) ended_bytes += m.lent[i].bytes;
+            keep[i] = false;
+        }
+    std::vector<Impl::LentEntry> next;
+    next.reserve(m.lent.size() - done.size());
+    for (size_t i = 0; i < m.lent.size(); ++i)
+        if (keep[i]) next.push_back(std::move(m.lent[i]));
+    m.lent = std::move(next);
+    m.lent_bytes_total -= std::min(m.lent_bytes_total, ended_bytes);
+    m.lent_restored_total += (int64_t) done.size();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr, "exl3 peer loan: restored %lld experts (%.2f GiB) before decode in %.1f ms; "
+                         "%lld still lent\n",
+                 (long long) done.size(), (double) bytes / 1073741824.0, ms, (long long) m.lent.size());
+    return true;
+}
+
 bool Exl3Peer::launch_prefill(int64_t layer, const uint16_t* x16, int64_t tokens,
                               const int32_t* ids, const uint8_t* peer_mask, const float* weights,
                               std::string& err) {
     if (!valid()) { err = failed() ? "exl3 peer: tier failed earlier" : "exl3 peer: not open"; return false; }
     Impl& m = *impl_;
     if (!m.pf_on) { err = "exl3 peer: prefill not enabled"; return false; }
+    if (m.pf_d_x16 == nullptr || m.pf_d_rows == nullptr || m.pf_d_sum == nullptr || m.pf_d_slab == nullptr) {
+        err = "exl3 peer: prefill device buffers are released (a loan restore freed them; the next "
+              "lend re-allocates them before its first chunk)";
+        return false;
+    }
     if (m.pending || m.pf_pending) { err = "exl3 peer: a launch is already pending"; return false; }
     if (tokens <= 0 || tokens > m.pf_tokens_cap) { err = "exl3 peer: prefill tokens out of the enabled cap"; return false; }
     if (!x16 || !ids || !peer_mask || !weights) { err = "exl3 peer: prefill null x16/ids/mask/weights"; return false; }
     const int64_t routes = tokens * m.pf_k;
 
     // ---- host plan (before any enqueue): the masked routes, expert-major, per route validated
-    Exl3RoutePlan plan;
+    using Clock = std::chrono::steady_clock;
+    const auto plan_start = m.pf_host_timing ? Clock::now() : Clock::time_point{};
+    Exl3RoutePlan local_plan;
+    auto& plan = m.pf_reuse_plan ? m.pf_plan : local_plan;
     plan.build(ids, (int) tokens, m.pf_k, (int) m.pf_n_expert);
     unsigned char* h = (unsigned char*) m.pf_h_slab;
     std::memcpy((float*) (h + m.pf_off[2]), weights, (size_t) routes * sizeof(float));
@@ -1387,11 +1891,16 @@ bool Exl3Peer::launch_prefill(int64_t layer, const uint16_t* x16, int64_t tokens
     int groups = 0;
     for (size_t g = 0; g < plan.experts.size(); ++g) {
         const int32_t e = plan.experts[g];
+        size_t slot = SIZE_MAX;
         int taken = 0;
         for (int r = plan.offsets[g]; r < plan.offsets[g + 1]; ++r) {
             const int dst = plan.destinations[(size_t) r];
             if (!peer_mask[dst]) continue;
-            if (!has(layer, e)) {
+            if (m.pf_reuse_plan && taken == 0) {
+                const auto it = m.where.find({layer, e});
+                if (it != m.where.end()) slot = it->second;
+            }
+            if (m.pf_reuse_plan ? slot == SIZE_MAX : !has(layer, e)) {
                 err = "exl3 peer: prefill mask routes expert " + std::to_string(e) +
                       " (layer " + std::to_string(layer) + ") not resident on this tier";
                 return false;
@@ -1401,7 +1910,7 @@ bool Exl3Peer::launch_prefill(int64_t layer, const uint16_t* x16, int64_t tokens
             ++taken;
         }
         if (taken == 0) continue;
-        const auto& d = m.dev[m.where.at({layer, e})];
+        const auto& d = m.dev[m.pf_reuse_plan ? slot : m.where.at({layer, e})];
         out_grp[groups] = Exl3Group{d.g, d.u, d.d, 0, taken};
         m.pf_first.push_back((int) total);
         m.pf_rowsn.push_back(taken);
@@ -1481,11 +1990,13 @@ bool Exl3Peer::launch_prefill(int64_t layer, const uint16_t* x16, int64_t tokens
     } else if (m.pf_batch) {
         int i = 0;
         while (i < groups) {
-            if (m.pf_rowsn[(size_t) i] < 16) { ++i; continue; }
+            const bool small = m.pf_rowsn[(size_t) i] < 16;
+            if (small && !m.pf_small_batch) { ++i; continue; }
             int j = i, rows = 0;
             // one K per launch (the WMMA batch's stride/decode are per-(bits, frac)): a K2/K2.5
             // mix ends the run and the next K starts its own batch on the following pass
-            while (j < groups && j - i < 8 && m.pf_rowsn[(size_t) j] >= 16 &&
+            while (j < groups && j - i < 8 &&
+                   (m.pf_rowsn[(size_t) j] < 16) == small &&
                    (m.pf_rowsn[(size_t) j] >= 24) == (m.pf_rowsn[(size_t) i] >= 24) &&
                    out_grp[j].gate.bits == out_grp[i].gate.bits &&
                    out_grp[j].gate.frac == out_grp[i].gate.frac &&
@@ -1509,11 +2020,16 @@ bool Exl3Peer::launch_prefill(int64_t layer, const uint16_t* x16, int64_t tokens
     m.pf_groups = groups;
     m.pf_last_rows = total;
 
+    const auto submit_start = m.pf_host_timing ? Clock::now() : Clock::time_point{};
+
     // ---- enqueue only
     int caller = -1;
     (void) cudaGetDevice(&caller);
     if (!switch_to(m.device)) { err = "exl3 peer: cannot switch to the tier device"; return false; }
     struct Restore { int prev; ~Restore() { (void) cudaSetDevice(prev); } } restore{caller};
+    // the deferred mode's prefill workspace when the loan built one, the shared tier workspace
+    // otherwise (the flag-off and non-deferred path sees exactly its previous workspace)
+    Exl3MoeWorkspace& ws = m.ws_pf ? *m.ws_pf : *m.ws;
     bool enq = true;
     try {
         // the recon batches' descriptor count (their slab region follows grp); the mbegin/mend
@@ -1543,11 +2059,28 @@ bool Exl3Peer::launch_prefill(int64_t layer, const uint16_t* x16, int64_t tokens
         auto standalone = [&](int g) {
             const int rowsn = m.pf_rowsn[(size_t) g];
             const int h_first = m.pf_first[(size_t) g];
+            const auto& mat = out_grp[g];
+            if (m.pf_down_accumulate) {
+                // The stable route plan emits each expert's rows in token order;
+                // strict monotonicity proves no two blocks update the same sum row.
+                bool unique = true;
+                for (int r = 1; r < rowsn && unique; ++r)
+                    unique = out_ires[h_first+r-1] < out_ires[h_first+r];
+                if (unique && exl3_moe_group_wmma_accumulate(mat.gate, mat.up, mat.down, rowsn,
+                        m.pf_d_x16, m.pf_d_ires + h_first, m.pf_d_sum, m.pf_d_wk,
+                        m.pf_d_pair + h_first, m.pf_k, m.stream, ws)) {
+                    ++m.pf_down_accumulated;
+                    if (rowsn < 16) ++m.pf_small_wmma_groups;
+                    return;
+                }
+            }
             float* dst = m.pf_d_rows + (size_t) h_first * m.n_embd;
             if (!exl3_moe_group_wmma(out_grp[g].gate, out_grp[g].up, out_grp[g].down, rowsn,
-                                     m.pf_d_x16, m.pf_d_ires + h_first, dst, m.stream, *m.ws))
+                                     m.pf_d_x16, m.pf_d_ires + h_first, dst, m.stream, ws))
                 exl3_moe_group_gemm(out_grp[g].gate, out_grp[g].up, out_grp[g].down, rowsn,
-                                    m.pf_d_x16, m.pf_d_ires + h_first, dst, m.stream, *m.ws);
+                                    m.pf_d_x16, m.pf_d_ires + h_first, dst, m.stream, ws);
+            else if (rowsn < 16)
+                ++m.pf_small_wmma_groups;
             exl3_pf_scatter_add(m.pf_d_sum, dst, m.pf_d_wk, m.pf_d_pair + h_first,
                                 rowsn, m.pf_k, m.n_embd, m.stream);
         };
@@ -1564,7 +2097,7 @@ bool Exl3Peer::launch_prefill(int64_t layer, const uint16_t* x16, int64_t tokens
                     if (exl3_moe_recon_batch(rgrp + m.pf_recon_desc[(size_t) g], me - mb, m.pf_d_x16,
                                              m.pf_d_rire + m.pf_recon_base[(size_t) g],
                                              m.pf_d_rdest + m.pf_recon_base[(size_t) g],
-                                             m.pf_d_rows, m.stream, *m.ws)) {
+                                             m.pf_d_rows, m.stream, ws)) {
                         for (int q = mb; q < me; ++q) {
                             const int member = m.pf_recon_m[(size_t) q];
                             const int first = m.pf_first[(size_t) member];
@@ -1586,10 +2119,25 @@ bool Exl3Peer::launch_prefill(int64_t layer, const uint16_t* x16, int64_t tokens
                 continue;
             }
             const int j = m.pf_batch_end[(size_t) g];
+            const bool small = m.pf_rowsn[(size_t) g] < 16;
             if (j >= g + 2 &&
                 exl3_moe_expert_batch((const Exl3Group*) ((unsigned char*) m.pf_h_slab + m.pf_off[6]) + g,
                                       j - g, m.pf_d_x16, m.pf_d_ires + m.pf_first[(size_t) g],
-                                      m.pf_d_dest + m.pf_first[(size_t) g], m.pf_d_rows, m.stream, *m.ws)) {
+                                      m.pf_d_dest + m.pf_first[(size_t) g], m.pf_d_rows, m.stream, ws, small)) {
+                if (small) {
+                    // Several experts can contribute to one token. Keep the
+                    // standalone per-expert accumulation order and launches.
+                    for (int q = g; q < j; ++q) {
+                        const int first = m.pf_first[(size_t) q];
+                        exl3_pf_scatter_add(m.pf_d_sum, m.pf_d_rows + (size_t) first * m.n_embd,
+                                            m.pf_d_wk, m.pf_d_pair + first,
+                                            m.pf_rowsn[(size_t) q], m.pf_k, m.n_embd, m.stream);
+                    }
+                    ++m.pf_small_batches;
+                    m.pf_small_batched_groups += j - g;
+                    g = j;
+                    continue;
+                }
                 const int rows = (int) ((j < groups ? (int64_t) m.pf_first[(size_t) j] : total) -
                                         (int64_t) m.pf_first[(size_t) g]);
                 exl3_pf_scatter_add(m.pf_d_sum, m.pf_d_rows + (size_t) m.pf_first[(size_t) g] * m.n_embd,
@@ -1619,6 +2167,10 @@ bool Exl3Peer::launch_prefill(int64_t layer, const uint16_t* x16, int64_t tokens
     ++m.pf_layers;
     m.pf_rows_total += total;
     m.pf_groups_total += groups;
+    if (m.pf_host_timing) {
+        m.pf_plan_ms += std::chrono::duration<double, std::milli>(submit_start - plan_start).count();
+        m.pf_submit_ms += std::chrono::duration<double, std::milli>(Clock::now() - submit_start).count();
+    }
     return true;
 }
 
@@ -1630,7 +2182,11 @@ bool Exl3Peer::finish_prefill(std::string& err) {
     (void) cudaGetDevice(&caller);
     if (!switch_to(m.device)) { err = "exl3 peer: cannot switch to the tier device"; return false; }
     struct Restore { int prev; ~Restore() { (void) cudaSetDevice(prev); } } restore{caller};
+    using Clock = std::chrono::steady_clock;
+    const auto start = m.pf_host_timing ? Clock::now() : Clock::time_point{};
     const cudaError_t e = cudaEventSynchronize(m.pf_done);
+    if (m.pf_host_timing)
+        m.pf_wait_ms += std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     if (e != cudaSuccess) {
         err = std::string("exl3 peer: prefill layer failed: ") + cudaGetErrorString(e);
         m.failed = true;

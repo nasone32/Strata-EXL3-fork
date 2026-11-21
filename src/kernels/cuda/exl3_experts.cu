@@ -324,10 +324,19 @@ struct Exl3ExpertStream::Impl {
     std::unique_ptr<Exl3Model> model;
     // Opt-in for checkpoints with mixed bitrates WITHIN a layer. Capacity views
     // select the largest physical plane, never the weights used for execution.
+    // NO HOST POINTERS ARE EVER CACHED: an Exl3ResidentBacking built before its
+    // deferred (peer-complement) activation serves source-mmap pointers here, and
+    // the activation retires that mmap - a cached pointer would dangle silently.
+    // The capacity views' readers use dims/layout only; a future reader that
+    // dereferences gets a null fault, never a stale mapping.
     std::unordered_map<std::string, Exl3Linear> slot_caps;
     Exl3Linear capacity(const std::string& base) {
-        const auto it = slot_caps.find(base);
-        return it == slot_caps.end() ? model->linear(base) : it->second;
+        auto it = slot_caps.find(base);
+        if (it != slot_caps.end()) return it->second;
+        Exl3Linear L = model->linear(base);
+        L.trellis = nullptr; L.suh = nullptr; L.svh = nullptr;
+        slot_caps.emplace(base, L);
+        return L;
     }
     // The stream's ONE canonical expert format (the model's expert_layout(), probed at
     // construction).  Every Exl3Linear loaded later must carry exactly this layout - a mixed
@@ -404,6 +413,7 @@ struct Exl3ExpertStream::Impl {
         return layer.tick[a] < layer.tick[b];
     }
     bool arena_requested = false;      // PREFILL_BORROW currently selects backing only, no loan
+    bool auto_loan_sizing = false;     // the cache consumes the owned prompt-buffer budget
     uint8_t* arena = nullptr;          // single owner; Layer::allocs stays empty in this arm
     size_t arena_bytes = 0, arena_rank_bytes = 0;
     // ---- the stream loan (contract in the header).  `active` is the routable slot prefix: without
@@ -561,6 +571,8 @@ struct Exl3ExpertStream::Impl {
     // behind a wave-end sync.  Implies the per-wave barrier.
     bool pipe_stage = false;
     bool expert_batch = false;  // temporary STRATA_EXL3_EXPERT_BATCH: bounded multi-expert launches
+    bool prefill_indexed_batch = false;
+    long long prefill_indexed_calls = 0, prefill_indexed_groups = 0;
     long long batch_groups = 0, batch_calls = 0, group_hist[5] = {};
     long long ffn_launches = 0, standalone_groups = 0, batch_rejects = 0;
     long long split_stops[4] = {}; // small next group, route cap, row-tile/K-mix boundary, eight-group cap
@@ -1121,6 +1133,9 @@ struct Exl3ExpertStream::Impl {
         if (primary_packed_calls)
             std::fprintf(stderr, "exl3 primary packed plan: %lld passes / %lld routes, one plan H2D and direct FFN output per pass\n",
                          primary_packed_calls, primary_packed_routes);
+        if (prefill_indexed_batch)
+            std::fprintf(stderr, "exl3 prefill indexed batch: %lld groups in %lld calls\n",
+                         prefill_indexed_groups, prefill_indexed_calls);
         if (resident_direct_dma)
             std::fprintf(stderr, "exl3 resident direct DMA: %lld experts / %.2f MiB uploaded straight from the "
                                  "registered arena (gather memcpy avoided); %lld packed experts kept the gather path "
@@ -1179,7 +1194,8 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
                                     void* stream, size_t ram_cache_bytes, size_t reserve_device_bytes,
                                     int layer_lo, int layer_hi, int prefill_tokens,
                                     const std::string& layer_prefix,
-                                    std::shared_ptr<const Exl3ExpertBacking> expert_backing) {
+                                    std::shared_ptr<const Exl3ExpertBacking> expert_backing,
+                                    size_t auto_loan_bytes) {
     if (layer_hi < 0) layer_hi = n_layers;
     if (n_embd <= 0 || n_layers <= 0 || n_layers > 48 || slots_per_layer < -1 || slots_per_layer > 512 ||
         layer_lo < 0 || layer_lo >= layer_hi || layer_hi > n_layers)
@@ -1219,6 +1235,8 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
     if (const char* v = std::getenv("STRATA_EXL3_EXPERT_BATCH"); v && v[0]) {
         impl_->expert_batch = v[0] != '0';   // opt-in (RDNA/WMMA batched group FFN, launcher-set)
     }
+    if (const char* v = std::getenv("STRATA_EXL3_PREFILL_INDEXED_BATCH"))
+        impl_->prefill_indexed_batch = n_embd == 2560 && v[0] == '1' && !v[1];
     // STRATA_EXL3_RECON_BATCH (opt-in, the C2 batched weight reconstruction for the frac/low-K
     // experts - the Qwen-side EXPERT_BATCH's fraternal twin for the reconstruct+BLAS arm).  The
     // subgroup cap defaults to 8 experts; STRATA_EXL3_RECON_BATCH_MAX overrides (1..16).
@@ -1282,6 +1300,10 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
                         throw std::runtime_error("exl3: variable-bit expert geometry differs: " + name);
                     if (candidate.words() > largest.words()) largest = candidate;
                 }
+                // Capacity views are METADATA ONLY (see capacity()): a resident backing built
+                // before its deferred peer-complement activation serves source-mmap pointers
+                // here, and that activation retires the mmap - never cache a host pointer.
+                largest.trellis = nullptr; largest.suh = nullptr; largest.svh = nullptr;
                 impl_->slot_caps.emplace(stem + "0." + proj, largest);
             }
         }
@@ -1525,6 +1547,16 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
     // path's `--expert-cache` is a global count because its blobs are one pool; here the stream is per
     // layer, so the count is per layer.
     int slots = slots_per_layer;
+    size_t sizing_reserve = reserve_device_bytes;
+    int owned_fit = 0;
+    auto trim_slot_events = [&](int fit) {
+        if (!impl_->pipe_stage) return;
+        for (int l = layer_lo; l < layer_hi; ++l) {
+            auto& used = impl_->layers[(size_t) l].used;
+            for (size_t s = (size_t) fit; s < used.size(); ++s) (void) cudaEventDestroy(used[s]);
+            if (used.size() > (size_t) fit) used.resize((size_t) fit);
+        }
+    };
     {
         size_t per_slot = 0;
         for (int l = layer_lo; l < layer_hi; ++l) {
@@ -1534,11 +1566,24 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
                 per_slot += (size_t) L.ki * L.nj * (2 * L.words()) + (size_t) (L.in() + L.out()) * 2;
             }
         }
+        const auto fit_with = [&](size_t free, size_t keep) {
+            return (per_slot && free > keep) ? (int) std::min<size_t>((free - keep) / per_slot, 512) : 0;
+        };
+        const size_t loan_ranks = per_slot ? auto_loan_bytes / per_slot +
+            (auto_loan_bytes % per_slot != 0) : 0;
         if (slots < 0 || variable_bits) {
             size_t free_b = 0, total_b = 0;
             (void) cudaMemGetInfo(&free_b, &total_b);
             const size_t reserve = variable_bits ? std::max(reserve_device_bytes, size_t(1) << 30) : reserve_device_bytes;
-            const int fit = (per_slot > 0 && free_b > reserve) ? (int) std::min<size_t>((free_b - reserve) / per_slot, 512) : 0;
+            sizing_reserve = reserve;
+            owned_fit = fit_with(free_b, reserve);
+            if (slots < 0 && !variable_bits && impl_->arena_requested && loan_ranks > 0 &&
+                    auto_loan_bytes <= reserve &&
+                    (size_t) fit_with(free_b, reserve - auto_loan_bytes) > loan_ranks) {
+                sizing_reserve = reserve - auto_loan_bytes;
+                impl_->auto_loan_sizing = true;
+            }
+            const int fit = fit_with(free_b, sizing_reserve);
             slots = slots < 0 ? fit : std::min(slots, fit);
             std::fprintf(stderr, "strata generate: EXL3 expert cache auto: %.2f GiB free -> %d slots/layer\n",
                          (double) free_b / 1073741824.0, slots);
@@ -1556,15 +1601,15 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
             for (int l = layer_lo; l < layer_hi; ++l) make_used(impl_->layers[(size_t) l], (size_t) impl_->cache);
             (void) cudaMemGetInfo(&free_after, &total_b);
             if (slots_per_layer < 0 && per_slot > 0 && free_before > free_after &&
-                free_after > reserve_device_bytes) {
-                const int fit = (int) std::min<size_t>((free_after - reserve_device_bytes) / per_slot,
-                                                       (size_t) impl_->cache);
+                (free_after > reserve_device_bytes || impl_->auto_loan_sizing)) {
+                owned_fit = std::min(owned_fit, fit_with(free_after, reserve_device_bytes));
+                int fit = std::min(fit_with(free_after, sizing_reserve), impl_->cache);
+                if (impl_->auto_loan_sizing && (size_t) fit <= loan_ranks) {
+                    impl_->auto_loan_sizing = false;
+                    fit = owned_fit;
+                }
                 if (fit < impl_->cache) {
-                    for (int l = layer_lo; l < layer_hi; ++l) {
-                        std::vector<cudaEvent_t>& used = impl_->layers[(size_t) l].used;
-                        for (size_t s = (size_t) fit; s < used.size(); ++s) (void) cudaEventDestroy(used[s]);
-                        used.resize((size_t) fit);
-                    }
+                    trim_slot_events(fit);
                     std::fprintf(stderr, "strata generate: EXL3 expert slot events cost %.1f MiB -> %d slots/layer\n",
                                  (double) (free_before - free_after) / 1048576.0, fit);
                     impl_->cache = fit;
@@ -1572,6 +1617,10 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
             }
         }
     }
+    if (impl_->auto_loan_sizing)
+        std::fprintf(stderr, "strata generate: EXL3 main auto sizing: %zu MiB of prefill scratch "
+                     "covered by the arena loan, %d slots/layer instead of %d\n",
+                     auto_loan_bytes >> 20, impl_->cache, owned_fit);
     if (impl_->cache > 0) {
         std::unique_ptr<Exl3ArenaLayout> arena_layout;
         if (impl_->arena_requested) {
@@ -1617,7 +1666,23 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
                 }
             if (raw_rank != arena_layout->rank_bytes)
                 throw std::logic_error("exl3: arena rank differs from auto-cache price");
-            const cudaError_t status = cudaMalloc((void**) &impl_->arena, arena_layout->bytes);
+            cudaError_t status = cudaMalloc((void**) &impl_->arena, arena_layout->bytes);
+            if (status != cudaSuccess && impl_->auto_loan_sizing) {
+                if (status != cudaErrorMemoryAllocation)
+                    throw std::runtime_error(std::string("exl3: loan-sized arena allocation failed: ") +
+                                             cudaGetErrorString(status));
+                (void) cudaGetLastError();
+                impl_->arena = nullptr;
+                impl_->auto_loan_sizing = false;
+                impl_->cache = owned_fit;
+                trim_slot_events(owned_fit);
+                std::fprintf(stderr, "strata generate: EXL3 main loan-sized arena did not fit; "
+                             "retrying with %d slots/layer and owned-workspace headroom\n", owned_fit);
+                if (owned_fit > 0) {
+                    arena_layout = std::make_unique<Exl3ArenaLayout>(sizes, owned_fit);
+                    status = cudaMalloc((void**) &impl_->arena, arena_layout->bytes);
+                }
+            }
             if (status != cudaSuccess) {
                 impl_->arena = nullptr;
                 (void) cudaGetLastError();
@@ -1691,6 +1756,7 @@ size_t Exl3ExpertStream::ram_bytes() const { return impl_->ram.size(); }
 // loan is opened on top of it (nor any recovery claimed for it).
 
 bool Exl3ExpertStream::loan_available() const { return impl_->arena != nullptr && impl_->cache > 0; }
+bool Exl3ExpertStream::auto_sized_for_loan() const { return impl_->auto_loan_sizing; }
 size_t Exl3ExpertStream::loan_rank_bytes() const { return loan_available() ? impl_->arena_rank_bytes : 0; }
 int Exl3ExpertStream::loan_max_ranks() const { return loan_available() ? impl_->cache - 1 : 0; }
 bool Exl3ExpertStream::loan_active() const { return impl_->loan.ranks > 0; }
@@ -3163,6 +3229,8 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
         // wave_arm: one barrier per wave (not per tile).  STRATA_EXL3_PIPE pipelines the waves on
         // top of that granularity - it needs the wave batching, so it implies wave_arm.
         const bool wave_arm = device_io && !window_device && !device_small && (impl_->wave_sync || impl_->pipe_stage);
+        const bool indexed_batch = wave_arm && impl_->prefill_indexed_batch;
+        constexpr int indexed_batch_rows = 64;
         if (wave_arm) {
             size_t max_wave_routes = 0;
             int max_group_rows = 0;
@@ -3175,6 +3243,8 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
             const int ff = impl_->model->linear(impl_->expert_prefix + std::to_string(layer) +
                                                 ".mlp.experts.0.gate_proj").out();
             impl_->workspace->reserve(std::max(1, std::min(15, max_group_rows)), n, ff, n, true);
+            if (indexed_batch && ff == 640)
+                impl_->workspace->reserve_runtime_scratch(std::min(tile, indexed_batch_rows), n, ff, n);
             if (max_group_rows >= 16) {
                 impl_->workspace->reserve(max_group_rows, n, ff, n, false);
                 impl_->workspace->reserve_group_scratch(max_group_rows, n, ff, n, impl_->wmma_group);
@@ -3713,7 +3783,36 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
                 // window_device keeps the HOST arm's whole-window tile boundary (all routes
                 // in one indexed/small-M pass); only the prefill device arm extends a tile to
                 // its group boundary for the tensor-core group arm below.
-                const int count = std::min(tile, ((device_io && !window_device) ? plan.offsets[group + 1] : route_end) - route);
+                int count = std::min(tile, ((device_io && !window_device) ? plan.offsets[group + 1] : route_end) - route);
+                size_t indexed_end = group + 1;
+                if (indexed_batch && count < 16 && route == plan.offsets[group]) {
+                    // Native K4 uses fixed K splits in the indexed kernel; coalescing
+                    // rows into one grid preserves that kernel and its per-route math.
+                    auto eligible = [&](size_t g) {
+                        const auto& a = gates[g-first];
+                        const auto& b = ups[g-first];
+                        const auto& d = downs[g-first];
+                        if (a.ki != 160 || a.nj != 40 || b.ki != 160 || b.nj != 40 ||
+                            d.ki != 40 || d.nj != 160) return false;
+                        for (const auto* m : {&a, &b, &d})
+                            if (m->bits != 4 || m->frac || m->cb != 2 ||
+                                m->layout != Exl3TrellisLayout::Native) return false;
+                        return true;
+                    };
+                    if (eligible(group))
+                        while (indexed_end < end && indexed_end < group+8 && eligible(indexed_end)) {
+                            const int more = plan.offsets[indexed_end+1] - plan.offsets[indexed_end];
+                            if (more >= 16 || more > std::min(tile, indexed_batch_rows) - count) break;
+                            count += more;
+                            ++indexed_end;
+                        }
+                    if (indexed_end > group + 1) {
+                        ++impl_->prefill_indexed_calls;
+                        impl_->prefill_indexed_groups += indexed_end - group;
+                        if (timing) impl_->group_hist[0] += indexed_end - group - 1;
+                    }
+                }
+                const bool indexed_coalesced = indexed_end > group + 1;
                 const size_t tile_off = wave_arm ? (size_t) (route - route_base) : 0;
                 // The group containing this tile's FIRST route.  The input_rows build below
                 // ADVANCES `group` to the tile's last group, so capture the start here.
@@ -3736,7 +3835,7 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
                 const int* tile_rows = batch.input_rows.p + tile_off;
                 const long elements = (long) count * n;
                 if (timing && !wave_arm) (void) cudaEventRecord(impl_->profile[2], st);
-                if (device_io && !window_device && count >= 16) {
+                if (device_io && !window_device && count >= 16 && !indexed_coalesced) {
                     if (prof) impl_->prof_arm_routes[1] += count;   // group arm (wmma|gemm)
                     // STRATA_EXL3_WMMA=1: the gfx11 matrix-core group FFN (trellis decoded into the
                     // WMMA fragments, no FP16 weight materialized) against the reconstruct+hipBLAS path.
@@ -3847,10 +3946,11 @@ bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32
                 // it while the rest of this wave's tiles still run.  Later records of the same slot
                 // supersede this one for later waits; a wait enqueued before this record captured
                 // the previous one (the same snapshot rule the native ring relies on).
-                if (pipeline && route >= plan.offsets[group + 1] &&
-                    cudaEventRecord((!wave_scratch.empty() && wave_scratch[group - first] ? &impl_->scratch : wave_blocks)
-                                        ->used[(size_t) wave_slots[group - first]], st) != cudaSuccess)
-                    throw std::runtime_error("exl3: slot last-reader event failed");
+                if (pipeline && route >= plan.offsets[group + 1])
+                    for (size_t g = group; g < indexed_end; ++g)
+                        if (cudaEventRecord((!wave_scratch.empty() && wave_scratch[g - first] ? &impl_->scratch : wave_blocks)
+                                                ->used[(size_t) wave_slots[g - first]], st) != cudaSuccess)
+                            throw std::runtime_error("exl3: slot last-reader event failed");
             }
             }   // end of the original single-pass tile loop (the overlap_arm else)
             if (wave_arm) {

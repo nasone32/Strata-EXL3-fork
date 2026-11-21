@@ -446,6 +446,23 @@ int main() {
                 ram->cancel_return(0,1);
                 CHECK(!ram->resident(0,1),"cancel preserves original GPU ownership");
                 CHECK(model.linear(resident_groups[0].projections[0]).trellis == stable,"CPU address stable through exchange");
+                // The Qwen peer-complement BORROW rhythm (STRATA_EXL3_RESIDENT=peer +
+                // STRATA_EXL3_PEER_PREFILL_BORROW): a lend RETURNS the outgoing expert's
+                // planes GPU->RAM (prepare/copy/finish), the prompt reads/stages them there,
+                // the restore re-uploads and RELEASES the span back to GPU-only - and the
+                // NEXT prompt repeats the whole cycle on the same fixed address.  The
+                // returned/released counters must track the repeats, and a released expert
+                // must be returnable again immediately.
+                ram->release_to_gpu(0,0);
+                CHECK(!ram->resident(0,0) && ram->has_gpu_only(),"post-restore release returns the span to GPU-only");
+                CHECK(ram->prepare_return(0,0),"repeat cycle: a re-return opens the same target");
+                CHECK_THROW(ram->prepare_return(0,0),"already pending");
+                check_group(resident_groups[0],true);
+                ram->finish_return(0,0);
+                CHECK(ram->resident(0,0),"repeat cycle: the second lend's copy is RAM again");
+                ram->release_to_gpu(0,0);
+                CHECK(!ram->resident(0,0) && ram->stats().released >= 3 &&
+                      ram->stats().returned >= 2,"repeat cycle: return/release counters track the rhythm");
             }
             CHECK(ram->stats().file_reads == reads,"exchange/lookup never reopens source files");
             CHECK(locked == ram->stats().locked_bytes,"all live committed RAM has lock ownership");

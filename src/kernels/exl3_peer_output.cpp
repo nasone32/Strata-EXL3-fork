@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <atomic>
 #include <climits>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace strata::kernels {
@@ -14,9 +16,15 @@ struct Exl3PeerOutput::Impl {
     bool queued = false;
     bool p2p = false;
     bool kernel_transfer = false;
+    bool fused_copy = false;
     int* arrivals = nullptr;
+    unsigned long long frames = 0, output_bytes = 0;
     std::atomic<bool> released{false};
     ~Impl() {
+        if (frames)
+            std::fprintf(stderr, "exl3 peer output: %s %llu frames / %llu bytes%s\n",
+                         kernel_transfer ? "P2P kernel" : p2p ? "P2P DMA" : "mapped host", frames, output_bytes,
+                         fused_copy ? " (fused wait/scatter)" : "");
         int previous = 0; (void) cudaGetDevice(&previous);
         if (peer >= 0 && cudaSetDevice(peer) == cudaSuccess && done) {
             if (queued) (void) cudaEventSynchronize(done);
@@ -45,6 +53,8 @@ bool Exl3PeerOutput::open(int primary, int peer, int embd, int capacity, std::st
     m->primary=primary; m->peer=peer; m->embd=embd; m->capacity=capacity;
     m->p2p=p2p;
     m->kernel_transfer=kernel_transfer;
+    if (const char* v = std::getenv("STRATA_EXL3_PEER_OUTPUT_FUSED"))
+        m->fused_copy = p2p && v[0] == '1' && !v[1];
     auto ck = [&](cudaError_t e) { if (e == cudaSuccess) return true; err=cudaGetErrorString(e); return false; };
     const unsigned flags=cudaHostAllocPortable|cudaHostAllocMapped;
     if (!ck(cudaSetDevice(primary)) ||
@@ -109,6 +119,8 @@ bool Exl3PeerOutput::enqueue(const uint16_t* rows, const int* destinations, int 
         err=cudaGetErrorString(e); return false;
     }
     m.queued=true;
+    ++m.frames;
+    m.output_bytes += bytes;
     return true;
 }
 
@@ -124,7 +136,7 @@ void Exl3PeerOutput::empty() {
 }
 void Exl3PeerOutput::copy(float* parts,int routes,const uint32_t* skip,uint32_t ring,void* stream) {
     if(!impl_ || routes<1 || routes>impl_->capacity) throw std::runtime_error("exl3 peer output: invalid capture");
-    exl3_peer_output_copy(impl_->device,impl_->device_rows,parts,routes,impl_->embd,skip,ring,stream);
+    exl3_peer_output_copy(impl_->device,impl_->device_rows,parts,routes,impl_->embd,skip,ring,stream,impl_->fused_copy);
 }
 void Exl3PeerOutput::release() {
     if(impl_ && !impl_->released.exchange(true)) *(volatile uint32_t*)&impl_->host->aborted=1;

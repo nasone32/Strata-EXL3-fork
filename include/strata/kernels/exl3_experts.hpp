@@ -75,7 +75,8 @@ public:
                      size_t ram_cache_bytes = 0, size_t reserve_device_bytes = (size_t) 512 << 20,
                      int layer_lo = 0, int layer_hi = -1, int prefill_tokens = 0,
                      const std::string& layer_prefix = "model.language_model.layers.",
-                     std::shared_ptr<const Exl3ExpertBacking> expert_backing = {});
+                     std::shared_ptr<const Exl3ExpertBacking> expert_backing = {},
+                     size_t auto_loan_bytes = 0);
     ~Exl3ExpertStream();
     Exl3ExpertStream(const Exl3ExpertStream&) = delete;
     Exl3ExpertStream& operator=(const Exl3ExpertStream&) = delete;
@@ -333,6 +334,7 @@ public:
     };
     /// the arena backing exists and holds a cache: this stream can lend
     bool loan_available() const;
+    bool auto_sized_for_loan() const;
     /// one rank's bytes (this stream's owned layers, all nine planes); 0 when unavailable
     size_t loan_rank_bytes() const;
     /// the largest rank count lend_tail accepts now (at least one active rank must remain)

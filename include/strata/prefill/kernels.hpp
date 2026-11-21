@@ -121,6 +121,8 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
           const strata::kernels::RopeScaling& scaling, void* stream);
 /// q_full [T, 24, 512] (q | gate per head) -> q [T, 24, 256]
 void split_q(const float* q_full, float* q, int64_t T, void* stream);
+/// Split and RMS-normalize the query half in one pass, leaving the gate in q_full intact.
+void split_q_norm(const float* q_full, const float* w, float* q, int64_t T, float eps, void* stream);
 /// attn[t, h, d] *= sigmoid(q_full[t, h, 256 + d]) -> out16 (fp16 bits: the o-projection is quantized)
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream, int64_t ld16 = 0);
 

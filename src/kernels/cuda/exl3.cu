@@ -46,6 +46,36 @@ __global__ void peer_output_copy_kernel(const Exl3PeerOutputRecord* frame,const 
     const int source=frame->rank[i/embd];
     if(source>=0) parts[i]=__half2float(__ushort_as_half(rows[(long)source*embd+i%embd]));
 }
+// The upstream host doorbell already published the per-route index. Only
+// blocks that actually read the peer payload need the second doorbell.
+__global__ void peer_output_wait_scatter_kernel(const Exl3PeerOutputRecord* frame, const uint16_t* rows,
+                                              float* parts, int embd, const uint32_t* skip, uint32_t ring) {
+    if (skip && *(const volatile uint32_t*)skip == ring) return;
+    const int route = blockIdx.x;
+    const auto* f = (const volatile Exl3PeerOutputRecord*)frame;
+    __shared__ int src;
+    if (threadIdx.x == 0) {
+        const int rank = f->rank[route];
+        if (rank >= 0) {
+            const uint32_t expected = f->expected;
+            while (f->ready < expected && !f->aborted) {
+#if defined(__HIP_PLATFORM_AMD__)
+                __builtin_amdgcn_s_sleep(1);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+                __nanosleep(64);
+#endif
+            }
+            __threadfence_system();
+        }
+        src = f->aborted ? -1 : rank;
+    }
+    __syncthreads();
+    if (src < 0) return;
+    const uint16_t* in = rows + (size_t)src * embd;
+    float* out = parts + (size_t)route * embd;
+    for (int i = threadIdx.x; i < embd; i += blockDim.x)
+        out[i] = __half2float(__ushort_as_half(in[i]));
+}
 __global__ void peer_output_transfer_kernel(const uint4* source,uint4* target,long vectors,
                                            uint32_t* ready,uint32_t sequence,int* arrivals) {
     const long i=(long)blockIdx.x*blockDim.x+threadIdx.x;
@@ -69,7 +99,11 @@ void exl3_peer_output_transfer(const uint16_t* source,uint16_t* target,int64_t e
         (const uint4*)source,(uint4*)target,vectors,ready,sequence,arrivals);
 }
 void exl3_peer_output_copy(const Exl3PeerOutputRecord* frame,const uint16_t* rows,float* parts,
-                          int routes,int embd,const uint32_t* skip,uint32_t ring,void* stream) {
+                          int routes,int embd,const uint32_t* skip,uint32_t ring,void* stream,bool fused) {
+    if (fused) {
+        peer_output_wait_scatter_kernel<<<routes, 256, 0, (cudaStream_t)stream>>>(frame,rows,parts,embd,skip,ring);
+        return;
+    }
     peer_output_wait_kernel<<<1,1,0,(cudaStream_t)stream>>>(frame,skip,ring);
     peer_output_copy_kernel<<<(unsigned)(((long)routes*embd+255)/256),256,0,(cudaStream_t)stream>>>(
         frame,rows,parts,routes,embd,skip,ring);
@@ -1670,7 +1704,9 @@ template <typename T> struct MoeBuffer {
         if (count > std::numeric_limits<size_t>::max() / sizeof(T))
             throw std::overflow_error("exl3 MoE workspace size overflow");
         T* next = nullptr;
-        if (cudaMalloc((void**) &next, count * sizeof(T)) != cudaSuccess)
+        const auto status = cudaMalloc((void**) &next, count * sizeof(T));
+        if (status == cudaErrorMemoryAllocation) throw Exl3WorkspaceOom();
+        if (status != cudaSuccess)
             throw std::runtime_error("exl3 MoE workspace allocation failed");
         (void) cudaFree(p);
         p = next;
@@ -3533,6 +3569,20 @@ void exl3_wmma_stg_pad_set(bool on)
     g_wmma_stg_pad.store(on);
 }
 
+namespace {
+std::atomic<bool>& pf_small_wmma_silu() {
+    static std::atomic<bool> on{[] {
+        const char* v = std::getenv("STRATA_EXL3_PF_SMALL_WMMA_SILU");
+        return v && v[0] == '1' && v[1] == '\0';
+    }()};
+    return on;
+}
+}  // namespace
+
+void exl3_pf_small_wmma_silu_set(bool on) {
+    pf_small_wmma_silu().store(on, std::memory_order_relaxed);
+}
+
 #if defined(STRATA_WMMA_GFX11)
 namespace {
 
@@ -3868,10 +3918,11 @@ __global__ void gather_h128_f16_kernel(const uint16_t* __restrict__ x, const int
 // The output-side Hadamard + svh for the group's rows: the f16 form the silu consumes, and the f32
 // form the down projection writes (the same math as postscale_batched_kernel, without the per-expert
 // mat descriptor: this path is one expert).
-template <bool batched = false>
+template <bool batched = false, bool fuse_silu = false>
 __global__ void postscale_rows_f16_kernel(const float* __restrict__ z, const uint16_t* __restrict__ svh,
                                           uint16_t* __restrict__ y, int n,
-                                          const Exl3Group* groups = nullptr, int projection = 0) {
+                                          const Exl3Group* groups = nullptr, int projection = 0,
+                                          const uint16_t* __restrict__ gate = nullptr) {
     __shared__ float b[HAD];
     int r = blockIdx.y;
     if constexpr (batched) {
@@ -3887,13 +3938,24 @@ __global__ void postscale_rows_f16_kernel(const float* __restrict__ z, const uin
         if ((t & step) == 0) { float a = b[t], d = b[t | step]; b[t] = a + d; b[t | step] = a - d; }
         __syncthreads();
     }
-    y[(size_t) r * n + idx] = __half_as_ushort(__float2half_rn(b[t] * 0.08838834764831845f * dh2f(svh[idx])));
+    const size_t i = (size_t) r * n + idx;
+    const __half scaled = __float2half_rn(b[t] * 0.08838834764831845f * dh2f(svh[idx]));
+    if constexpr (fuse_silu) {
+        // Keep the standalone chain's FP16 up boundary, even without the store/load.
+        const float gv = dh2f(gate[i]);
+        const float s = gv / (1.0f + expf(-gv));
+        y[i] = __half_as_ushort(__float2half_rn(s * __half2float(scaled)));
+    } else {
+        y[i] = __half_as_ushort(scaled);
+    }
 }
 
-template <bool batched = false>
+template <bool batched = false, bool accumulate = false>
 __global__ void postscale_rows_f32_kernel(const float* __restrict__ z, const uint16_t* __restrict__ svh,
                                           float* __restrict__ y, int n,
-                                          const Exl3Group* groups = nullptr, const int* destinations = nullptr) {
+                                          const Exl3Group* groups = nullptr, const int* destinations = nullptr,
+                                          const float* weights = nullptr, int top_k = 0) {
+    static_assert(!(batched && accumulate));
     __shared__ float b[HAD];
     int r = blockIdx.y;
     if constexpr (batched) {
@@ -3909,8 +3971,15 @@ __global__ void postscale_rows_f32_kernel(const float* __restrict__ z, const uin
         if ((t & step) == 0) { float a = b[t], d = b[t | step]; b[t] = a + d; b[t | step] = a - d; }
         __syncthreads();
     }
-    const int dst = batched ? destinations[r] : r;
-    y[(size_t) dst * n + idx] = b[t] * 0.08838834764831845f * dh2f(svh[idx]);
+    const float value = b[t] * 0.08838834764831845f * dh2f(svh[idx]);
+    if constexpr (accumulate) {
+        const int pair = destinations[r];
+        float& dst = y[(size_t) (pair / top_k) * n + idx];
+        dst = fmaf(weights[pair], value, dst);
+    } else {
+        const int dst = batched ? destinations[r] : r;
+        y[(size_t) dst * n + idx] = value;
+    }
 }
 
 // The answer is per device (a mixed-gfx machine must not run gfx11 fragments elsewhere) and must not
@@ -3949,10 +4018,11 @@ namespace {
 // with nothing enqueued, so capture stays allocation-free.  Packed bytes are never handed to a
 // native reader: there is no fallback.  input_rows values are trusted exactly as the native
 // entry trusts them (the callers' contract).
-template <bool Band8 = false, bool Strict = false>
+template <bool Band8 = false, bool Strict = false, bool Accumulate = false>
 bool moe_group_wmma_impl(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& down, int rows,
                          const uint16_t* x, const int* input_rows, float* out, void* stream,
-                         Exl3MoeWorkspace& workspace) {
+                         Exl3MoeWorkspace& workspace, const float* weights = nullptr,
+                         const int32_t* pair = nullptr, int top_k = 0) {
     if (!exl3_wmma_device()) return false;
     if constexpr (Band8) {
         for (const Exl3Mat* matrix : {&gate, &up, &down})
@@ -3974,7 +4044,7 @@ bool moe_group_wmma_impl(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& 
         return false;
     const int k = gate.ki * 16, ff = gate.nj * 16, n = down.nj * 16;
     const auto st = (cudaStream_t) stream;
-    if constexpr (Band8 && Strict) {
+    if constexpr ((Band8 && Strict) || Accumulate) {
         auto& wt = workspace.implementation();
         int device = -1;
         if (cudaGetDevice(&device) != cudaSuccess || device != wt.device ||
@@ -3984,7 +4054,7 @@ bool moe_group_wmma_impl(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& 
         workspace.reserve(rows, k, ff, n);
     }
     auto& w = workspace.implementation();
-    if constexpr (!(Band8 && Strict)) {
+    if constexpr (!(Band8 && Strict) && !Accumulate) {
         w.wmma_x.reserve((size_t) rows * std::max(k, ff));
         w.group_y.reserve((size_t) rows * std::max(ff, n));
     }
@@ -3992,7 +4062,12 @@ bool moe_group_wmma_impl(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& 
     float* y = w.group_y.p;
     const int row_tiles = rows >= 24 ? 2 : 1;
     const int m_blocks = std::min((rows + 16 * row_tiles - 1) / (16 * row_tiles), 32);
-    auto project = [&](const Exl3Mat& m, const uint16_t* input, const int* rows_of, uint16_t* f16_out, float* f32_out) {
+    // Primary prefill uses indexed GEMV for <16 rows; peer prefill calls this WMMA
+    // entry for those standalone groups. Leave batched and larger groups alone.
+    const bool fuse_up = !Strict && rows < 16 && k == 2560 && ff == 640 && n == 2560 &&
+                         pf_small_wmma_silu().load(std::memory_order_relaxed);
+    auto project = [&](const Exl3Mat& m, const uint16_t* input, const int* rows_of,
+                       uint16_t* f16_out, float* f32_out, const uint16_t* silu_gate = nullptr) {
         const int in = m.ki * 16, outputs = m.nj * 16;
         gather_h128_f16_kernel<<<dim3(in / 128, rows), 32, 0, st>>>(input, rows_of, m.suh, slab, in);
         const int bands = (outputs + 255) / 256;
@@ -4019,15 +4094,25 @@ bool moe_group_wmma_impl(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& 
             case 5: launch(std::integral_constant<int, 5>{}); break;
             default: launch(std::integral_constant<int, 6>{}); break;
         }
-        if (f16_out)
+        if (silu_gate)
+            postscale_rows_f16_kernel<false, true><<<dim3(outputs / HAD, rows), HAD, 0, st>>>(
+                y, m.svh, f16_out, outputs, nullptr, 0, silu_gate);
+        else if (f16_out)
             postscale_rows_f16_kernel<<<dim3(outputs / HAD, rows), HAD, 0, st>>>(y, m.svh, f16_out, outputs);
+        else if constexpr (Accumulate)
+            postscale_rows_f32_kernel<false, true><<<dim3(outputs / HAD, rows), HAD, 0, st>>>(
+                y, m.svh, f32_out, outputs, nullptr, pair, weights, top_k);
         else
             postscale_rows_f32_kernel<<<dim3(outputs / HAD, rows), HAD, 0, st>>>(y, m.svh, f32_out, outputs);
     };
     project(gate, x, input_rows, w.g.p, nullptr);
-    project(up, x, input_rows, w.u.p, nullptr);
-    const long hidden = (long) rows * ff;
-    silu_batched_kernel<<<(unsigned) ((hidden + 255) / 256), 256, 0, st>>>(w.g.p, w.u.p, w.h.p, hidden);
+    if (fuse_up) {
+        project(up, x, input_rows, w.h.p, nullptr, w.g.p);
+    } else {
+        project(up, x, input_rows, w.u.p, nullptr);
+        const long hidden = (long) rows * ff;
+        silu_batched_kernel<<<(unsigned) ((hidden + 255) / 256), 256, 0, st>>>(w.g.p, w.u.p, w.h.p, hidden);
+    }
     project(down, w.h.p, nullptr, nullptr, out);   // the silu slab is route-major: no row table
     return true;
 }
@@ -4046,6 +4131,18 @@ bool exl3_moe_group_wmma(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& 
     if (gate.layout == Exl3TrellisLayout::Band8)
         return moe_group_wmma_impl<true, false>(gate, up, down, rows, x, input_rows, out, stream, workspace);
     return moe_group_wmma_impl<false, false>(gate, up, down, rows, x, input_rows, out, stream, workspace);
+}
+
+bool exl3_moe_group_wmma_accumulate(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& down,
+                                   int rows, const uint16_t* x, const int* input_rows, float* sum,
+                                   const float* weights, const int32_t* pair, int top_k,
+                                   void* stream, Exl3MoeWorkspace& workspace) {
+    if (!weights || !pair || top_k <= 0 || gate.ki != 160 || gate.nj != 40 || down.nj != 160)
+        return false;
+    for (const auto* m : {&gate, &up, &down})
+        if (m->layout != Exl3TrellisLayout::Native || m->bits != 4 || m->frac != 0) return false;
+    return moe_group_wmma_impl<false, false, true>(gate, up, down, rows, x, input_rows, sum, stream,
+                                                 workspace, weights, pair, top_k);
 }
 
 // EXPERIMENTAL, stage-2 band8 prefill: the gfx11 WMMA group FFN on CPU-repacked band8 trellis
@@ -4067,7 +4164,7 @@ bool exl3_experimental_band8_group_wmma(const Exl3Mat& gate, const Exl3Mat& up, 
 
 bool exl3_moe_expert_batch(const Exl3Group* groups, int count, const uint16_t* x,
                            const int* input_rows, const int* destinations, float* out, void* stream,
-                           Exl3MoeWorkspace& workspace) {
+                           Exl3MoeWorkspace& workspace, bool small_peer) {
     if (!groups || count < 2 || count > 8 || !x || !input_rows || !destinations || !out ||
         !exl3_wmma_device()) return false;
     // Layout routing: one tag over every group's whole trio (mixed tags return false before
@@ -4076,15 +4173,18 @@ bool exl3_moe_expert_batch(const Exl3Group* groups, int count, const uint16_t* x
     // routed_wmma_kernel's Band8 fragment reader, everything else unchanged.
     const Exl3TrellisLayout layout = groups[0].gate.layout;
     const bool band8 = layout == Exl3TrellisLayout::Band8;
+    if (small_peer && layout != Exl3TrellisLayout::Native) return false;
     int rows = 0, max_rows = 0;
     for (int i = 0; i < count; ++i) {
         const auto& g = groups[i];
-        if (g.first != rows || g.rows < 16 || g.rows > 4096 - rows ||
+        if (g.first != rows || (small_peer ? g.rows < 1 || g.rows >= 16 : g.rows < 16) ||
+            g.rows > 4096 - rows ||
             (g.rows >= 24) != (groups[0].rows >= 24)) return false;
         for (int p = 0; p < 3; ++p) {
             const Exl3Mat& m = p == 0 ? g.gate : p == 1 ? g.up : g.down;
             const Exl3Mat& ref = p == 0 ? groups[0].gate : p == 1 ? groups[0].up : groups[0].down;
             if (m.layout != layout || (band8 && !band8_matrix_valid(m))) return false;
+            if (small_peer && (m.bits != 4 || m.frac != 0)) return false;
             // one (bits, frac) per batch: the trellis stride is a kernel argument - a K2/K2.5 mix
             // splits into two launches upstream (the builders stop a run at the boundary)
             if (!m.trellis || !m.suh || !m.svh || m.cb != 2 || m.bits < 2 || m.bits > 6 ||
@@ -4099,13 +4199,17 @@ bool exl3_moe_expert_batch(const Exl3Group* groups, int count, const uint16_t* x
     }
     auto& w = workspace.implementation();
     const int k = groups[0].gate.ki * 16, ff = groups[0].gate.nj * 16, n = groups[0].down.nj * 16;
-    if (w.expert_groups.capacity < (size_t) count || !workspace.group_tile_fits(rows, k, ff, n, true))
+    if (small_peer && (k != 2560 || ff != 640 || n != 2560)) return false;
+    if (w.expert_groups.capacity < (size_t) count || !workspace.group_tile_fits(rows, k, ff, n, true)) {
+        if (small_peer) return false;
         throw std::runtime_error("exl3: expert batch workspace would grow under queued work");
+    }
     const auto st = (cudaStream_t) stream;
     if (cudaMemcpyAsync(w.expert_groups.p, groups, count * sizeof(Exl3Group), cudaMemcpyHostToDevice, st) != cudaSuccess)
         throw std::runtime_error("exl3: expert batch descriptor upload failed");
     const int rt = groups[0].rows >= 24 ? 2 : 1;
     const int mb = std::min((max_rows + 16 * rt - 1) / (16 * rt), 32);
+    const bool fuse_up = small_peer && pf_small_wmma_silu().load(std::memory_order_relaxed);
     auto project = [&](int p, const uint16_t* input, const int* ids, uint16_t* h, float* f) {
         const Exl3Mat& m = p == 0 ? groups[0].gate : p == 1 ? groups[0].up : groups[0].down;
         const int in = m.ki * 16, outputs = m.nj * 16;
@@ -4140,23 +4244,32 @@ bool exl3_moe_expert_batch(const Exl3Group* groups, int count, const uint16_t* x
             case 5: launch.template operator()<5>(); break;
             case 6: launch.template operator()<6>(); break;
         }
-        if (h) postscale_rows_f16_kernel<true><<<dim3(outputs / HAD, max_rows, count), HAD, 0, st>>>(
+        if (p == 1 && fuse_up)
+            postscale_rows_f16_kernel<true, true><<<dim3(outputs / HAD, max_rows, count), HAD, 0, st>>>(
+                w.group_y.p, nullptr, h, outputs, w.expert_groups.p, p, w.g.p);
+        else if (h) postscale_rows_f16_kernel<true><<<dim3(outputs / HAD, max_rows, count), HAD, 0, st>>>(
             w.group_y.p, nullptr, h, outputs, w.expert_groups.p, p);
         else postscale_rows_f32_kernel<true><<<dim3(outputs / HAD, max_rows, count), HAD, 0, st>>>(
             w.group_y.p, nullptr, f, outputs, w.expert_groups.p, destinations);
     };
     project(0, x, input_rows, w.g.p, nullptr);
-    project(1, x, input_rows, w.u.p, nullptr);
-    const long hidden = (long) rows * ff;
-    silu_batched_kernel<<<(unsigned) ((hidden + 255) / 256), 256, 0, st>>>(w.g.p, w.u.p, w.h.p, hidden);
+    project(1, x, input_rows, fuse_up ? w.h.p : w.u.p, nullptr);
+    if (!fuse_up) {
+        const long hidden = (long) rows * ff;
+        silu_batched_kernel<<<(unsigned) ((hidden + 255) / 256), 256, 0, st>>>(w.g.p, w.u.p, w.h.p, hidden);
+    }
     project(2, w.h.p, nullptr, nullptr, out);
     return true;
 }
 
 #else   // !STRATA_WMMA_GFX11
 
+bool exl3_moe_group_wmma_accumulate(const Exl3Mat&, const Exl3Mat&, const Exl3Mat&, int,
+                                   const uint16_t*, const int*, float*, const float*, const int32_t*,
+                                   int, void*, Exl3MoeWorkspace&) { return false; }
+
 bool exl3_moe_expert_batch(const Exl3Group*, int, const uint16_t*, const int*, const int*, float*,
-                           void*, Exl3MoeWorkspace&) { return false; }
+                           void*, Exl3MoeWorkspace&, bool) { return false; }
 
 bool exl3_moe_group_wmma(const Exl3Mat&, const Exl3Mat&, const Exl3Mat&, int,
                          const uint16_t*, const int*, float*, void*, Exl3MoeWorkspace&) {

@@ -142,8 +142,12 @@ public:
     /// rows on the way back, so a prompt with this enabled is NOT bit-identical to a single-GPU
     /// prompt (the GGUF peer-prefill exactness class); decode windows are untouched.  Returns
     /// false with `err` when the transport cannot allocate - the prompt path then stays local.
+    /// `strict_owned` (the STRATA_EXL3_RESIDENT=peer peer-complement arena, default false): a
+    /// peer-OWNED expert that stays local (its rows passed the peer share cap, or the tier
+    /// failed) has NO host bytes - the arena span is PROT_NONE - so this prompt ERRORS instead
+    /// of staging garbage or faulting mid-chunk.  Every existing caller passes the default.
     bool set_exl3_peer(kernels::Exl3Peer* peer, const uint8_t* owned, int64_t n_layers, int64_t n_expert,
-                       int64_t chunk, std::string& err);
+                       int64_t chunk, std::string& err, bool strict_owned = false);
 
     const PrefillStats& stats() const { return stats_; }
 

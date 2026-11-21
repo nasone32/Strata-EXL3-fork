@@ -21,6 +21,7 @@ def parser():
                    help="converted tokenizer directory; otherwise detected in the model")
     p.add_argument("--engine-bin", default=os.environ.get("STRATA_EXL3_ENGINE",
                    str(ROOT / "build-hip-exl3/strata")))
+    p.add_argument("--engine-log", type=Path, help="append engine diagnostics to this file")
     p.add_argument("--gpu", default=os.environ.get("STRATA_EXL3_GPUS"),
                    help="physical GPU list, default 0 (0,1 when a peer is requested)")
     p.add_argument("--peer-device", type=int, default=os.environ.get("STRATA_EXL3_PEER_DEVICE"),
@@ -37,6 +38,8 @@ def parser():
                    help="Qwen peer cap; default fills the engine's free-VRAM budget")
     p.add_argument("--max-context", type=int, help="default: Qwen 65536, MiMo 16384")
     p.add_argument("--prefill", type=int, help="default: Qwen 8192, MiMo 512")
+    p.add_argument("--qwen-16k-peer", action="store_true",
+                   help="native 4.05 bpw on 2×7900 XTX: 16384-token prefill, 7200 peer slots, prompt loan")
     p.add_argument("--expert-vram", type=float, help="MiMo: primary expert budget, GiB")
     p.add_argument("--reserve", type=int, default=2048, help="primary VRAM reserve, MiB")
     p.add_argument("--peer-reserve", type=int, default=4096, help="peer VRAM reserve, MiB")
@@ -59,6 +62,15 @@ def parser():
 
 
 def make_config(a):
+    if a.qwen_16k_peer:
+        if (a.family != "qwen" or a.peer_device is None or a.experts or a.repack_in_memory
+                or os.environ.get("STRATA_QWEN_BAND8", "0") not in ("", "0")):
+            raise experts.Refused("--qwen-16k-peer requires native Qwen with --peer-device")
+        if a.prefill not in (None, 16384):
+            raise experts.Refused("--qwen-16k-peer requires --prefill 16384; omit the profile for other chunks")
+        a.prefill = 16384
+        if a.peer_slots is None:
+            a.peer_slots = 7200
     a.max_context = a.max_context or (16384 if a.family == "mimo" else 65536)
     a.prefill = a.prefill or (512 if a.family == "mimo" else 8192)
     if not a.model_dir:
@@ -72,9 +84,15 @@ def make_config(a):
         raise experts.Refused(f"--family {a.family} does not match this model ({family})")
     if a.host not in ("127.0.0.1", "localhost", "::1") and not a.api_key:
         raise experts.Refused("--api-key is required with a non-local --host")
-    if a.resident == "peer" and (a.family == "qwen" or a.peer_device is None):
-        raise experts.Refused("RESIDENT=peer currently requires MiMo with a peer GPU; "
-                              "for low-RAM Qwen use --resident 0 and reduce the GPU cache")
+    if a.resident == "peer" and a.peer_device is None:
+        raise experts.Refused("--resident peer requires --peer-device")
+    if a.resident == "peer" and a.family == "qwen":
+        if a.experts or a.repack_in_memory or os.environ.get("STRATA_QWEN_BAND8", "0") not in ("", "0"):
+            raise experts.Refused("Qwen --resident peer requires native, unrepacked experts")
+        if os.environ.get("STRATA_EXL3_PEER_PREFILL", "1") == "0":
+            raise experts.Refused("Qwen --resident peer requires peer prefill")
+        if os.environ.get("STRATA_EXL3_CPU_HYBRID_PEER", "0") not in ("", "0"):
+            raise experts.Refused("Qwen --resident peer cannot use STRATA_EXL3_CPU_HYBRID_PEER")
     if min(a.max_context, a.prefill) < 1 or min(a.reserve, a.peer_reserve) < 0:
         raise experts.Refused("context/prefill must be positive; VRAM reserves cannot be negative")
     if a.cpu_threads is not None and a.cpu_threads < 1:
@@ -111,6 +129,10 @@ def make_config(a):
         env["STRATA_AUX_CPUS"] = a.aux_cpus
     args = ["--exl3", str(model)]
     if a.family == "qwen":
+        if a.resident == "peer":
+            env["STRATA_EXL3_PEER_PREFILL_BORROW"] = "0"
+        elif a.qwen_16k_peer:
+            env["STRATA_EXL3_PEER_PREFILL_BORROW"] = os.environ.get("STRATA_EXL3_PEER_PREFILL_BORROW", "400")
         ple = Path(a.ple_file).expanduser().resolve() if a.ple_file else next(
             (model / n for n in ("ngram_embedding.safetensors", "gram_embedding.safetensors")
              if (model / n).is_file()), None)
@@ -129,7 +151,7 @@ def make_config(a):
             for k, v in experts.QWEN_AUTO_CPU_FLAGS:
                 if k != cpu_key:
                     env[k] = os.environ.get(k, v)
-            if a.peer_device is not None:
+            if a.peer_device is not None and a.resident != "peer":
                 env["STRATA_EXL3_CPU_HYBRID_PEER"] = os.environ.get("STRATA_EXL3_CPU_HYBRID_PEER", "1")
         if a.mtp_dir:
             args += ["--mtp", str(Path(a.mtp_dir).expanduser()), "--spec", str(a.spec),
@@ -169,6 +191,7 @@ def make_config(a):
             env["STRATA_MIMO_PEER_RESERVE_MIB"] = str(a.peer_reserve)
     return {"exe": str(Path(a.engine_bin).expanduser().resolve()), "cwd": str(ROOT),
             "backend": "hip", "gpu": gpus, "tokenizer": str(tokenizer), "lib_dirs": [],
+            **({"log": str(a.engine_log.expanduser().resolve())} if a.engine_log else {}),
             **({"arch": "mimo_v2"} if a.family == "mimo" else {}), "env": env, "args": args}
 
 

@@ -6,10 +6,15 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <stdexcept>
 
 #include "strata/core/exl3_layout.hpp"
 
 namespace strata::kernels {
+// A device allocation refused for lack of VRAM (not a geometry or runtime error).
+struct Exl3WorkspaceOom : std::runtime_error {
+    Exl3WorkspaceOom() : std::runtime_error("exl3 MoE workspace allocation failed: out of memory") {}
+};
 // One ordered verifier layer at a time. Portable mapped transport: the peer
 // publishes compact fp16 rows; the primary graph scatters directly to parts.
 struct Exl3PeerOutputRecord {
@@ -21,7 +26,7 @@ void exl3_peer_output_transfer(const uint16_t* source,uint16_t* target,int64_t e
                                uint32_t* ready,uint32_t sequence,int* arrivals,void* stream);
 void exl3_peer_output_copy(const Exl3PeerOutputRecord* record, const uint16_t* rows,
                           float* parts, int routes, int embd, const uint32_t* skip,
-                          uint32_t ring, void* stream);
+                          uint32_t ring, void* stream, bool fused = false);
 struct Exl3Mat;
 class Exl3MoeWorkspace;
 
@@ -271,12 +276,25 @@ bool exl3_moe_group_wmma(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& 
                          const uint16_t* x, const int* input_rows, float* out, void* stream,
                          Exl3MoeWorkspace& workspace);
 
+// Native Qwen K4 standalone peer prefill: postscale directly into the weighted
+// sum. Device pair[r] indexes weights and pair[r]/top_k indexes sum rows.
+// Caller proves distinct destination tokens within the group and queues groups
+// in order on one stream. False means nothing enqueued.
+bool exl3_moe_group_wmma_accumulate(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& down,
+                                   int rows, const uint16_t* x, const int* input_rows, float* sum,
+                                   const float* weights, const int32_t* pair, int top_k,
+                                   void* stream, Exl3MoeWorkspace& workspace);
+
 // STRATA_EXL3_WMMA_STG_PAD (default off): route routed_wmma_kernel through the padded-LDS
 // instantiation (sh_a innermost extent 8 -> 9 dwords; the bank-conflict hypothesis is documented
 // at the kernel).  Byte-identical by construction; exl3_moe_multi_parity's pad A/B section proves
 // it per shape.  The setter is for tests/benches that A/B the two strides in one process.
 bool exl3_wmma_stg_pad_enabled();
 void exl3_wmma_stg_pad_set(bool on);
+
+// Opt-in STRATA_EXL3_PF_SMALL_WMMA_SILU: fold SiLU into the up epilogue for
+// standalone 1..15-row Qwen-shaped WMMA groups. Setter for paired GPU tests.
+void exl3_pf_small_wmma_silu_set(bool on);
 
 // STRATA_EXL3_NATIVE_GROUPED (default off): host-only admission + k-partition plan for the
 // native grouped GEMV (the indexed native kernel's packed mul1 decode + fdot2 core on the
@@ -351,9 +369,10 @@ void exl3_pf_scatter_add(float* sum, const float* rows, const float* weights, co
 // input_rows and destinations contain total rows; callers guarantee indices are in bounds and
 // destinations are unique valid rows of out. Final postscale scatters directly to destinations.
 // All metadata is validated before the first upload/kernel. False means nothing was enqueued.
+// small_peer selects ONLY 1..15-row native K4 Qwen-shaped groups for peer prefill.
 bool exl3_moe_expert_batch(const Exl3Group* groups, int count, const uint16_t* x,
                            const int* input_rows, const int* destinations, float* out, void* stream,
-                           Exl3MoeWorkspace& workspace);
+                           Exl3MoeWorkspace& workspace, bool small_peer = false);
 
 // STRATA_EXL3_RECON_BATCH (the batched weight reconstruction, audit item C2): the reconstruct+BLAS
 // fallback's batched twin for the fractional/low-K experts every WMMA/RDNA kernel rejects (MiMo's

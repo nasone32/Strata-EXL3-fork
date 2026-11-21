@@ -1195,7 +1195,7 @@ bool real_geometry(int device) {
         Matrix wg(bits,2,rng,width,hidden,frac), wu(bits,2,rng,width,hidden,frac), wd(bits,2,rng,hidden,width,frac);
         const char* kn = frac ? "2.5" : nullptr;
         char kname[8]; if (!kn) std::snprintf(kname,sizeof kname,"%d",bits);
-        for (int rows : {7, 8, 15, 16, 23, 24, 31, 32, 40}) {
+        for (int rows : {1, 2, 7, 8, 15, 16, 23, 24, 31, 32, 40}) {
             const int tokens = 4 * rows + 13;
             std::vector<uint16_t> wx((size_t) tokens*width);
             std::vector<double> wref((size_t) rows*width);
@@ -1214,6 +1214,7 @@ bool real_geometry(int device) {
             Buffer<int> dr((size_t) rows);
             check(cudaMemcpy(dr.p,token_of.data(),token_of.size()*4,cudaMemcpyHostToDevice));
             Buffer<float> dout((size_t) rows*width);
+            exl3_pf_small_wmma_silu_set(false);
             if (!exl3_moe_group_wmma(wg.gpu,wu.gpu,wd.gpu,rows,dwx.p,dr.p,dout.p,nullptr,workspace)) {
                 std::printf("device=%d geometry=2560/640 K%s wmma_group rows=%d unavailable-on-this-device SKIP\n",
                             device,kn?kn:kname,rows);
@@ -1242,6 +1243,92 @@ bool real_geometry(int device) {
                             device,kn?kn:kname,rows,(int)pad_equal,pad_equal?"PASS":"FAIL");
             }
             exl3_wmma_stg_pad_set(false);
+            if (rows <= 16) {
+                exl3_pf_small_wmma_silu_set(true);
+                const bool ran = exl3_moe_group_wmma(wg.gpu,wu.gpu,wd.gpu,rows,dwx.p,dr.p,dout.p,nullptr,workspace);
+                std::vector<float> fused(wy.size());
+                check(cudaMemcpy(fused.data(),dout.p,fused.size()*sizeof(float),cudaMemcpyDeviceToHost));
+                const bool equal = ran && std::memcmp(fused.data(), wy.data(), wy.size()*sizeof(float)) == 0;
+                ok = ok && equal;
+                std::printf("device=%d K%s rows=%d small_wmma_silu bytes_equal=%d %s\n",
+                            device,kn?kn:kname,rows,(int)equal,equal?"PASS":"FAIL");
+                exl3_pf_small_wmma_silu_set(false);
+            }
+        }
+        if (bits == 4 && frac == 0) {
+            Matrix g2(4,2,rng,width,hidden), u2(4,2,rng,width,hidden), d2(4,2,rng,hidden,width);
+            constexpr int total = 53;
+            const int lengths[] = {1, 15, 2, 9, 3, 12, 4, 7};
+            Exl3Group groups[8];
+            int first = 0;
+            for (int i = 0; i < 8; ++i) {
+                groups[i] = {i%2 ? g2.gpu : wg.gpu, i%2 ? u2.gpu : wu.gpu,
+                             i%2 ? d2.gpu : wd.gpu, first, lengths[i]};
+                first += lengths[i];
+            }
+            std::vector<uint16_t> x(17*width);
+            for (auto& v : x) v = half(((int)(rng()%1000)-500)*.001f);
+            int rows[total], dest[total];
+            for (int r = 0; r < total; ++r) { rows[r] = (r*7)%17; dest[r] = r; }
+            Buffer<uint16_t> dx(x.size());
+            Buffer<int> dr(total), dd(total);
+            Buffer<float> dy((size_t)total*width), ref((size_t)total*width);
+            // Distinct tokens within each group, repeated across groups. Signed
+            // weights and ordered adds make this stronger than a single-group check.
+            int32_t pairs[total];
+            float weights[17*8];
+            for (auto& w : weights) w = ((int)(rng()%1000)-500)*.001f;
+            for (int i = 0; i < 8; ++i)
+                for (int r = groups[i].first; r < groups[i].first + groups[i].rows; ++r)
+                    pairs[r] = rows[r]*8+i;
+            Buffer<int32_t> dp(total);
+            Buffer<float> dw(17*8), sum0(17*width), sum1(17*width);
+            check(cudaMemcpy(dp.p,pairs,sizeof pairs,cudaMemcpyHostToDevice));
+            check(cudaMemcpy(dw.p,weights,sizeof weights,cudaMemcpyHostToDevice));
+            cudaStream_t st;
+            check(cudaStreamCreateWithFlags(&st,cudaStreamNonBlocking));
+            check(cudaMemcpy(dx.p, x.data(), x.size()*sizeof(uint16_t), cudaMemcpyHostToDevice));
+            check(cudaMemcpy(dr.p, rows, sizeof rows, cudaMemcpyHostToDevice));
+            check(cudaMemcpy(dd.p, dest, sizeof dest, cudaMemcpyHostToDevice));
+            workspace.reserve_expert_batch(8,total,width,hidden,width);
+            for (bool fused : {false,true}) {
+                exl3_pf_small_wmma_silu_set(fused);
+                exl3_wmma_stg_pad_set(true);
+                bool ran = true;
+                for (const auto& g : groups)
+                    ran &= exl3_moe_group_wmma(g.gate,g.up,g.down,g.rows,dx.p,dr.p+g.first,
+                                               ref.p+(size_t)g.first*width,nullptr,workspace);
+                if (!ran) { std::puts("small peer WMMA not available; SKIP"); break; }
+                const bool refused = !exl3_moe_expert_batch(groups,8,dx.p,dr.p,dd.p,dy.p,nullptr,workspace);
+                ran = exl3_moe_expert_batch(groups,8,dx.p,dr.p,dd.p,dy.p,nullptr,workspace,true);
+                std::vector<float> a((size_t)total*width), b(a.size());
+                check(cudaMemcpy(a.data(),ref.p,a.size()*sizeof(float),cudaMemcpyDeviceToHost));
+                check(cudaMemcpy(b.data(),dy.p,b.size()*sizeof(float),cudaMemcpyDeviceToHost));
+                const bool equal = refused && ran && std::memcmp(a.data(),b.data(),a.size()*sizeof(float)) == 0;
+                ok &= equal;
+                std::printf("device=%d small peer WMMA 8 ragged groups fused=%d byte parity %s\n",
+                            device,(int)fused,equal?"PASS":"FAIL");
+                check(cudaMemsetAsync(sum0.p,0,17*width*sizeof(float),st));
+                check(cudaMemsetAsync(sum1.p,0,17*width*sizeof(float),st));
+                bool accum = true;
+                for (const auto& g : groups) {
+                    exl3_pf_scatter_add(sum0.p,ref.p+(size_t)g.first*width,dw.p,dp.p+g.first,
+                                        g.rows,8,width,st);
+                    accum &= exl3_moe_group_wmma_accumulate(g.gate,g.up,g.down,g.rows,dx.p,
+                        dr.p+g.first,sum1.p,dw.p,dp.p+g.first,8,st,workspace);
+                }
+                check(cudaStreamSynchronize(st));
+                a.resize(17*width); b.resize(a.size());
+                check(cudaMemcpy(a.data(),sum0.p,a.size()*sizeof(float),cudaMemcpyDeviceToHost));
+                check(cudaMemcpy(b.data(),sum1.p,b.size()*sizeof(float),cudaMemcpyDeviceToHost));
+                accum &= std::memcmp(a.data(),b.data(),a.size()*sizeof(float)) == 0;
+                ok &= accum;
+                std::printf("device=%d peer down accumulate SiLU=%d byte parity %s\n",
+                            device,(int)fused,accum?"PASS":"FAIL");
+            }
+            check(cudaStreamDestroy(st));
+            exl3_wmma_stg_pad_set(false);
+            exl3_pf_small_wmma_silu_set(false);
         }
     }
     // Multi-expert WMMA subgroup: independent signed weights/scales per projection and expert,

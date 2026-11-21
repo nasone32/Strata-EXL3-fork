@@ -127,7 +127,7 @@ __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __rest
         s = fmaf(x, sigm(g[j]), s);
     }
     s /= (float) HC;
-    mixed[i] = s;
+    if (mixed) mixed[i] = s;
     if (mixed16) {
         const uint16_t h = act16(s);
         mixed16[i] = h;
@@ -1633,6 +1633,19 @@ __global__ void rms_rows_kernel(float* __restrict__ x, const float* __restrict__
     __syncthreads();
     for (int64_t c = threadIdx.x; c < cols; c += blockDim.x) r[c] = s * r[c] * w[c];
 }
+// Keep the generic loop and runtime column count: specializing to one
+// element per lane changed the generated FP32 reduction on gfx1100.
+__global__ void rms_rows_out_kernel(const float* __restrict__ src, const float* __restrict__ w,
+                                    float* __restrict__ dst, int64_t cols, int64_t src_ld, float eps) {
+    __shared__ float sh[32];
+    const float* r = src + (int64_t) blockIdx.x * src_ld;
+    float* out = dst + (int64_t) blockIdx.x * cols;
+    float ss = 0.0f;
+    for (int64_t c = threadIdx.x; c < cols; c += blockDim.x) ss += r[c] * r[c];
+    const float s = rsqrtf(block_sum(ss, sh) / (float) cols + eps);
+    __syncthreads();
+    for (int64_t c = threadIdx.x; c < cols; c += blockDim.x) out[c] = s * r[c] * w[c];
+}
 // TAB (#280, STRATA_ROPE_TABLE=1): the angles from the session's float64 table.  The host launches <false> whenever
 // no table applies - the default - so the default kernel is 0.1.31's code exactly (the table read is not in it;
 // with it merely skipped at run time, the compiled default path changed its results).
@@ -2215,6 +2228,11 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {
     split_q_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(q_full, q, T);
     check("split_q");
+}
+void split_q_norm(const float* q_full, const float* w, float* q, int64_t T, float eps, void* stream) {
+    if (T <= 0) return;
+    rms_rows_out_kernel<<<(unsigned) (T * 24), 256, 0, (cudaStream_t) stream>>>(q_full, w, q, 256, 512, eps);
+    check("split_q_norm");
 }
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream, int64_t ld16) {
     gate_attn_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out16, T,

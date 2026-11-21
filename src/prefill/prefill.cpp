@@ -342,6 +342,10 @@ inline bool hc_upmix() {
     static const bool v = [] { const char* e = std::getenv("STRATA_HC_UPMIX"); return e != nullptr && e[0] == '1'; }();
     return v;
 }
+inline bool hc_no_float_attn() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_HC_NO_FLOAT_ATTN"); return e && e[0] == '1' && !e[1]; }();
+    return v;
+}
 inline bool bf16x2_hc(bool f16_io) { return bf16x2_mode(f16_io) == 1; }
 // S23 (opt-in STRATA_CVEC_FUSE=1): a steered layer's FFN write + control vector + the next half's norm in one pass
 // over R (gr_write_cvec_norm_rs; bitwise the gr_write + cvec_apply + gr_norm_rs it replaces)
@@ -739,6 +743,8 @@ struct Exl3PeerPf {
     std::vector<int32_t> slot;           // per route: identity, or T*K (the combine's skip sentinel)
     int64_t rows_local = 0, rows_peer = 0;
     int64_t layers = 0, rows_total = 0;  // counters (STRATA_PREFILL_TIMING reports at release)
+    bool strict_owned = false;           // STRATA_EXL3_RESIDENT=peer: a peer-owned expert staying
+                                         // local has NO host bytes - error, never stage it
     ~Exl3PeerPf() {
         if (xs) { cudaStreamSynchronize(xs); cudaStreamDestroy(xs); }
         if (ev) cudaEventDestroy(ev);
@@ -1926,7 +1932,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
 }
 
 bool Prefill::set_exl3_peer(kernels::Exl3Peer* peer, const uint8_t* owned, int64_t n_layers, int64_t n_expert,
-                            int64_t chunk, std::string& err) {
+                            int64_t chunk, std::string& err, bool strict_owned) {
     Impl& m = *impl_;
     m.epf.reset();
     if (peer == nullptr || owned == nullptr || n_layers <= 0 || n_expert <= 0 || chunk <= 0) {
@@ -1941,6 +1947,7 @@ bool Prefill::set_exl3_peer(kernels::Exl3Peer* peer, const uint8_t* owned, int64
     epf->n_expert = n_expert;
     epf->rows_cap = peer->prefill_rows_cap();
     epf->T_cap = chunk;
+    epf->strict_owned = strict_owned;
     int prev = 0;
     (void) cudaGetDevice(&prev);
     bool ok = cudaStreamCreateWithFlags(&epf->xs, cudaStreamNonBlocking) == cudaSuccess &&
@@ -2107,11 +2114,11 @@ namespace {
 // are folded at every MoE layer's host sync, after which all of them have completed.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
                kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut,
-               kPfCount };
+               kPfHcWrite, kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj"};
+                                        "gdn recurrence", "gdn out proj", "hc write+next norm"};
 struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     std::vector<cudaEvent_t> ev;
@@ -2747,7 +2754,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (!hcd && !hdown && !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
                 bool upmixed = false;
-                if (hc_upmix() && T >= pf_switch_min_t() && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
+                if (hc_upmix() && T >= pf_switch_min_t() && !m.f16_io && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
                     wu->kind == core::WeightKind::Bf16InF32 && wu->data && wu->ne0 == LR && wu->ne1 == D) {
                     static int checks = [] { const char* e = std::getenv("STRATA_HC_UPMIX_CHECK"); return e ? std::atoi(e) : 0; }();
                     if (checks > 0) {   // the default pair first, kept for the comparison
@@ -2779,7 +2786,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 } else if (gr_unfused()) {
                     gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
                 } else {
-                    gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
+                    // The attention/GDN half consumes only the FP16/BF16 images.
+                    // The MoE half still needs the FP32 image for expert dispatch.
+                    float* mixed = half == 0 && hc_no_float_attn() ? nullptr : m.mixed;
+                    gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, mixed, m.mixed_bf, T, m.cs, m.mixed_h,
                              m.mixed_bf_lo);
                 }
 
@@ -2891,8 +2901,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                 (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
                     }
                     if (staged) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
-                    split_q(m.Qf, m.q, T, m.cs);
-                    rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
+                    static const bool fused_q_norm = [] {
+                        const char* e = std::getenv("STRATA_PF_QSA_SPLIT_NORM"); return e && e[0] == '1' && !e[1];
+                    }();
+                    if (fused_q_norm) split_q_norm(m.Qf, (const float*) wqn->data, m.q, T, EPS, m.cs);
+                    else {
+                        split_q(m.Qf, m.q, T, m.cs);
+                        rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
+                    }
                     rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
                     if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
                     rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
@@ -3173,6 +3189,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     epf->mask[(size_t) i] = 1;
                                     epf->slot[(size_t) i] = skip_sentinel;
                                     ++rows_peer;
+                                } else if (epf->strict_owned && e >= 0 && e < epf->n_expert && lay_owned[e]) {
+                                    // The resident peer complement: a peer-OWNED expert that stayed
+                                    // local (over the share cap) has no host bytes to stage.  The
+                                    // engine sizes the cap at chunk*K, so reaching here is a
+                                    // configuration drift - refuse it loudly, never stage.
+                                    err = "prefill: a peer-owned expert stayed local past the peer share cap "
+                                          "(" + std::to_string(epf->rows_cap) + " rows/layer) under the resident "
+                                          "peer complement - raise the cap or unset STRATA_EXL3_RESIDENT=peer";
+                                    return false;
                                 }
                             }
                             epf->rows_peer = rows_peer;
@@ -4281,6 +4306,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // ---- the hyper-connection write of this half; F-2: fused with the next half's norm when nothing else
                 // touches R in between (not the stage's last half, not before the PLE block of layer 1, not under a
                 // control vector)
+                pt.mark(kPfHcWrite, cs);
                 const int64_t nl = half == 0 ? l : l + 1;
                 const bool steered = half == 1 && strata::kernels::cvec().covers(l);
                 const float *cv_dir = nullptr, *cv_s = nullptr;
@@ -4549,6 +4575,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     // the freshest safe snapshot; without it the split could mask an expert the tier just dropped
     // and the peer would refuse the layer.
     if (impl_ && impl_->epf) {
+        // The peer-complement resident arena (strict_owned): a failed/closed tier means every
+        // peer-owned expert would stay local and the primary would stage PROT_NONE arena pages.
+        // Error the prompt BEFORE any chunk reads them - MiMo's refusal, not a fault.
+        if (impl_->epf->strict_owned && !impl_->epf->peer->valid()) {
+            err = "prefill: the EXL3 peer tier failed and the resident peer complement has no host "
+                  "bytes for its experts - failing the request instead of staging protected pages";
+            return false;
+        }
         std::vector<int32_t> res;
         impl_->epf->peer->residency((int) impl_->epf->n_layers, (int) impl_->epf->n_expert, res);
         if (res.size() == impl_->epf->owned_copy.size())
